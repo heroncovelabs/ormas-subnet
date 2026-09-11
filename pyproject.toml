@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.24",
+    # ed25519 signing of validator decisions (ormas_subnet/validator.py)
+    "cryptography>=41",
 ]
 
 [tool.setuptools.packages.find]
