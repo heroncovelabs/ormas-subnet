@@ -3,7 +3,7 @@
 One page, in order of authority:
 
 - [`docs/DECISIONS.md`](DECISIONS.md) — the owner-locked decision that defines a miner. Normative; it wins any disagreement.
-- the validator acceptance design (summarized in [`docs/DECISIONS.md`](DECISIONS.md) §6) — how acceptance will work. A design draft awaiting owner sign-off; anything drawn from it below is marked **planned — not yet live**.
+- the validator acceptance design (summarized in [`docs/DECISIONS.md`](DECISIONS.md) §6) — how acceptance will work. Design signed off by the owner on 2026-09-10; implementation is in progress, so anything drawn from it below is marked **planned — not yet live**.
 - [`README.md`](../README.md) and [`protocol.md`](protocol.md) — the wire protocol as implemented today. They describe what is live now.
 - [`ormas_subnet/skeleton.py`](../ormas_subnet/skeleton.py) and [`ormas_subnet/reference_solver.py`](../ormas_subnet/reference_solver.py) — the code you actually run.
 
@@ -52,4 +52,4 @@ Model routing, hardware, energy, harness, caching, the orchestration loop — al
 
 ## Not decided yet
 
-Owner calls, not values this page may invent: the license on this repo, the repo's destination, commercial terms for external miners, the assigned validator count and decision timeouts, and validator collateral.
+Owner calls, not values this page may invent: commercial terms for external miners, the assigned validator count and decision timeouts, the validator fee share, and validator collateral. The validator count, timeouts and spot-check fraction will be set from measurements on the development subnet, not chosen up front.
