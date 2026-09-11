@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ormas-subnet"
+version = "0.0.1"
+description = "Ormas miner protocol, thin client library, and reference miner skeleton"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.24",
+]
+
+[tool.setuptools.packages.find]
+include = ["ormas_subnet*"]
