@@ -20,6 +20,14 @@ from ormas_subnet.client import OrmasMinerClient
 from ormas_subnet.protocol import RUNNER_PROTOCOL_V1
 from ormas_subnet.reference_solver import make_shell_solver
 from ormas_subnet.skeleton import MinerConfig, MinerSkeleton, SolveResult
+from ormas_subnet.validator import (
+    OrmasValidatorClient,
+    ValidatorConfig,
+    ValidatorDaemon,
+    canonical_evidence_fields,
+    evidence_digest_hex,
+    make_ed25519_signer,
+)
 
 
 class _FakeResponse:
@@ -345,3 +353,101 @@ def test_verify_command_failure_yields_failed(tmp_path: Path) -> None:
     assert gateway.completed["capture"]["scope_ok"] is True
     assert gateway.completed["capture"]["attempts"] == [{"verify_exit_code": 1}]
     assert gateway.completed["terminal"]["verification_state"] == "failed"
+
+
+class _FakeValidatorGateway:
+    """Enough of ``/api/validator/v1`` to drive :class:`ValidatorDaemon` end to
+    end — a protocol-shape double (no auth, no persistence), mirroring
+    ``FakeGateway`` above but for the validator's own registration/assignment/
+    decision routes."""
+
+    def __init__(self, *, assignment: dict[str, Any]) -> None:
+        self._assignment = dict(assignment)
+        self._served = False
+        self.registered: dict[str, Any] | None = None
+        self.decisions: list[dict[str, Any]] = []
+
+    def post(self, path: str, json: dict[str, Any] | None = None, headers: Any = None) -> _FakeResponse:
+        body = json or {}
+        if path == "/api/validator/v1/registrations":
+            self.registered = body
+            return _FakeResponse(200, {"validator_id": "val_test"})
+        if path.endswith("/decisions"):
+            self.decisions.append(body)
+            return _FakeResponse(200, {"decision": body["decision"], "quorum": body["decision"]})
+        raise AssertionError(f"unhandled path: {path}")
+
+    def get(self, path: str) -> _FakeResponse:
+        if path == "/api/validator/v1/assignments":
+            if self._served:
+                return _FakeResponse(200, {"assignments": []})
+            self._served = True
+            return _FakeResponse(200, {"assignments": [self._assignment]})
+        raise AssertionError(f"unexpected GET: {path}")
+
+
+def _validator_assignment(*, repo: Path, base_commit: str, result_commit: str, verify_command: str) -> dict[str, Any]:
+    fields = canonical_evidence_fields(
+        job_id="job_1",
+        miner_id="miner:other-tenant",
+        base_commit=base_commit,
+        result_commit=result_commit,
+        repo_url=str(repo),
+        verify_command=verify_command,
+        allowed_paths=["out.txt"],
+        immutable_paths=[],
+    )
+    return {"assignment_id": "asgn_1", **fields, "evidence_digest_sha256": evidence_digest_hex(fields)}
+
+
+def _run_validator_once(tmp_path: Path, *, assignment: dict[str, Any]) -> _FakeValidatorGateway:
+    gateway = _FakeValidatorGateway(assignment=assignment)
+    client = OrmasValidatorClient(base_url="https://fake.invalid", token="ormv_test", http_client=gateway)
+    sign_fn, pubkey_hex = make_ed25519_signer("11" * 32)
+    daemon = ValidatorDaemon(client, ValidatorConfig(workdir_root=tmp_path / "validator-work"), sign_fn)
+    daemon.register(pubkey_hex=pubkey_hex)
+    assert daemon.run_once() is True
+    assert daemon.run_once() is False  # no more work queued
+    return gateway
+
+
+@requires_git
+def test_validator_daemon_accepts_a_verified_delivery(tmp_path: Path) -> None:
+    """Base fails the verify command (fail-on-base honored), result passes,
+    the diff stays in the allowed scope — the daemon signs an independent
+    ``accept``, never trusting the miner's own claim."""
+    repo, base_commit = _init_repo(tmp_path)
+    (repo / "out.txt").write_text("base\nmined\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "result"], cwd=repo, check=True, capture_output=True)
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assignment = _validator_assignment(
+        repo=repo, base_commit=base_commit, result_commit=result_commit, verify_command="grep -q mined out.txt",
+    )
+    gateway = _run_validator_once(tmp_path, assignment=assignment)
+
+    assert gateway.decisions[0]["decision"] == "accept"
+    assert len(gateway.decisions[0]["signature_hex"]) == 128
+
+
+@requires_git
+def test_validator_daemon_rejects_when_result_still_fails_verify(tmp_path: Path) -> None:
+    """Base fails (as required), but the result commit never actually fixes
+    anything the verify command checks for — the daemon's own re-run of
+    verify_command against the result catches this and rejects, regardless
+    of what the miner claimed."""
+    repo, base_commit = _init_repo(tmp_path)
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "no-op"], cwd=repo, check=True, capture_output=True)
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assignment = _validator_assignment(
+        repo=repo, base_commit=base_commit, result_commit=result_commit, verify_command="grep -q mined out.txt",
+    )
+    gateway = _run_validator_once(tmp_path, assignment=assignment)
+
+    assert gateway.decisions[0]["decision"] == "reject"

@@ -17,6 +17,16 @@ from .protocol import (
     TaskTerminal,
 )
 from .skeleton import MinerConfig, MinerSkeleton, SolveFn, SolveResult
+from .validator import (
+    VALIDATOR_PROTOCOL_V1,
+    OrmasValidatorClient,
+    SignFn,
+    ValidatorConfig,
+    ValidatorDaemon,
+    canonical_evidence_fields,
+    evidence_digest_hex,
+    make_ed25519_signer,
+)
 
 __version__ = "0.0.1"
 
@@ -38,4 +48,12 @@ __all__ = [
     "MinerSkeleton",
     "SolveFn",
     "SolveResult",
+    "VALIDATOR_PROTOCOL_V1",
+    "OrmasValidatorClient",
+    "SignFn",
+    "ValidatorConfig",
+    "ValidatorDaemon",
+    "canonical_evidence_fields",
+    "evidence_digest_hex",
+    "make_ed25519_signer",
 ]
