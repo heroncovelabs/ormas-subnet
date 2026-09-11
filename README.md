@@ -123,8 +123,6 @@ does at completion" for the exact rules.
   1b in the decision doc's consequence list is the validator design + build; it
   belongs in this repo alongside the miner protocol, and is not part of this
   card.
-- **No license file yet.** Owner decision pending before this package is
-  published as its own repository.
 
 ## No secrets in the client
 
