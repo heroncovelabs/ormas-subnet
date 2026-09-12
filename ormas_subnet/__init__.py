@@ -3,7 +3,7 @@
 Not our miner. See ``docs/DECISIONS.md`` and ``README.md`` for what "miner" means here and
 what this package deliberately does not ship.
 """
-from .client import OrmasMinerClient, load_token
+from .client import OrmasGatewayError, OrmasMinerClient, load_token
 from .protocol import (
     RUNNER_DEVICE_HEADER,
     RUNNER_PROTOCOL_V1,
@@ -32,6 +32,7 @@ __version__ = "0.0.1"
 
 __all__ = [
     "__version__",
+    "OrmasGatewayError",
     "OrmasMinerClient",
     "load_token",
     "RUNNER_DEVICE_HEADER",

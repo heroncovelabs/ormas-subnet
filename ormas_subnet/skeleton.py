@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -22,7 +23,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .client import OrmasMinerClient
 from .protocol import (
@@ -55,6 +56,10 @@ _RESULT_REF_LOCAL = "local:ormas/job/"
 DEFAULT_POLL_INTERVAL_S = 15
 DEFAULT_LEASE_TTL_S = 300
 DEFAULT_HEARTBEAT_S = 90
+
+# Bound on the exception text carried in a failure capture's ``error`` field —
+# enough to diagnose, short enough to stay a sane evidence payload.
+_FAILURE_MESSAGE_MAX = 500
 
 # `TaskReceipt.actual_provider` / `.model` are plain ``str`` fields on the wire —
 # there is no null. The server additionally requires `model` to match
@@ -288,13 +293,25 @@ class MinerSkeleton:
         self.client = client
         self.config = config
         self.solve_fn = solve_fn
+        # Poll/lease cadences adopted from the gateway's registration response
+        # (see register()); the module defaults stand until then.
+        self.poll_interval_s = float(DEFAULT_POLL_INTERVAL_S)
+        self.lease_ttl_s = float(DEFAULT_LEASE_TTL_S)
 
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
 
     def register(self, *, health_extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        """POST a registration; returns the gateway's poll/lease/heartbeat cadence."""
+        """POST a registration and adopt the gateway's response cadences.
+
+        The registration response authoritatively carries ``poll_interval_s``,
+        ``heartbeat_s`` and ``lease_ttl_s``: each field present replaces the
+        local default — stored on ``self.poll_interval_s`` / ``self.lease_ttl_s``
+        and on ``config.heartbeat_interval_s`` — so a gateway cadence change
+        does not silently desynchronise every miner. Fields the response omits
+        keep the module defaults. Returns the gateway's raw response.
+        """
         health: dict[str, Any] = {"cells": list(self.config.cells)}
         if self.config.device_nonce:
             health["device_nonce"] = self.config.device_nonce
@@ -307,7 +324,18 @@ class MinerSkeleton:
             capacity=self.config.capacity,
             health=health,
         )
-        return self.client.register_runner(registration)
+        response = self.client.register_runner(registration)
+        if isinstance(response, Mapping):
+            poll = response.get("poll_interval_s")
+            if poll is not None:
+                self.poll_interval_s = float(poll)
+            heartbeat_s = response.get("heartbeat_s")
+            if heartbeat_s is not None:
+                self.config.heartbeat_interval_s = float(heartbeat_s)
+            lease_ttl = response.get("lease_ttl_s")
+            if lease_ttl is not None:
+                self.lease_ttl_s = float(lease_ttl)
+        return response
 
     def bind(self, *, project_id: str, base_commit: str) -> dict[str, Any]:
         """Bind this miner's repo_id to a client project at a base commit."""
@@ -326,9 +354,15 @@ class MinerSkeleton:
     # ------------------------------------------------------------------
 
     def _fresh_workdir(self, task_id: str) -> Path:
+        """Return a clean per-task workdir path, replacing any crashed-job leftover.
+
+        A run killed mid-task leaves ``workdir_root/<task_id>`` behind, and the
+        same lease is re-served on restart — the leftover must be removed,
+        not treated as fatal, or every restart wedges on it.
+        """
         workdir = self.config.workdir_root / task_id
         if workdir.exists():
-            raise GitError(f"workdir already exists: {workdir}")
+            shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
         return workdir
 
@@ -418,18 +452,36 @@ class MinerSkeleton:
     # ------------------------------------------------------------------
 
     def run_once(self) -> bool:
-        """Claim one task if available, solve+verify it, and complete. False when idle."""
+        """Claim one task if available, solve+verify it, and complete.
+
+        ``False`` when idle. Once a lease is held, nothing that goes wrong
+        afterwards — a raising ``solve_fn``, a git failure in clone/publish, a
+        verify/publish crash — escapes: the failure is reported to the gateway
+        as a failed terminal so the lease completes instead of silently
+        expiring server-side, and the call still returns ``True`` (the job was
+        claimed and handled). Only a claim failure, before any lease is held,
+        propagates. ``KeyboardInterrupt`` is never swallowed.
+        """
         claimed = self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
         if claimed is None:
             return False
         lease, draft = claimed
+        start = time.monotonic()
+        try:
+            self._run_leased_task(lease, draft, start)
+        except Exception as exc:  # noqa: BLE001 - contained + reported; KeyboardInterrupt propagates
+            self._report_lease_failure(lease, draft, exc, start)
+        return True
+
+    def _run_leased_task(self, lease: TaskLease, draft: TaskDraft, start: float) -> None:
+        """The claim → complete path for one held lease. Errors propagate to
+        :meth:`run_once`, which reports them as a failed terminal."""
         workdir = self._clone_and_checkout(draft)
         stop = threading.Event()
         heartbeat = threading.Thread(
             target=self._heartbeat_loop, args=(draft.task_id, lease, stop), daemon=True,
         )
         heartbeat.start()
-        start = time.monotonic()
         try:
             result = self.solve_fn(draft, workdir)
         finally:
@@ -491,19 +543,78 @@ class MinerSkeleton:
             terminal=terminal,
             capture=capture,
         )
-        return True
+
+    def _report_lease_failure(
+        self, lease: TaskLease, draft: TaskDraft, exc: Exception, start: float,
+    ) -> None:
+        """Report a crashed job on a held lease as a failed terminal.
+
+        The heartbeat is already stopped by the time this runs (solve's
+        ``finally``, or before it ever started when the clone failed). The
+        terminal honestly says ``verification_state='failed'`` /
+        ``settlement_state='unset'`` with ``result_commit`` pointing at the
+        base commit — no delivery exists to point at — and the capture carries
+        a ``failure_class`` plus the (truncated) exception message. The
+        receipt reports unknown usage rather than fabricated zeros. Reporting
+        itself is best-effort: if even the completion call cannot reach the
+        gateway there is nothing more this process can do for the lease, so
+        that secondary failure only warns.
+        """
+        failure_class = "git_error" if isinstance(exc, GitError) else "solve_error"
+        terminal = TaskTerminal(
+            lease_id=lease.lease_id,
+            verification_state="failed",
+            result_ref=None,
+            settlement_state="unset",
+            rating=None,
+            result_commit=draft.base_commit,
+        )
+        receipt = _build_receipt(
+            lease.lease_id,
+            SolveResult(result_commit=draft.base_commit, failure_class=failure_class),
+        )
+        capture: dict[str, Any] = {
+            "status": "failed",
+            "scope_ok": False,
+            "file_count": 0,
+            "changed_paths": [],
+            "wall_s": time.monotonic() - start,
+            "failure_class": failure_class,
+            "error": str(exc)[:_FAILURE_MESSAGE_MAX],
+        }
+        try:
+            self.client.complete_task(
+                draft.task_id,
+                self.config.runner_id,
+                lease.lease_id,
+                receipt=receipt,
+                terminal=terminal,
+                capture=capture,
+            )
+        except Exception as report_exc:  # noqa: BLE001 - nothing more to do for this lease
+            warnings.warn(
+                f"could not report crashed task {draft.task_id!r} to the gateway "
+                f"({report_exc}); the lease will expire server-side",
+                stacklevel=2,
+            )
 
     def run_forever(
         self,
         *,
-        poll_interval_s: float = float(DEFAULT_POLL_INTERVAL_S),
+        poll_interval_s: float | None = None,
         max_iterations: int | None = None,
         idle_sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        """Poll until stopped. ``max_iterations`` bounds it for tests/dry runs."""
+        """Poll until stopped. ``max_iterations`` bounds it for tests/dry runs.
+
+        The idle sleep between polls is the gateway-adopted
+        ``self.poll_interval_s`` unless ``poll_interval_s`` is given as an
+        explicit override.
+        """
+        interval = self.poll_interval_s if poll_interval_s is None else poll_interval_s
         iterations = 0
         while max_iterations is None or iterations < max_iterations:
             iterations += 1
             did_work = self.run_once()
             if not did_work:
-                idle_sleep(poll_interval_s)
+                idle_sleep(interval)
