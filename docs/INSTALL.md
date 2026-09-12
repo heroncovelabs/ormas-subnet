@@ -82,11 +82,7 @@ The reference solver runs `true` — a no-op that commits an empty result. It ex
 
 ## Known gaps (skeleton)
 
-What the reference skeleton does not do for you yet:
-
-- It polls and heartbeats on built-in defaults (15 s poll, 90 s heartbeat) that match today's gateway — it does **not** read the cadences from the registration response. If the gateway changes them, pass `poll_interval_s` to `run_forever()` and `heartbeat_interval_s` in `MinerConfig` yourself.
-- A crashed or killed job leaves its workdir behind, and a restart returns the same lease — so the next claim exits with `workdir already exists`. Delete the stale workdir before restarting.
-- Any git or HTTP error — a clone without credentials, a lost connection — terminates `run_forever()`: nothing is caught, no terminal is reported to the gateway, and the lease simply expires server-side.
+- Poll, heartbeat and lease cadences are adopted from the registration response; a job that crashes mid-run is reported to the gateway as a failed terminal and its workdir is replaced on the next claim; gateway errors surface as `OrmasGatewayError` with the gateway's `error.type` and message. Remaining gap: the skeleton does not retry a failed `complete` call — if the gateway is unreachable at that moment the lease expires server-side (a warning is emitted).
 
 ## Plug in your own `solve`
 
