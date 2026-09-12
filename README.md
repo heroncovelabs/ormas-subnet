@@ -42,12 +42,18 @@ or SN76.
   a task well lives here.
 - **Not an inference endpoint.** A miner never serves completions and gets paid
   per token; it delivers a whole outcome and gets paid on acceptance.
-- **Not the acceptance oracle (yet).** Today the gateway derives settlement from
-  the miner's own reported `verification_state` plus a scope/commit check — that
-  is acceptable only because our own miner is trusted. The **validator** — which
-  independently re-runs the verify command and is the real acceptance authority
-  for third-party miners — ships in this same public repo, but is not yet built.
-  See "Known gaps" below and the decision doc §8.
+- **Not yet settled by validators on the production gateway.** Today the
+  production gateway derives settlement from the miner's own reported
+  `verification_state` plus a scope/commit check — acceptable only because our
+  own miner is trusted. The **reference validator** — which clones the job's
+  repo, independently re-runs the verify command on base and result, checks
+  scope from `git diff`, signs, and posts accept/reject — ships here
+  (`ormas_subnet/validator.py`, `neurons/validator.py`). The gateway settles a
+  third-party miner's delivery only on unanimous validator acceptance and
+  refuses its claim until a validator count is configured; our own trusted
+  miner still settles by its own verify run. In production no validators are
+  configured yet and only our miner runs. See "Known gaps" below and the
+  decision doc §8.
 
 ## Plugging in your own `solve`
 
@@ -107,22 +113,25 @@ run at all. All three are now real:
 See `docs/protocol.md` § "What this package's reference skeleton actually
 does at completion" for the exact rules.
 
-## Known gaps (as of 2026-09-10, documented rather than papered over)
+## Known gaps (as of 2026-09-12, documented rather than papered over)
 
-- **Firm-bid field mirrored here; gateway deploy pending.** The gateway's claim
-  body accepts an optional `ask_usd` (the miner's firm ask) as of 2026-09-10 —
-  the first ask at or under the client's reserve is leased; an ask above it is
-  recorded and skipped, the job stays queued (`runner_api.claim_lease`). That
-  gateway change is on the integration branch, not yet deployed to
-  `api.ormas.ai`. This package now sends `ask_usd` when configured
+- **Firm asks are live.** The gateway's claim body accepts an optional
+  `ask_usd` (the miner's firm ask) — the first ask at or under the client's
+  reserve is leased; an ask above it is recorded and skipped, the job stays
+  queued (`runner_api.claim_lease`). Deployed on `api.ormas.ai` in
+  `gateway-2026.09.11`; nine production tasks settled at their firm asks on
+  2026-09-12 with zero platform fee. This package sends `ask_usd` when configured
   (`OrmasMinerClient.claim_task(..., ask_usd=...)` / `MinerConfig.ask_usd`,
   validated locally to the server's rule); the default `None` keeps sending only
   `schema_version` + `runner_id` and the gateway derives the ask (flat
   per-project fee, or estimated cost plus margin).
-- **No validator yet.** Settlement is the miner's own self-report today. Item
-  1b in the decision doc's consequence list is the validator design + build; it
-  belongs in this repo alongside the miner protocol, and is not part of this
-  card.
+- **No validators configured in production yet.** The reference validator
+  (this repo) and validator-quorum settlement (gateway, card `25ff6188`) are
+  built and deployed in `gateway-2026.09.11`, but `api.ormas.ai` has no
+  validator count configured and no third-party miner connected, so every
+  production receipt to date reflects our trusted miner's own verify run, not
+  an independent decision. Ed25519 is the dev-subnet signature scheme; sr25519
+  is the SN76 target.
 
 ## No secrets in the client
 
