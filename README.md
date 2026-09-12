@@ -89,7 +89,7 @@ def solve(draft: TaskDraft, workdir: Path) -> SolveResult:
 client = OrmasMinerClient(base_url="https://api.ormas.ai", token=my_token)
 config = MinerConfig(
     runner_id="my-miner-01", runner_version="0.1.0", platform="linux",
-    capacity=1, cells=("outcomes-grok-46-native",), workdir_root=Path.home() / ".ormas" / "work",
+    capacity=1, cells=("task:code",), workdir_root=Path.home() / ".ormas" / "work",
     repo_id="my-repo", repo_url="https://github.com/acme/target.git",
 )
 skeleton = MinerSkeleton(client, config, solve)

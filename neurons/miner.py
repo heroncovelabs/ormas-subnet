@@ -7,7 +7,7 @@ your own ``solve(draft, workdir) -> SolveResult`` — that function is the miner
 
     python neurons/miner.py --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
         --runner-id my-miner --repo-id <repo_id> --repo-url <https-or-ssh-url> \
-        --cell outcomes-grok-46-native --solve-command 'make fix' [--ask-usd 1.20]
+        --cell task:code --solve-command 'make fix' [--ask-usd 1.20]
 
 The token is read from an environment variable or a file, never from argv.
 """
@@ -31,7 +31,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--runner-id", required=True)
     ap.add_argument("--repo-id", required=True, help="Repo id the gateway bound for this project")
     ap.add_argument("--repo-url", required=True, help="Credential-free clone URL (https or ssh)")
-    ap.add_argument("--cell", action="append", required=True, help="Fleet cell alias (repeatable)")
+    ap.add_argument("--cell", action="append", required=True, help="Task-type cell this miner serves, e.g. task:code (repeatable)")
     ap.add_argument("--workdir-root", default=str(Path.cwd() / "ormas-work"))
     ap.add_argument("--solve-command", required=True, help="Shell command the reference solver runs in the workdir")
     ap.add_argument("--ask-usd", type=float, default=None, help="Firm ask sent with every claim; omit to let the gateway derive one")

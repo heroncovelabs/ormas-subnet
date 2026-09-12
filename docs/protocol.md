@@ -105,7 +105,7 @@ Register (or re-register) this miner.
 | `runner_version` | str | Free-form version string |
 | `platform` | str | Free-form platform label |
 | `capacity` | int | Concurrent task capacity |
-| `health` | object | Must include non-empty `cells: [str, ...]` (which reputation cells / archetypes this miner claims to serve); may include `device_nonce` |
+| `health` | object | Must include non-empty `cells: [str, ...]` — the task-type cells this miner serves: `task:code`, `task:code/<small|medium|large>`, `task:lang/<language>` (see INSTALL.md); may include `device_nonce` |
 
 **Response**: `{"runner_id": str, "poll_interval_s": int, "lease_ttl_s": int, "heartbeat_s": int, "protocol": "ormas-runner-v1"}`.
 Today's server values: `poll_interval_s=15`, `lease_ttl_s=300`, `heartbeat_s=90`
