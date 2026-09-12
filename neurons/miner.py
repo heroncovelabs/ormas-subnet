@@ -5,7 +5,7 @@ the connect → bind → claim → solve → verify → publish → complete loo
 end before plugging in real mining logic. Replace ``make_shell_solver`` with
 your own ``solve(draft, workdir) -> SolveResult`` — that function is the miner.
 
-    python neurons/miner.py --gateway https://api.ormas.ai --token-env ORMAS_RUNNER_TOKEN \
+    python neurons/miner.py --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
         --runner-id my-miner --repo-id <repo_id> --repo-url <https-or-ssh-url> \
         --cell outcomes-grok-46-native --solve-command 'make fix' [--ask-usd 1.20]
 
@@ -26,7 +26,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Ormas subnet reference miner")
     ap.add_argument("--gateway", required=True, help="Gateway base URL, e.g. https://api.ormas.ai")
     tok = ap.add_mutually_exclusive_group(required=True)
-    tok.add_argument("--token-env", help="Env var holding the runner token")
+    tok.add_argument("--token-env", help="Env var holding the miner token (conventionally ORMAS_MINER_TOKEN)")
     tok.add_argument("--token-file", help="File holding the runner token")
     ap.add_argument("--runner-id", required=True)
     ap.add_argument("--repo-id", required=True, help="Repo id the gateway bound for this project")

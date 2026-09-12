@@ -83,6 +83,14 @@ until a validator count is configured (decision doc §8, item 1b; reference
 validator in `ormas_subnet/validator.py`). In production no validators are
 configured yet and no third-party miner has connected.
 
+`pending_acceptance` is what a third-party miner sees at `complete`: the route
+returns `200` with `receipt.settlement = "pending_acceptance"` (never `paid` for
+a cross-tenant delivery), and the miner's job ends there. Settlement then
+follows the validator quorum — unanimous accept settles `paid` at exactly the
+accepted ask; any reject settles `no_delivery`/`validator_reject`, unpaid. There
+is no miner-facing route to learn the verdict in this protocol version; do not
+build a callback around one.
+
 ## Routes
 
 ### `POST /api/runner/v1/registrations`
@@ -273,17 +281,22 @@ it does not trust `solve`'s self-report for anything settlement-relevant:
 
 ## Known gaps between this doc and the decision record
 
-- **Firm bid mirrored in both halves, awaiting gateway deploy.** The gateway's
-  `claim_lease` accepts `ask_usd` (2026-09-10, on the integration branch, not
-  yet deployed to `api.ormas.ai`), and this package now sends it:
-  `client.claim_task(..., ask_usd=...)` with `MinerConfig.ask_usd` threaded
-  through the skeleton, validated locally to the server's rule (finite, ≥ 0,
-  not a bool — a bad value raises `ValueError` before any request). The default
-  `None` keeps the byte-identical two-field body and the server-derived ask
-  (`outcome_price_usd` on the lease). A miner built from this package can bid
-  as soon as the gateway change ships.
-- **No validator.** `verification_state`/`scope_ok` are miner-reported.
-  Nothing here re-runs `verify_command` independently yet.
+- **Firm asks are live.** The gateway's claim body accepts an optional `ask_usd`
+  (the miner's firm ask) — deployed on `api.ormas.ai` in `gateway-2026.09.11`;
+  the first ask at or under the client's reserve is leased, and an ask above it
+  is recorded and skipped. This package sends it when configured
+  (`client.claim_task(..., ask_usd=...)` / `MinerConfig.ask_usd`, validated
+  locally to the server's rule: finite, ≥ 0, not a bool — a bad value raises
+  `ValueError` before any request). The default `None` keeps the two-field
+  claim body and the server-derived ask (`outcome_price_usd` on the lease).
+- **Validator-quorum settlement is built but not configured in production.**
+  The reference validator ships in this package (`ormas_subnet/validator.py`,
+  `neurons/validator.py`), and the gateway settles a third-party miner's
+  delivery only on unanimous validator acceptance, refusing its claim until a
+  validator count is configured. `api.ormas.ai` has no validator count
+  configured and no third-party miner has connected, so every production
+  receipt to date reflects our trusted miner's own verify run, not an
+  independent decision.
 - **No reputation feed from this protocol version.** Nothing in this route set
   writes to a miner-identity reputation history a chain weight could read;
   that is consequence item 3 in the decision doc, not yet built.
