@@ -50,6 +50,10 @@ Two honesty rules protect your score: report `None` for usage you do not know â€
 
 Model routing, hardware, energy, harness, caching, the orchestration loop â€” all of it lives inside your miner, and none of it is specified by Ormas. The network rewards accepted outcomes at the best price, latency, and quality; how you produce them is your edge. This repo ships protocol mechanics only. Your `solve` is the mining.
 
+## Other gateways
+
+Anyone may operate their own gateway against SN76 miners using this protocol. Ormas neither blocks nor supports that: there is no compatibility promise beyond the published protocol version, no support channel, and no shared settlement or reputation. A miner that connects to a third-party gateway is bound by that gateway's terms, not this contract. Ormas's own acceptance and settlement are what the reference validator and the subnet's weights are built around.
+
 ## Not decided yet
 
 Owner calls, not values this page may invent: commercial terms for external miners, the assigned validator count and decision timeouts, the validator fee share, and validator collateral. The validator count, timeouts and spot-check fraction will be set from measurements on the development subnet, not chosen up front.
