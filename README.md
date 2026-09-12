@@ -1,5 +1,11 @@
 # ormas-subnet
 
+> **Ormas: pay for verified receipts, not inference turns.**
+> A client describes a change and the test that proves it. Miners with public track records post a firm ask for the passing result. Accepted delivery → the miner is paid exactly its ask; a miss pays nothing.
+> The client's acceptance tests are the purchase order; validators re-run them before anyone is paid.
+
+Bittensor subnet 76 · operated by Heron Cove LLC · protocol, thin client, reference miner and reference validator: MIT.
+
 This package is normative under
 [`docs/DECISIONS.md`](docs/DECISIONS.md)
 (owner-locked 2026-09-10): **the runner is the miner.** A miner posts a firm bid
@@ -133,6 +139,10 @@ does at completion" for the exact rules.
   production receipt to date reflects our trusted miner's own verify run, not
   an independent decision. Ed25519 is the dev-subnet signature scheme; sr25519
   is the SN76 target.
+
+## Other gateways
+
+Anyone may operate their own gateway against SN76 miners using this protocol. Ormas neither blocks nor supports that: there is no compatibility promise beyond the published protocol version, no support channel, and no shared settlement or reputation. A miner that connects to a third-party gateway is bound by that gateway's terms, not [`docs/CONTRACT.md`](docs/CONTRACT.md). Ormas's own acceptance and settlement are what the reference validator and the subnet's weights are built around.
 
 ## No secrets in the client
 
