@@ -30,7 +30,33 @@ from .protocol import (
     snapshot_evidence,
 )
 
-__all__ = ["OrmasMinerClient", "load_token"]
+__all__ = ["OrmasMinerClient", "OrmasGatewayError", "load_token"]
+
+
+class OrmasGatewayError(RuntimeError):
+    """An HTTP error from the gateway, carrying its structured error body.
+
+    The gateway answers failures with ``{"error": {"type": ..., "message": ...}}``
+    (``docs/protocol.md``); a bare ``resp.raise_for_status()`` drops that body and
+    leaves the operator with only a status code. This error instead carries the
+    parsed ``status_code`` / ``error_type`` / ``message``, and its string names
+    them (falling back to the raw response text when the body is not the
+    structured shape).
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int | None,
+        error_type: str | None,
+        message: str,
+    ) -> None:
+        self.status_code = status_code
+        self.error_type = error_type
+        self.message = message
+        label = f"HTTP {status_code}" if status_code is not None else "HTTP error"
+        type_part = f" [{error_type}]" if error_type else ""
+        super().__init__(f"gateway {label}{type_part}: {message}")
 
 
 def load_token(*, token_env: str | None = None, token_path: str | os.PathLike[str] | None = None) -> str:
@@ -100,6 +126,40 @@ class OrmasMinerClient:
             return self._client.post(path, json=body)
         return self._client.post(path, json=body, headers=headers)
 
+    @staticmethod
+    def _raise_for_status(resp: Any) -> None:
+        """``resp.raise_for_status()`` that surfaces the gateway's error body.
+
+        On an HTTP error the raised :class:`OrmasGatewayError` carries the
+        structured ``error.type`` / ``error.message`` from ``resp.json()`` when
+        present (falling back to ``resp.text``), chained from the original
+        transport error.
+        """
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            error_type: str | None = None
+            detail: str | None = None
+            try:
+                payload = resp.json()
+            except Exception:  # noqa: BLE001 - the body may not be JSON at all
+                payload = None
+            if isinstance(payload, Mapping):
+                error = payload.get("error")
+                if isinstance(error, Mapping):
+                    raw_type = error.get("type")
+                    raw_message = error.get("message")
+                    error_type = None if raw_type is None else str(raw_type)
+                    detail = None if raw_message is None else str(raw_message)
+            if detail is None:
+                text = getattr(resp, "text", None)
+                detail = str(text) if text else str(exc)
+            raise OrmasGatewayError(
+                status_code=getattr(resp, "status_code", None),
+                error_type=error_type,
+                message=detail,
+            ) from exc
+
     # ------------------------------------------------------------------
     # /api/runner/v1 routes
     # ------------------------------------------------------------------
@@ -111,7 +171,7 @@ class OrmasMinerClient:
         ``lease_ttl_s``, ``heartbeat_s`` — honor those over any local default.
         """
         resp = self._post("/api/runner/v1/registrations", registration.to_wire())
-        resp.raise_for_status()
+        self._raise_for_status(resp)
         return resp.json()
 
     def register_repository(
@@ -128,7 +188,7 @@ class OrmasMinerClient:
             "project_id": project_id,
         }
         resp = self._post("/api/runner/v1/repositories", body)
-        resp.raise_for_status()
+        self._raise_for_status(resp)
         return resp.json()
 
     def claim_task(
@@ -156,7 +216,7 @@ class OrmasMinerClient:
         if ask_usd is not None:
             body["ask_usd"] = float(ask_usd)
         resp = self._post("/api/runner/v1/leases", body)
-        resp.raise_for_status()
+        self._raise_for_status(resp)
         if getattr(resp, "status_code", None) == 204:
             return None
         payload = resp.json()
@@ -187,7 +247,7 @@ class OrmasMinerClient:
             "event": None if event is None else event.to_wire(),
         }
         resp = self._post(f"/api/runner/v1/leases/{task_id}/heartbeat", body)
-        resp.raise_for_status()
+        self._raise_for_status(resp)
         return resp.json()
 
     def complete_task(
@@ -224,7 +284,7 @@ class OrmasMinerClient:
         status = getattr(resp, "status_code", None)
         if status in (202, 410):
             return resp.json()
-        resp.raise_for_status()
+        self._raise_for_status(resp)
         return resp.json()
 
     def close(self) -> None:
