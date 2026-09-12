@@ -33,6 +33,7 @@ or SN76.
 - The **protocol contract** in [`docs/protocol.md`](docs/protocol.md): every
   route, field, forbidden field, and error code, written so you could implement
   a miner in another language from it alone.
+- No token yet? [`docs/QUICKSTART_LOCAL.md`](docs/QUICKSTART_LOCAL.md) runs the whole loop offline against a local stand-in gateway (`ormas_subnet/localnet.py`) — no token, no network host.
 
 ## What this is NOT
 

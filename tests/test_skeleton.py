@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from ormas_subnet.client import OrmasMinerClient
-from ormas_subnet.protocol import RUNNER_PROTOCOL_V1
+from ormas_subnet.localnet import LocalGateway as FakeGateway
 from ormas_subnet.reference_solver import make_shell_solver
 from ormas_subnet.skeleton import MinerConfig, MinerSkeleton, SolveResult
 from ormas_subnet.validator import (
@@ -41,111 +41,6 @@ class _FakeResponse:
 
     def json(self) -> Any:
         return self._body
-
-
-class FakeGateway:
-    """Enough of ``/api/runner/v1`` to drive the skeleton end to end.
-
-    Deliberately simplified vs. the real server (no auth, no persistence) — this
-    is a protocol-shape double, not a reimplementation of runner_api.py.
-    """
-
-    def __init__(
-        self,
-        *,
-        task_id: str,
-        base_commit: str,
-        verify_command: str,
-        allowed_paths: list[str] | None = None,
-    ) -> None:
-        self.task_id = task_id
-        self.base_commit = base_commit
-        self.verify_command = verify_command
-        self.allowed_paths = allowed_paths if allowed_paths is not None else ["out.txt"]
-        self.registered: dict[str, Any] | None = None
-        self.bound: dict[str, Any] | None = None
-        self.claims: list[dict[str, Any]] = []
-        self.claimed = False
-        self.heartbeats: list[dict[str, Any]] = []
-        self.completed: dict[str, Any] | None = None
-        self._lease_token = "lease-token-1"
-
-    def post(self, path: str, json: dict[str, Any] | None = None, headers: Any = None) -> _FakeResponse:
-        body = json or {}
-        assert body.get("schema_version") == RUNNER_PROTOCOL_V1
-        if path == "/api/runner/v1/registrations":
-            self.registered = body
-            return _FakeResponse(
-                200,
-                {
-                    "runner_id": body["runner_id"],
-                    "poll_interval_s": 15,
-                    "lease_ttl_s": 300,
-                    "heartbeat_s": 90,
-                    "protocol": RUNNER_PROTOCOL_V1,
-                },
-            )
-        if path == "/api/runner/v1/repositories":
-            self.bound = body
-            return _FakeResponse(200, {"repo_id": body["repo_id"], "project_id": body["project_id"]})
-        if path == "/api/runner/v1/leases":
-            self.claims.append(body)
-            if self.claimed:
-                return _FakeResponse(204, None)
-            self.claimed = True
-            lease = {
-                "schema_version": RUNNER_PROTOCOL_V1,
-                "lease_id": self._lease_token,
-                "task_id": self.task_id,
-                "expires_at": "2026-01-01T00:05:00Z",
-                "selected_cell": "code-edit-small",
-                "provider_pin": "unset",
-                "fallback_policy": "unset",
-                "hold_ref": "unset",
-                "now": "2026-01-01T00:00:00Z",
-                "outcome_price_usd": 0.05,
-            }
-            draft = {
-                "schema_version": RUNNER_PROTOCOL_V1,
-                "task_id": self.task_id,
-                "runner_id": body["runner_id"],
-                "repo_id": "repo1",
-                "base_commit": self.base_commit,
-                "brief": "append a line to out.txt",
-                "verify_command": self.verify_command,
-                "allowed_paths": self.allowed_paths,
-                "budget_usd": 1.0,
-                "work_packet": {"task": "append a line to out.txt"},
-                "work_packet_sha256": "b" * 64,
-                "attempt": 0,
-                "parent_job_id": "",
-                "repair_findings": [],
-            }
-            return _FakeResponse(200, {"lease": lease, "draft": draft})
-        if path.endswith("/heartbeat"):
-            self.heartbeats.append(body)
-            return _FakeResponse(200, {"expires_at": "2026-01-01T00:05:00Z", "now": "2026-01-01T00:00:30Z"})
-        if path.endswith("/complete"):
-            assert body["receipt"]["schema_version"] == RUNNER_PROTOCOL_V1
-            assert body["terminal"]["verification_state"] in {"verified", "failed"}
-            self.completed = body
-            return _FakeResponse(
-                200,
-                {
-                    "status": "done" if body["terminal"]["verification_state"] == "verified" else "failed",
-                    "receipt": {
-                        "receipt_id": "rcpt_1",
-                        "settlement": "paid",
-                        "customer_billed_usd": 0.05,
-                        "debit_status": "delivered",
-                        "upstream_cost_usd": 0.0,
-                    },
-                },
-            )
-        raise AssertionError(f"unhandled path: {path}")
-
-    def get(self, path: str) -> _FakeResponse:  # pragma: no cover - unused by the skeleton
-        raise AssertionError(f"unexpected GET: {path}")
 
 
 def _init_repo(tmp_path: Path) -> tuple[Path, str]:
