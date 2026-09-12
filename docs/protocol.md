@@ -71,15 +71,17 @@ register runner  ──▶  bind repo(s)  ──▶  poll claim ──(204 idle)
                                             complete ──▶ 200 done | 202 settling (poll again) | 410 replay
 ```
 
-Acceptance today: the gateway derives `settlement` from the miner's own
-`terminal.verification_state` plus a scope check on `capture.scope_ok` and a
-valid 40-hex `result_commit`. This is **self-reported**, acceptable only because
-today's only miner is our own trusted one. The **validator** — an independent
-re-run of the packet's verify command against the delivered branch, whose
-accept/reject decision is the actual settlement condition for a third-party
-miner — is designed but not yet built (decision doc §8, item 1b). Until it
-ships, do not read a `"paid"` settlement as proof of correctness from an
-external miner.
+Acceptance today: for a miner in the client's own tenant (our trusted miner) the
+gateway derives `settlement` from the miner's own `terminal.verification_state`
+plus a scope check on `capture.scope_ok` and a valid 40-hex `result_commit`.
+This is **self-reported**, acceptable only because that miner is ours. For a
+third-party (cross-tenant) miner the gateway settles only on **unanimous
+validator acceptance** — the delivery goes `pending_acceptance`, assigned
+validators independently re-run the packet's verify command against the
+delivered branch and post signed decisions — and it refuses the claim outright
+until a validator count is configured (decision doc §8, item 1b; reference
+validator in `ormas_subnet/validator.py`). In production no validators are
+configured yet and no third-party miner has connected.
 
 ## Routes
 
@@ -125,9 +127,8 @@ leased to this miner when `ask_usd` is at or under the client's reserve; an ask
 above the reserve is recorded and the job is skipped (it stays queued for the
 next miner). When `ask_usd` is absent the server derives the ask (flat per-project
 fee, or estimated cost plus margin) and applies the same reserve gate. Every ask
-is recorded with its arrival offset. **Deployment status:** `ask_usd` is on the
-gateway's integration branch as of 2026-09-10 and not yet deployed to
-`api.ormas.ai`. This package's client sends it when configured
+is recorded with its arrival offset. **Deployment status:** `ask_usd` is live on
+`api.ormas.ai` since `gateway-2026.09.11`. This package's client sends it when configured
 (`claim_task(..., ask_usd=...)` / `MinerConfig.ask_usd`); with no ask
 configured the body is exactly `schema_version` + `runner_id`.
 
