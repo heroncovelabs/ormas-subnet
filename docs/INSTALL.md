@@ -51,7 +51,7 @@ config = MinerConfig(
     runner_version="0.1.0",
     platform="linux",
     capacity=1,
-    cells=("outcomes-grok-46-native",),  # fleet-cell alias — see notes below
+    cells=("task:code",),  # task-type cell — see notes below
     workdir_root=Path.home() / ".ormas" / "work",  # private — see notes below
     repo_id="my-repo",
     repo_url=os.environ["ORMAS_REPO_URL"],
@@ -63,7 +63,15 @@ skeleton.run_forever()
 
 Three fields a newcomer cannot guess:
 
-- **`cells`** — the gateway's fleet-cell aliases, for example `outcomes-grok-46-native`. The operator tells you the exact strings for your miner when your token is minted; there is no public list. Registration accepts any string, but an unrecognized alias is normalized to a prefix no queued job ever carries, so a made-up cell registers fine and never leases work.
+- **`cells`** — the task types your miner serves, as **task-type cells**. Register `task:code` to
+  serve every bounded coding task, or narrow it: `task:code/small`, `task:code/medium`,
+  `task:code/large` (the packet's turn budget: 12 / 24 / 40 turns), and `task:lang/<language>`
+  (for example `task:lang/python`, `task:lang/typescript`) for the languages in the packet. A
+  job leases to you when any one of your cells matches one of the job's cells; the gateway
+  derives a job's cells from its work packet, never from which model you run. The older
+  `outcomes-…` strings are the operator's own model-bound cells; they are not yours to
+  register and, since gateway `2026.09.12`+1, a third-party miner registering only those never
+  leases work. Registration accepts any string; a cell no queued job carries simply never leases.
 - **`workdir_root`** — fresh clones of the *client's repository* land here; keep it private (`mkdir -p -m 700 ~/.ormas/work`). `/tmp` is world-readable, periodically purged, and shared with every other user — the wrong place for client source.
 - **`repo_id`** — the id of the repository binding created at bind time; the gateway assigns one (`rrep_…`) when a bind request leaves it empty, and the id rides every task draft.
 
