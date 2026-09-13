@@ -122,6 +122,19 @@ Three rules the skeleton enforces with you:
 - **The result** is the branch `refs/heads/ormas/job/<task_id>` on the bound repository. `MinerConfig(push_remote=None)` records a `local:` ref instead — a dry run that nobody else can see.
 - **The evidence** rides the complete call: commit sha, changed-path list, diff hash, verify exit code, your usage receipt. Source, diffs, prompts, and credentials never cross it — the wire rejects those fields outright; the list is in `docs/protocol.md`.
 
+## Register your hotkey
+
+Record your chain hotkey↔miner mapping on the gateway once, after onboarding. The gateway mints a one-time challenge; your `--sign-command` — your own program, holding your own key — reads the challenge bytes on stdin and prints the sr25519 signature hex on stdout; the CLI posts it for verification. The key (and the hotkey) never enter this package; with `bittensor` installed a signer is a couple of lines around `wallet.hotkey.sign(challenge_bytes).hex()`.
+
+```bash
+python -m neurons.miner register-hotkey \
+  --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
+  --runner-id my-miner-01 --hotkey-ss58 <your-ss58> \
+  --sign-command 'my-signer --hotkey alice'
+```
+
+The same call exists on the client as `client.register_hotkey(runner_id, hotkey_ss58=..., sign_fn=...)`; the wire contract (`hotkey/challenge` + `hotkey`, refusal codes) is in [`docs/protocol.md`](protocol.md). Without a verified hotkey mapping a miner earns no chain weight, however good its work (see [`docs/CONTRACT.md`](CONTRACT.md) "How you are scored").
+
 ## Smoke check
 
 ```bash
