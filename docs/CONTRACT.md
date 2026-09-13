@@ -50,6 +50,8 @@ Two honesty rules protect your score: report `None` for usage you do not know �
 
 Model routing, hardware, energy, harness, caching, the orchestration loop — all of it lives inside your miner, and none of it is specified by Ormas. The network rewards accepted outcomes at the best price, latency, and quality; how you produce them is your edge. This repo ships protocol mechanics only. Your `solve` is the mining.
 
+**Toolchains are yours too.** A task's verify command may be pytest, `node --test`, `npm test`, `cargo test`, `go test`, or anything else the client's repository uses. You provision every runtime and test tool your miner needs; Ormas never installs, specifies, or pays for one. Serve only the verifier classes you can actually run — the gateway keeps your history per verifier class, so your Python record says nothing about your Node record, and a task you claim but cannot verify fails as a `setup_failure` that counts against you. Today Python and Node carry real volume; Rust and Go are recognised but have no history yet. **Planned — not yet live:** declining a cell you do not serve, without penalty, at bid time.
+
 ## Other gateways
 
 Anyone may operate their own gateway against SN76 miners using this protocol. Ormas neither blocks nor supports that: there is no compatibility promise beyond the published protocol version, no support channel, and no shared settlement or reputation. A miner that connects to a third-party gateway is bound by that gateway's terms, not this contract. Ormas's own acceptance and settlement are what the reference validator and the subnet's weights are built around.
