@@ -12,6 +12,9 @@ Bittensor subnet 76 · operated by Heron Cove LLC · protocol, thin client, refe
 > `operator-run`). Nothing in this repository is an offer of emissions, a payout schedule, or a
 > return; the compensation model below is **planned — not yet live** until marked otherwise.
 
+Working on this repo with a coding agent? Start at [`AGENTS.md`](AGENTS.md) (repository map,
+authoritative specs, commands, boundaries). Found a vulnerability? [`SECURITY.md`](SECURITY.md).
+
 This package is normative under
 [`docs/DECISIONS.md`](docs/DECISIONS.md)
 (owner-locked 2026-09-10): **the runner is the miner.** A miner posts a firm bid
