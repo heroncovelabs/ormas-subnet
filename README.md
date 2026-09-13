@@ -6,6 +6,12 @@
 
 Bittensor subnet 76 · operated by Heron Cove LLC · protocol, thin client, reference miner and reference validator: MIT.
 
+> **Disclosure.** Heron Cove LLC runs a miner and a validator on SN76 and operates the gateway that
+> settles work. Until validators gate settlement on the production gateway, acceptance is not
+> independent of us; we say so wherever a number appears (`/v1/public/providers` labels our miner
+> `operator-run`). Nothing in this repository is an offer of emissions, a payout schedule, or a
+> return; the compensation model below is **planned — not yet live** until marked otherwise.
+
 This package is normative under
 [`docs/DECISIONS.md`](docs/DECISIONS.md)
 (owner-locked 2026-09-10): **the runner is the miner.** A miner posts a firm bid
@@ -119,6 +125,38 @@ run at all. All three are now real:
 
 See `docs/protocol.md` § "What this package's reference skeleton actually
 does at completion" for the exact rules.
+
+## How miners are paid (planned — not yet live)
+
+Ormas (Heron Cove LLC) sells verified coding Outcomes to customers in USD and is responsible for
+delivery. Miners are Ormas's suppliers: they bid a USD price per Outcome (`ask_usd`), and when their
+work is accepted that USD bid becomes their **emission target**. Independent validators convert
+targets into SN76 emission weights every epoch using the on-chain alpha price and a published
+TAO/USD reference, so **miners are paid in alpha by the chain**. Any USD not covered by an epoch's
+emissions **carries forward** as a visible balance; persistent balances are **topped up in alpha from
+Ormas's treasury** on a daily netting schedule, after a KYC/W-9/W-8 gate. Every balance and payment
+is **recomputable from public per-epoch artifacts**. Ormas never converts a customer's dollars for a
+miner, never holds alpha for anyone, and never pays miners in dollars by default. Bids are USD
+*targets*; what an epoch actually pays varies with the alpha price. Detail and the open parameters:
+[`docs/economics.md`](docs/economics.md); the obligations: [`MINER_TERMS.md`](MINER_TERMS.md) (draft).
+
+### How this compares to other subnets
+
+From the operators' own documentation, read 2026-09-12/13. Check the sources; these summaries are ours.
+
+| | SN4 Targon (Manifold) | SN28 sayGM (T34) | SN51 Lium (Datura) | SN76 Ormas |
+|---|---|---|---|---|
+| What is priced in USD | per-card-hour targets and caps | traffic value served (discount off retail) | rental fees | the accepted Outcome bid |
+| Who converts USD → weight | validators, at a TAO price | validators, from public epoch artifacts | — (emissions separate from pay) | validators, at pool price × published TAO/USD reference |
+| Miner paid in | emissions only | emissions only | 95% of USD fees in alpha from Lium's treasury, daily, T+2, plus emissions | emissions; shortfall carried forward, then topped up in alpha from treasury |
+| Unallocated emission | burned | — | — | weight to owner UID (burn/recycle per hyperparameter) |
+| Public per-epoch ledger | no | yes (every earning recomputable) | no | yes (sayGM standard) |
+| Seller of record to the customer | Manifold | T34 | Lium (pass-through shape) | Heron Cove LLC |
+
+Sources: `docs.targon.com/providers/miner/` (mirrored in `manifold-inc/targon`), sayGM's public
+miner ledger and docs, Lium's provider docs. We copy Targon's USD-target conversion and sayGM's
+public ledger; the on-chain carry-forward and the US seller standing behind the target are ours.
+No peer we found combines all five columns.
 
 ## Known gaps (as of 2026-09-12, documented rather than papered over)
 
