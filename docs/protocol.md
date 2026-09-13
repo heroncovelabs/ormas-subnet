@@ -279,6 +279,54 @@ it does not trust `solve`'s self-report for anything settlement-relevant:
   `capture.attempts` (`[{"verify_exit_code": N}]`), the same shape the
   private runner uses (`outcomes_worker.py`'s per-attempt projection).
 
+### `POST /api/runner/v1/hotkey/challenge`
+
+Mint a one-time challenge for chain-hotkey registration, bound to this
+(runner, miner identity, hotkey). The challenge expires in 300 s and can be
+consumed exactly once.
+
+**Request**:
+
+| Field | Type | Notes |
+|---|---|---|
+| `runner_id` | str | Miner's stable id |
+| `hotkey_ss58` | str | SS58 address of the hotkey to register |
+
+**Response**: `{"challenge": str, "expires_at": str, "now": str, "miner_identity": str}`.
+
+### `POST /api/runner/v1/hotkey`
+
+Verify the miner's signature over the challenge and record the verified
+hotkey↔miner-identity mapping the weights scorer pays on. The signature is
+**sr25519 over the UTF-8 bytes of the challenge string** — exactly those bytes,
+nothing prepended — made with the miner's own tooling (e.g. a Bittensor wallet
+`Keypair.sign`); this package never holds, derives, or loads a hotkey
+(`OrmasMinerClient.register_hotkey` takes an injected `sign_fn`; the miner CLI
+takes a `--sign-command` that reads the challenge on stdin and prints hex).
+
+**Request**:
+
+| Field | Type | Notes |
+|---|---|---|
+| `runner_id` | str | Miner's stable id |
+| `hotkey_ss58` | str | Must match the minted challenge's hotkey |
+| `challenge` | str | The exact challenge string the challenge route returned |
+| `signature_hex` | str | sr25519 signature over the challenge's UTF-8 bytes, hex-encoded |
+
+**Response**: `{"miner_identity": str, "hotkey_ss58": str, "verified": true,
+"signature_scheme": "sr25519"}`. Nothing is written on any refusal:
+
+| HTTP | Message | When |
+|---|---|---|
+| 400 | `hotkey_invalid` | `hotkey_ss58` is not a valid SS58 address |
+| 400 | `challenge_unknown` | No challenge minted for this (runner, hotkey) |
+| 400 | `challenge_mismatch` | `challenge` does not match the minted string |
+| 400 | `challenge_expired` | Challenge older than 300 s |
+| 400 | `hotkey_signature_invalid` | sr25519 verification failed |
+| 409 | `challenge_used` | Challenge was already consumed (one-time) |
+| 409 | `hotkey_claimed` | Hotkey already registered to a different miner identity |
+| 503 | `hotkey_verification_unavailable` | Verification subsystem unavailable |
+
 ## Known gaps between this doc and the decision record
 
 - **Firm asks are live.** The gateway's claim body accepts an optional `ask_usd`

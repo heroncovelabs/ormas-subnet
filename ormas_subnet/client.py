@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .protocol import (
     RUNNER_DEVICE_HEADER,
@@ -284,6 +284,81 @@ class OrmasMinerClient:
         status = getattr(resp, "status_code", None)
         if status in (202, 410):
             return resp.json()
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def hotkey_challenge(self, runner_id: str, *, hotkey_ss58: str) -> dict[str, Any]:
+        """POST /api/runner/v1/hotkey/challenge — mint a one-time registration challenge.
+
+        The gateway binds the challenge to (runner, miner identity, hotkey); it
+        is valid for 300 s and can be consumed exactly once. Response keys:
+        ``challenge``, ``expires_at``, ``now``, ``miner_identity``. Raises
+        ``ValueError`` if the payload is not a mapping or lacks a str
+        ``challenge``.
+
+        This package never holds, derives, or loads a hotkey — the challenge is
+        an opaque string here; signing it is the miner's own tooling's job (see
+        :meth:`register_hotkey`).
+        """
+        body: dict[str, Any] = {
+            "schema_version": RUNNER_PROTOCOL_V1,
+            "runner_id": runner_id,
+            "hotkey_ss58": hotkey_ss58,
+        }
+        resp = self._post("/api/runner/v1/hotkey/challenge", body)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("challenge"), str):
+            raise ValueError("invalid hotkey challenge payload")
+        return dict(payload)
+
+    def register_hotkey(
+        self,
+        runner_id: str,
+        *,
+        hotkey_ss58: str,
+        sign_fn: Callable[[bytes], str],
+    ) -> dict[str, Any]:
+        """Drive challenge → sign → register for the miner's chain hotkey.
+
+        Mints a challenge via :meth:`hotkey_challenge`, then calls the injected
+        signer as ``sign_fn(challenge.encode("utf-8"))`` — the signature covers
+        EXACTLY the UTF-8 bytes of the challenge string, nothing prepended. The
+        signer is injected because this package never holds, derives, or loads a
+        hotkey; the miner signs with its own tooling (e.g. a Bittensor wallet
+        ``Keypair.sign``) and hands back the hex signature.
+
+        The signature is validated locally BEFORE the register request is sent:
+        it must be a non-empty ``str`` of even length consisting only of hex
+        digits — anything else raises ``ValueError`` and no request is made.
+
+        Then POSTs ``/api/runner/v1/hotkey`` with ``{schema_version, runner_id,
+        hotkey_ss58, challenge, signature_hex}``. A refusal (400/409/503, e.g.
+        ``hotkey_claimed``) raises :class:`OrmasGatewayError` carrying the
+        server's message — never a returned result — and ``verified`` is never
+        set or inferred locally. Returns the response JSON dict
+        (``miner_identity``, ``hotkey_ss58``, ``verified``,
+        ``signature_scheme``).
+        """
+        challenge = self.hotkey_challenge(runner_id, hotkey_ss58=hotkey_ss58)["challenge"]
+        signature_hex = sign_fn(challenge.encode("utf-8"))
+        if (
+            not isinstance(signature_hex, str)
+            or not signature_hex
+            or len(signature_hex) % 2 != 0
+            or any(c not in "0123456789abcdefABCDEF" for c in signature_hex)
+        ):
+            raise ValueError(
+                "sign_fn must return a non-empty, even-length hex signature string"
+            )
+        body: dict[str, Any] = {
+            "schema_version": RUNNER_PROTOCOL_V1,
+            "runner_id": runner_id,
+            "hotkey_ss58": hotkey_ss58,
+            "challenge": challenge,
+            "signature_hex": signature_hex,
+        }
+        resp = self._post("/api/runner/v1/hotkey", body)
         self._raise_for_status(resp)
         return resp.json()
 
