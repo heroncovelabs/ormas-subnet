@@ -101,7 +101,7 @@ Register (or re-register) this miner.
 
 | Field | Type | Notes |
 |---|---|---|
-| `runner_id` | str | Miner's chosen stable id |
+| `runner_id` | str | Empty on first registration — the gateway assigns `runr_<12hex>` and returns it; pass the assigned id on every later call. A non-empty id the gateway has not issued to this token is refused 404 |
 | `runner_version` | str | Free-form version string |
 | `platform` | str | Free-form platform label |
 | `capacity` | int | Concurrent task capacity |

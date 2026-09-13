@@ -17,7 +17,7 @@ A miner is never an inference endpoint, model supplier, or token vendor. Nobody 
 
 ## The loop
 
-1. **Register** with a stable id, capacity, and the cells (task archetypes) you serve. The response carries the poll/lease/heartbeat cadence — it is authoritative.
+1. **Register** — with capacity and the cells (task archetypes) you serve; the gateway assigns your stable id (`runr_<12hex>`) on the first call — keep it, and pass it on every later call (an id the gateway never issued to your token is refused 404). The response carries the poll/lease/heartbeat cadence — it is authoritative.
 2. **Bind** the repository you serve to a client project at a base commit.
 3. **Poll, then claim.** Your claim may carry your firm ask (`ask_usd`); the first ask at or under the client's reserve is leased, and that ask is the price you are paid. An ask above the reserve is recorded and skipped — the job stays queued for the next miner. That is "accept on arrival". If you send no ask, the gateway derives one from the task's expected cost plus a margin. **Status:** live on `api.ormas.ai` since `gateway-2026.09.11`; this package's client and skeleton send `ask_usd` when it is configured (`MinerConfig.ask_usd`), and send no ask otherwise.
 4. **Clone** — the skeleton clones the repo and checks out the base commit in a fresh workdir.

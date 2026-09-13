@@ -261,6 +261,12 @@ class MinerConfig:
     ``ask_usd`` is the miner's firm ask sent with every claim; the default
     ``None`` sends no ask — the byte-identical two-field claim body — and the
     server derives one. A bad value raises ``ValueError`` at the claim, locally.
+
+    ``runner_id`` may be ``""`` on the first run — the gateway assigns it
+    (``runr_<12hex>``) at registration, and ``MinerSkeleton.register`` adopts
+    the assigned id into this field. Afterwards it is the assigned/known id:
+    pass the one the gateway issued; a non-empty id it has not issued to this
+    token is refused 404.
     """
 
     runner_id: str
@@ -305,6 +311,10 @@ class MinerSkeleton:
     def register(self, *, health_extra: dict[str, Any] | None = None) -> dict[str, Any]:
         """POST a registration and adopt the gateway's response cadences.
 
+        When ``config.runner_id`` is empty the gateway assigns one
+        (``runr_<12hex>``) and returns it; whatever non-empty ``runner_id``
+        the response carries is adopted into ``config.runner_id`` so every
+        later claim/heartbeat/complete uses the assigned id.
         The registration response authoritatively carries ``poll_interval_s``,
         ``heartbeat_s`` and ``lease_ttl_s``: each field present replaces the
         local default — stored on ``self.poll_interval_s`` / ``self.lease_ttl_s``
@@ -326,6 +336,13 @@ class MinerSkeleton:
         )
         response = self.client.register_runner(registration)
         if isinstance(response, Mapping):
+            # The gateway ASSIGNS the runner id on a first registration (empty
+            # ``runner_id`` in, ``runr_<12hex>`` out) and echoes a known one;
+            # adopt whatever it returns so every later claim/heartbeat/complete
+            # carries the assigned id, not the locally configured one.
+            assigned = response.get("runner_id")
+            if isinstance(assigned, str) and assigned:
+                self.config.runner_id = assigned
             poll = response.get("poll_interval_s")
             if poll is not None:
                 self.poll_interval_s = float(poll)

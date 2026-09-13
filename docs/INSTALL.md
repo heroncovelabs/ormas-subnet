@@ -47,7 +47,10 @@ client = OrmasMinerClient(
     token=load_token(token_env="ORMAS_MINER_TOKEN"),
 )
 config = MinerConfig(
-    runner_id="my-miner-01",
+    runner_id="",  # empty on first run — the gateway assigns runr_<12hex>;
+    # register() adopts it into config.runner_id and it is echoed back below.
+    # Save it (e.g. export ORMAS_RUNNER_ID and read it here) and pass the
+    # assigned id on every later run; a self-chosen id is refused 404.
     runner_version="0.1.0",
     platform="linux",
     capacity=1,
@@ -129,9 +132,11 @@ Record your chain hotkey↔miner mapping on the gateway once, after onboarding. 
 ```bash
 python -m neurons.miner register-hotkey \
   --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
-  --runner-id my-miner-01 --hotkey-ss58 <your-ss58> \
+  --runner-id runr_0123456789ab --hotkey-ss58 <your-ss58> \
   --sign-command 'my-signer --hotkey alice'
 ```
+
+Here `--runner-id` is the assigned `runr_<12hex>` id from your first registration — never a self-chosen one: the gateway refuses an id it has not issued to your token (404). The third-party skeleton registers with `runner_id=""` and adopts the assigned id automatically (see the example above).
 
 The same call exists on the client as `client.register_hotkey(runner_id, hotkey_ss58=..., sign_fn=...)`; the wire contract (`hotkey/challenge` + `hotkey`, refusal codes) is in [`docs/protocol.md`](protocol.md). Without a verified hotkey mapping a miner earns no chain weight, however good its work (see [`docs/CONTRACT.md`](CONTRACT.md) "How you are scored").
 

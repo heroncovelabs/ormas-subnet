@@ -6,8 +6,12 @@ end before plugging in real mining logic. Replace ``make_shell_solver`` with
 your own ``solve(draft, workdir) -> SolveResult`` — that function is the miner.
 
     python neurons/miner.py --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
-        --runner-id my-miner --repo-id <repo_id> --repo-url <https-or-ssh-url> \
+        --runner-id runr_0123456789ab --repo-id <repo_id> --repo-url <https-or-ssh-url> \
         --cell task:code --solve-command 'make fix' [--ask-usd 1.20]
+
+``--runner-id``: omit on first run — the gateway assigns it (`runr_<12hex>`)
+and it is printed (stderr ``runner_id=<assigned>``); pass it on later runs.
+A self-chosen id the gateway never issued to your token is refused 404.
 
 The token is read from an environment variable or a file, never from argv.
 
@@ -39,7 +43,7 @@ _TOKEN_HELP_FILE = "File holding the runner token"
 
 # Args the run path requires; enforced in _parse so the register-hotkey
 # subcommand can omit them (argparse required= applies even under a subcommand).
-_RUN_REQUIRED = ("gateway", "runner_id", "repo_id", "repo_url", "cell", "solve_command")
+_RUN_REQUIRED = ("gateway", "repo_id", "repo_url", "cell", "solve_command")
 
 
 def _add_token_group(ap: argparse.ArgumentParser, *, required: bool) -> None:
@@ -52,7 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Ormas subnet reference miner")
     ap.add_argument("--gateway", help="Gateway base URL, e.g. https://api.ormas.ai")
     _add_token_group(ap, required=False)
-    ap.add_argument("--runner-id")
+    ap.add_argument(
+        "--runner-id", default="",
+        help="This miner's gateway-assigned id (runr_<12hex>); omit on first run — "
+        "the gateway assigns it and it is printed; pass it on later runs",
+    )
     ap.add_argument("--repo-id", help="Repo id the gateway bound for this project")
     ap.add_argument("--repo-url", help="Credential-free clone URL (https or ssh)")
     ap.add_argument(
@@ -156,6 +164,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     miner = MinerSkeleton(client, config, make_shell_solver(args.solve_command))
     miner.register()
+    # The gateway assigns the runner id on first registration; surface it so the
+    # operator can pass --runner-id on later runs.
+    print(f"runner_id={miner.config.runner_id}", file=sys.stderr)
     if args.bind_project:
         if not args.bind_base_commit:
             ap_err = "--bind-base-commit is required with --bind-project"
