@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -86,10 +87,73 @@ class ToolchainUnavailable(RuntimeError):
     """Declared interpreter missing or venv/pip provision failed."""
 
 
+_TOOLCHAIN_REQ_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"(\[[A-Za-z0-9._,-]+\])?"
+    r"((==|!=|<=|>=|<|>|~=|===)[A-Za-z0-9.*+!-]+"
+    r"(,(==|!=|<=|>=|<|>|~=|===)[A-Za-z0-9.*+!-]+)*)?$"
+)
+
+
+def _editable_install_path_ok(path: str) -> bool:
+    """Relative in-repo path; optional trailing extras. No URL, abs, or ``..`` segment."""
+    if not path or path.startswith("/") or "\\" in path or ":" in path:
+        return False
+    if any(ch.isspace() for ch in path):
+        return False
+    base = path
+    if path.endswith("]") and "[" in path:
+        base = path[: path.rfind("[")]
+        if not base:
+            return False
+    return ".." not in base.split("/")
+
+
+def validate_toolchain_shape(toolchain: Mapping[str, Any]) -> None:
+    """These rules must match ``tensorbox_spec.outcomes_prep.validate_toolchain_v1`` on the gateway."""
+    if set(toolchain.keys()) != {"kind", "python", "pip_install", "lock_paths"}:
+        raise ToolchainUnavailable("malformed toolchain")
+    if toolchain.get("kind") != "python":
+        raise ToolchainUnavailable("malformed toolchain")
+    python = toolchain.get("python")
+    if not isinstance(python, str) or re.fullmatch(r"^3\.\d{1,2}$", python) is None:
+        raise ToolchainUnavailable("malformed toolchain")
+    pip_install = toolchain.get("pip_install")
+    if not isinstance(pip_install, list) or not pip_install:
+        raise ToolchainUnavailable("malformed toolchain")
+    i = 0
+    while i < len(pip_install):
+        token = pip_install[i]
+        if not isinstance(token, str) or not token:
+            raise ToolchainUnavailable("malformed toolchain")
+        if token == "-e":
+            if i + 1 >= len(pip_install):
+                raise ToolchainUnavailable("malformed toolchain")
+            path = pip_install[i + 1]
+            if not isinstance(path, str) or not _editable_install_path_ok(path):
+                raise ToolchainUnavailable("malformed toolchain")
+            i += 2
+            continue
+        if token.startswith("-"):
+            raise ToolchainUnavailable("malformed toolchain")
+        if _TOOLCHAIN_REQ_RE.fullmatch(token) is None:
+            raise ToolchainUnavailable("malformed toolchain")
+        i += 1
+    lock_paths = toolchain.get("lock_paths")
+    if not isinstance(lock_paths, list):
+        raise ToolchainUnavailable("malformed toolchain")
+    for path in lock_paths:
+        if not isinstance(path, str) or not path:
+            raise ToolchainUnavailable("malformed toolchain")
+        if path.startswith("/") or "\\" in path or ".." in path.split("/"):
+            raise ToolchainUnavailable("malformed toolchain")
+
+
 def provision_toolchain(toolchain: Mapping[str, Any] | None, workdir: Path) -> str | None:
     """Return ``<workdir>/.venv/bin`` to prepend to PATH, or None if no python toolchain."""
     if not isinstance(toolchain, Mapping) or toolchain.get("kind") != "python":
         return None
+    validate_toolchain_shape(toolchain)
     interpreter = shutil.which(f"python{toolchain['python']}")
     if interpreter is None:
         raise ToolchainUnavailable(f"python{toolchain['python']} not on PATH")
