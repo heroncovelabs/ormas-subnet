@@ -6,7 +6,7 @@ Get the package installed, get a token, run the skeleton with the reference solv
 
 ## Prerequisites
 
-- Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
+- Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). A **validator** host additionally needs every Python minor a client may declare in a packet `toolchain` installed as `python3.X` on `PATH` (today: `python3.12`); a declared interpreter that is missing makes the validator post `error` for that assignment, which is excluded from quorum. Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
 - git, and credentials that can clone and push branches on the client repository you bind to — the skeleton clones it fresh per job into your workdir root.
 - A gateway token (starts `ormr_`), a project id, repo id, and base commit. You get these from the operator running the gateway. The development gateway at `https://api.ormas.ai` is **by invitation**; there is no public endpoint for miners yet.
 
