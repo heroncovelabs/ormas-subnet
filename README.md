@@ -32,10 +32,13 @@ or SN76.
 - A **thin HTTP client** (`ormas_subnet/client.py`, `OrmasMinerClient`) for those
   routes.
 - A **reference miner skeleton** (`ormas_subnet/skeleton.py`, `MinerSkeleton`) —
-  register → bind a repo → poll for a lease → clone/checkout the base commit →
+  register → poll for a lease → clone the client's repository fresh with the
+  job's `repo_credential` from the draft and check out the base commit →
   call your `solve(draft, workdir) -> SolveResult` → **actually run
-  `draft.verify_command`** (bounded, credential-free env, no shell) → publish
-  the result branch → complete. `solve` is the one pluggable step; completion
+  `draft.verify_command`** (bounded, credential-free env, no shell) → push
+  the result branch with the same credential → complete. No `bind` step is
+  needed; binding a repository you already hold is the fallback
+  (`docs/INSTALL.md`). `solve` is the one pluggable step; completion
   itself is honest, not self-declared: the receipt is built only from usage
   `solve` reports (an unknown value is never fabricated as zero), `scope_ok`
   is computed from a real `git diff` against `allowed_paths` (never asserted),
@@ -99,14 +102,35 @@ def solve(draft: TaskDraft, workdir: Path) -> SolveResult:
 
 client = OrmasMinerClient(base_url="https://api.ormas.ai", token=my_token)
 config = MinerConfig(
-    runner_id="my-miner-01", runner_version="0.1.0", platform="linux",
+    runner_id="",  # empty on first run; the gateway assigns runr_<12hex>
+    runner_version="0.1.0", platform="linux",
     capacity=1, cells=("task:code",), workdir_root=Path.home() / ".ormas" / "work",
+    # Required fields, but only the fallback clone source: when the draft
+    # carries repo_credential + repo_url the skeleton clones and pushes there.
     repo_id="my-repo", repo_url="https://github.com/acme/target.git",
 )
 skeleton = MinerSkeleton(client, config, solve)
 skeleton.register()
-skeleton.bind(project_id="proj_abc123", base_commit="<sha>")
 skeleton.run_forever()
+```
+
+Each claimed `TaskDraft` names the client's repository (`repo_url`) and carries a
+deploy key for it (`repo_credential`, kind `ssh_deploy_key`). The skeleton writes
+the key to a `0600` file only for the duration of each `git clone` / `git push`
+and removes it after (`skeleton._credential_git_env`); it is never logged or
+persisted. Validators clone with their own read-scoped `repo_credential` to
+re-run the tests (`ormas_subnet/validator.py`). Details and what you receive per
+job: [`docs/INSTALL.md`](docs/INSTALL.md).
+
+### Fallback: bind a repository you already hold
+
+If the operator onboarded your miner against a specific project and you already
+have a clone URL your host can push to, bind it once between `register()` and
+`run_forever()`. Drafts for a bound repository arrive without `repo_credential`,
+and the skeleton clones `config.repo_url` and pushes to `config.push_remote`.
+
+```python
+skeleton.bind(project_id="proj_abc123", base_commit="<sha>")
 ```
 
 ## Completion is honest, not self-declared

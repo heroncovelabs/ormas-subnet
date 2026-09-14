@@ -7,8 +7,8 @@ Get the package installed, get a token, run the skeleton with the reference solv
 ## Prerequisites
 
 - Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). A **validator** host additionally needs every Python minor a client may declare in a packet `toolchain` installed as `python3.X` on `PATH` (today: `python3.12`); a declared interpreter that is missing makes the validator post `error` for that assignment, which is excluded from quorum. Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
-- git, and credentials that can clone and push branches on the client repository you bind to — the skeleton clones it fresh per job into your workdir root.
-- A gateway token (starts `ormr_`), a project id, repo id, and base commit. You get these from the operator running the gateway. The development gateway at `https://api.ormas.ai` is **by invitation**; there is no public endpoint for miners yet.
+- `git` and an `ssh` client on `PATH`. You do **not** need your own credentials for the client's repository: on today's path the claim response carries a deploy key for it (`repo_credential`, see below) and the skeleton clones and pushes with that key. Only the bind fallback needs a clone URL your host can already reach and push to.
+- A gateway token (starts `ormr_`). You get it from the operator running the gateway. The development gateway at `https://api.ormas.ai` is **by invitation**; there is no public endpoint for miners yet. A project id and base commit are needed only for the bind fallback.
 
 ## Install
 
@@ -29,9 +29,34 @@ token = load_token(token_env="ORMAS_MINER_TOKEN")      # or token_path="~/.ormas
 
 The example below reads the gateway URL from `ORMAS_API_URL` — the same pattern: your names, your environment.
 
+## Today's path: the credential arrives with the claim
+
+You do not bind a repository. Register, poll, and when a job leases to you the draft tells the skeleton where the client's repository is and gives it a key to get in:
+
+1. `MinerSkeleton.register()` posts your registration; the gateway assigns your `runner_id`.
+2. `MinerSkeleton.run_once()` polls `claim_task`. Idle is `204`. A `200` returns a `TaskLease` and a `TaskDraft`.
+3. An unbound draft carries `repo_url` (the clone URL) and `repo_credential` (`{"kind": "ssh_deploy_key", "private_key": …, "fingerprint": …}`; `ormas_subnet/protocol.py`, `TaskDraft`).
+4. `_clone_and_checkout` clones `draft.repo_url` into `workdir_root/<task_id>` under `_credential_git_env`, which writes the key to a `0600` file that exists only for the duration of the git call and is removed after. It then checks out `draft.base_commit`.
+5. Your `solve(draft, workdir)` runs; the skeleton heartbeats the lease meanwhile.
+6. The skeleton runs `draft.verify_command`, then `_publish` pushes `ormas/job/<task_id>` to `draft.repo_url` with the same key, again materialised only for that push.
+7. `complete_task` posts the receipt, terminal, and capture. A third-party delivery settles on validator acceptance (`docs/protocol.md` §Lifecycle).
+
+Validators get their own credential. When the project has a read key, the assignment a validator polls carries a `repo_credential` with `"scope": "read"`; `ValidatorDaemon._clone` clones with it through the same `_credential_git_env` helper and re-runs the client's tests (`ormas_subnet/validator.py`; `tests/test_validator_repo_credential.py`). Validators do not use your key, and no credential is part of the signed evidence digest (`canonical_evidence_fields`).
+
+This path first ran live on 2026-09-14 against a repository the miner had never configured; `tests/test_skeleton_repo_credential.py` and `tests/test_validator_repo_credential.py` pin the behaviour.
+
+### What you receive per job
+
+- **`repo_url`** — the clone URL for the client's repository, on the draft. Credential-free by itself (`TaskDraft.repo_url`).
+- **`repo_credential`** — an `ssh_deploy_key` for that repository, with `private_key` and `fingerprint`. It is served once, in the claim response, over your authenticated runner channel; the gateway does not re-serve it on any list or status route (`docs/protocol.md` §`POST /api/runner/v1/leases`). It is absent when a bound `repo_id` already covers the repository.
+- **Where it lives on your host** — nowhere, except a `0600` file under a `tempfile.mkdtemp(prefix="ormas-job-key-")` directory for the duration of each `git clone` / `git push`, deleted in a `finally` block (`skeleton._credential_git_env`). The skeleton never logs it and never writes it anywhere else. Do not persist, copy, or reuse it yourself.
+- **What it is for** — cloning the base commit and pushing `refs/heads/ormas/job/<task_id>`. Validators receive a separate read-scoped key; you never handle theirs.
+
+Key rotation and revocation on the client's repository are gateway-side and are not described in this package; `docs/protocol.md` names a per-job, single-repo, read-scoped credential as the planned successor.
+
 ## Run the skeleton with the reference solver
 
-Save as `miner.py`, export the env vars (`ORMAS_API_URL`, `ORMAS_MINER_TOKEN`, `ORMAS_REPO_URL`), then `python miner.py`. As written this is the **third-party path** — register, then claim work on opted-in projects, no `bind`. **Today that path does not lease** (see the note after the code): the operator onboards you inside its tenant instead, which means adding the `bind` call shown below before `run_forever()`.
+Save as `miner.py`, export the env vars (`ORMAS_API_URL`, `ORMAS_MINER_TOKEN`, `ORMAS_REPO_URL`), then `python miner.py`. There is no `bind` call: the skeleton registers, polls, and clones whatever repository the draft names.
 
 ```python
 import os
@@ -57,14 +82,14 @@ config = MinerConfig(
     cells=("task:code",),  # task-type cell — see notes below
     workdir_root=Path.home() / ".ormas" / "work",  # private — see notes below
     repo_id="my-repo",
-    repo_url=os.environ["ORMAS_REPO_URL"],
+    repo_url=os.environ["ORMAS_REPO_URL"],  # fallback clone source only — see notes below
 )
 skeleton = MinerSkeleton(client, config, shell_solver)
 skeleton.register()
 skeleton.run_forever()
 ```
 
-Three fields a newcomer cannot guess:
+Four fields a newcomer cannot guess:
 
 - **`cells`** — the task types your miner serves, as **task-type cells**. Register `task:code` to
   serve every bounded coding task, or narrow it: `task:code/small`, `task:code/medium`,
@@ -75,10 +100,17 @@ Three fields a newcomer cannot guess:
   `outcomes-…` strings are the operator's own model-bound cells; they are not yours to
   register and, since gateway `2026.09.12`+1, a third-party miner registering only those never
   leases work. Registration accepts any string; a cell no queued job carries simply never leases.
-- **`workdir_root`** — fresh clones of the *client's repository* land here; keep it private (`mkdir -p -m 700 ~/.ormas/work`). `/tmp` is world-readable, periodically purged, and shared with every other user — the wrong place for client source.
-- **`repo_id`** — the id of the repository binding created at bind time; the gateway assigns one (`rrep_…`) when a bind request leaves it empty, and the id rides every task draft.
+- **`workdir_root`** — fresh clones of the *client's repository* land here, one directory per `task_id`; keep it private (`mkdir -p -m 700 ~/.ormas/work`). `/tmp` is world-readable, periodically purged, and shared with every other user — the wrong place for client source. A directory left behind by a crashed job is replaced on the next claim (`_fresh_workdir`).
+- **`repo_url`** — `MinerConfig` requires it, but on today's path it is only the fallback: `_clone_and_checkout` clones `draft.repo_url` whenever the draft carries a `repo_credential` and a non-empty `repo_url`, and clones `config.repo_url` only when it does not. Point it at a repository you actually hold, or at the bound repository if you use the fallback below.
+- **`repo_id`** — `MinerConfig` requires it; it is the id sent in a bind request (`RepoRegistration.repo_id`). On the credential path the draft's own `repo_id` describes the job, and this field is not used to choose the clone source.
 
-**Today's path — onboarded inside the operator's tenant.** The operator gives you a project id and a base commit with your token; bind the repository to that project before polling (export `ORMAS_PROJECT_ID` and `ORMAS_BASE_COMMIT`), placing this call between `register()` and `run_forever()`:
+The reference solver runs `true` — a no-op that commits an empty result. It exists so the loop runs end to end with no model call, and against a task whose verify expects a change it completes with `failed`, which is the honest outcome of doing nothing.
+
+The same loop is available as a CLI: `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`. It reads the token from `--token-env` / `--token-file`, never from argv, and prints the assigned `runner_id=…` on stderr after the first registration.
+
+## Fallback: bind a repository you already hold locally
+
+Use this only when the operator has onboarded your miner against a specific project and you already have a clone URL your host can pull from and push to. `MinerSkeleton.bind(project_id=…, base_commit=…)` posts a `RepoRegistration` for `config.repo_id`; a draft for a bound repository then arrives **without** `repo_credential`, and the skeleton clones `config.repo_url` and pushes to `config.push_remote` (`"origin"` by default; `None` records a `local:` ref instead). Place the call between `register()` and `run_forever()` (export `ORMAS_PROJECT_ID` and `ORMAS_BASE_COMMIT`):
 
 ```python
 skeleton.bind(
@@ -87,9 +119,9 @@ skeleton.bind(
 )
 ```
 
-Why: until a validator count is configured on the gateway (none is configured in production yet), a cross-tenant claim is refused outright — nothing is written, no bid, no lease. The third-party path (no `bind`, claim on any opted-in project, settlement only on validator acceptance) opens when validators are configured; your miner code does not change, only the `bind` call goes away.
+The CLI equivalent is `--bind-project <project_id> --bind-base-commit <sha>` on `neurons/miner.py`. `tests/test_skeleton_repo_credential.py::test_no_credential_keeps_configured_clone_source` pins this behaviour.
 
-The reference solver runs `true` — a no-op that commits an empty result. It exists so the loop runs end to end with no model call, and against a task whose verify expects a change it completes with `failed`, which is the honest outcome of doing nothing.
+One gateway rule applies to both paths: a third-party claim leases only when the gateway has a validator count configured, because a third-party delivery settles on validator acceptance, never on the miner's own report (`docs/protocol.md` §Lifecycle; [`README.md`](../README.md) "What this is NOT" for the production state).
 
 ## Known gaps (skeleton)
 
@@ -122,7 +154,7 @@ Three rules the skeleton enforces with you:
 
 ## Where results and evidence go
 
-- **The result** is the branch `refs/heads/ormas/job/<task_id>` on the bound repository. `MinerConfig(push_remote=None)` records a `local:` ref instead — a dry run that nobody else can see.
+- **The result** is the branch `refs/heads/ormas/job/<task_id>` on the client's repository — pushed to `draft.repo_url` with the job's `repo_credential` on today's path, or to `config.push_remote` on the bind fallback. `MinerConfig(push_remote=None)` records a `local:` ref instead on the fallback — a dry run that nobody else can see.
 - **The evidence** rides the complete call: commit sha, changed-path list, diff hash, verify exit code, your usage receipt. Source, diffs, prompts, and credentials never cross it — the wire rejects those fields outright; the list is in `docs/protocol.md`.
 
 ## Register your hotkey
