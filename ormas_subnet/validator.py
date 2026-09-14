@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -56,13 +59,16 @@ def canonical_evidence_fields(
     verify_command: str,
     allowed_paths: list[str],
     immutable_paths: list[str],
+    toolchain: dict | None = None,
 ) -> dict[str, Any]:
     """The §4.2 evidence fields a validator signs over. Must byte-match the
 
     gateway's copy of this function (see module docstring) — never add a field
-    here without updating both.
+    here without updating both. This must byte-match
+    ``tensorbox_spec/customer_api/outcomes_validators.canonical_evidence_fields``
+    on the gateway, which adds the same trailing optional key.
     """
-    return {
+    fields: dict[str, Any] = {
         "job_id": job_id,
         "miner_id": miner_id,
         "base_commit": base_commit,
@@ -72,6 +78,126 @@ def canonical_evidence_fields(
         "allowed_paths": list(allowed_paths),
         "immutable_paths": list(immutable_paths),
     }
+    if isinstance(toolchain, dict) and toolchain:
+        fields["toolchain"] = toolchain
+    return fields
+
+
+class ToolchainUnavailable(RuntimeError):
+    """Declared interpreter missing or venv/pip provision failed."""
+
+
+_TOOLCHAIN_REQ_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"(\[[A-Za-z0-9._,-]+\])?"
+    r"((==|!=|<=|>=|<|>|~=|===)[A-Za-z0-9.*+!-]+"
+    r"(,(==|!=|<=|>=|<|>|~=|===)[A-Za-z0-9.*+!-]+)*)?$"
+)
+
+
+def _editable_install_path_ok(path: str) -> bool:
+    """Relative in-repo path; optional trailing extras. No URL, abs, or ``..`` segment."""
+    if not path or path.startswith("/") or "\\" in path or ":" in path:
+        return False
+    if any(ch.isspace() for ch in path):
+        return False
+    base = path
+    if path.endswith("]") and "[" in path:
+        base = path[: path.rfind("[")]
+        if not base:
+            return False
+    return ".." not in base.split("/")
+
+
+def validate_toolchain_shape(toolchain: Mapping[str, Any]) -> None:
+    """These rules must match ``tensorbox_spec.outcomes_prep.validate_toolchain_v1`` on the gateway."""
+    if set(toolchain.keys()) != {"kind", "python", "pip_install", "lock_paths"}:
+        raise ToolchainUnavailable("malformed toolchain")
+    if toolchain.get("kind") != "python":
+        raise ToolchainUnavailable("malformed toolchain")
+    python = toolchain.get("python")
+    if not isinstance(python, str) or re.fullmatch(r"^3\.\d{1,2}$", python) is None:
+        raise ToolchainUnavailable("malformed toolchain")
+    pip_install = toolchain.get("pip_install")
+    if not isinstance(pip_install, list) or not pip_install:
+        raise ToolchainUnavailable("malformed toolchain")
+    i = 0
+    while i < len(pip_install):
+        token = pip_install[i]
+        if not isinstance(token, str) or not token:
+            raise ToolchainUnavailable("malformed toolchain")
+        if token == "-e":
+            if i + 1 >= len(pip_install):
+                raise ToolchainUnavailable("malformed toolchain")
+            path = pip_install[i + 1]
+            if not isinstance(path, str) or not _editable_install_path_ok(path):
+                raise ToolchainUnavailable("malformed toolchain")
+            i += 2
+            continue
+        if token.startswith("-"):
+            raise ToolchainUnavailable("malformed toolchain")
+        if _TOOLCHAIN_REQ_RE.fullmatch(token) is None:
+            raise ToolchainUnavailable("malformed toolchain")
+        i += 1
+    lock_paths = toolchain.get("lock_paths")
+    if not isinstance(lock_paths, list):
+        raise ToolchainUnavailable("malformed toolchain")
+    for path in lock_paths:
+        if not isinstance(path, str) or not path:
+            raise ToolchainUnavailable("malformed toolchain")
+        if path.startswith("/") or "\\" in path or ".." in path.split("/"):
+            raise ToolchainUnavailable("malformed toolchain")
+
+
+def provision_toolchain(toolchain: Mapping[str, Any] | None, workdir: Path) -> str | None:
+    """Return ``<workdir>/.venv/bin`` to prepend to PATH, or None if no python toolchain."""
+    if not isinstance(toolchain, Mapping) or toolchain.get("kind") != "python":
+        return None
+    validate_toolchain_shape(toolchain)
+    interpreter = shutil.which(f"python{toolchain['python']}")
+    if interpreter is None:
+        raise ToolchainUnavailable(f"python{toolchain['python']} not on PATH")
+    venv = workdir / ".venv"
+    if venv.exists() or venv.is_symlink():
+        if venv.is_dir() and not venv.is_symlink():
+            shutil.rmtree(venv)
+        else:
+            venv.unlink()
+    bounded_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(workdir),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    created = subprocess.run(
+        [interpreter, "-m", "venv", str(venv)],
+        cwd=workdir,
+        env=bounded_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        raise ToolchainUnavailable("python -m venv failed")
+    pip_install = toolchain.get("pip_install")
+    if isinstance(pip_install, list) and pip_install:
+        venv_bin = str(venv / "bin")
+        pip_env = {
+            "PATH": venv_bin + os.pathsep + bounded_env["PATH"],
+            "HOME": bounded_env["HOME"],
+            "LANG": bounded_env["LANG"],
+        }
+        installed = subprocess.run(
+            [str(venv / "bin" / "python"), "-m", "pip", "--no-input",
+             "--disable-pip-version-check", "install", *pip_install],
+            cwd=workdir,
+            env=pip_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if installed.returncode != 0:
+            raise ToolchainUnavailable("pip install failed")
+    return str(venv / "bin")
 
 
 def evidence_digest_hex(fields: Mapping[str, Any]) -> str:
@@ -202,6 +328,11 @@ class ValidatorDaemon:
         failure); it is excluded from quorum (``outcomes_validators.resolve_quorum``)
         rather than counted against the miner.
         """
+        # The provisioned .venv is untracked, so the scope check (git diff --name-only base..result) is unaffected.
+        try:
+            prefix = provision_toolchain(assignment.get("toolchain"), workdir)
+        except ToolchainUnavailable:
+            return "error"
         base_commit = str(assignment["base_commit"])
         result_commit = str(assignment["result_commit"])
         verify_command = str(assignment["verify_command"])
@@ -212,13 +343,13 @@ class ValidatorDaemon:
             _run_git(["checkout", base_commit], cwd=workdir)
         except GitError:
             return "error"
-        base_exit = _run_verify_command(verify_command, cwd=workdir)
+        base_exit = _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix)
 
         try:
             _run_git(["checkout", result_commit], cwd=workdir)
         except GitError:
             return "error"
-        result_exit = _run_verify_command(verify_command, cwd=workdir)
+        result_exit = _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix)
 
         try:
             diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
@@ -265,6 +396,7 @@ class ValidatorDaemon:
             verify_command=str(assignment["verify_command"]),
             allowed_paths=list(assignment.get("allowed_paths") or []),
             immutable_paths=list(assignment.get("immutable_paths") or []),
+            toolchain=assignment.get("toolchain") if isinstance(assignment.get("toolchain"), dict) else None,
         )
         digest = evidence_digest_hex(fields)
         if digest != assignment.get("evidence_digest_sha256"):
