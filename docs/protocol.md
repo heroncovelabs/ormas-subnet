@@ -159,6 +159,26 @@ task description), `verify_command`, `allowed_paths`, `budget_usd`,
 `work_packet_sha256`, `attempt`, `parent_job_id` (non-empty on a repair),
 `repair_findings`, `repair_evidence` (present only on a repair attempt).
 
+`work_packet` may carry an optional **`toolchain`** block the client declared at
+prepare time (protocol addition 2026-09-14):
+
+```json
+"toolchain": {"kind": "python", "python": "3.12",
+              "pip_install": ["-e", ".", "pytest>=8,<9"], "lock_paths": ["pyproject.toml"]}
+```
+
+It names the environment the verify command needs. `kind` is `python` (the only
+kind today); `python` is `3.X`; `pip_install` is a list of PEP 508 requirement
+specifiers and/or `-e <relative in-repo path>` pairs — no other pip options, no
+URLs, no `-r` files, no paths outside the repo (the gateway refuses anything
+else at enqueue); `lock_paths` is informational. A miner that honours it
+creates `<checkout>/.venv` with `python<X.Y>`, runs
+`python -m pip --no-input install <pip_install>` in the checkout, and runs the
+verify with `.venv/bin` first on `PATH`. The same block is served to validators
+on their assignment and is part of the signed evidence digest, so miner and
+validator provision the identical declared environment. A packet without a
+toolchain is verified exactly as before.
+
 Daily claims per token are capped (`daily_claim_cap`, default 50 unless the
 token row overrides it); exceeding it returns `429`.
 
@@ -274,7 +294,10 @@ it does not trust `solve`'s self-report for anything settlement-relevant:
   stripped into the environment, the remaining argv runs directly with no
   shell. The child environment is bounded and credential-free — only `PATH`,
   a fresh scratch `HOME`, and `LANG` cross in; no provider keys, no ambient
-  secrets. `verification_state` is `"verified"` only when the exit code is 0
+  secrets. When the draft's `work_packet.toolchain` is present, the reference
+  skeleton does not yet provision it (the private miner does); a reference
+  miner that wants to serve such packets should provision `.venv` as described
+  under `TaskDraft` before running the verify. `verification_state` is `"verified"` only when the exit code is 0
   **and** `scope_ok`; otherwise `"failed"`. The exit code is recorded in
   `capture.attempts` (`[{"verify_exit_code": N}]`), the same shape the
   private runner uses (`outcomes_worker.py`'s per-attempt projection).
