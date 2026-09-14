@@ -219,7 +219,9 @@ def _split_verify_command(verify_command: str) -> tuple[list[str], dict[str, str
     return tokens, env_overrides
 
 
-def _run_verify_command(verify_command: str, *, cwd: Path) -> int:
+def _run_verify_command(
+    verify_command: str, *, cwd: Path, path_prefix: str | None = None,
+) -> int:
     """Run ``verify_command`` in ``cwd`` under a bounded, credential-free env.
 
     No shell, no ambient secrets: only ``PATH``, a scratch ``HOME`` (so nothing
@@ -227,6 +229,8 @@ def _run_verify_command(verify_command: str, *, cwd: Path) -> int:
     provider keys, no tokens, nothing else from this process's environment.
     Returns the exit code; a command that can't even be parsed or launched
     fails closed (1 / 127) rather than raising past the caller.
+    When ``path_prefix`` is set, it is prepended to the child's ``PATH`` and
+    ``VIRTUAL_ENV`` is set to that prefix's parent directory.
     """
     try:
         argv, env_overrides = _split_verify_command(verify_command)
@@ -234,9 +238,13 @@ def _run_verify_command(verify_command: str, *, cwd: Path) -> int:
         return 1
     with tempfile.TemporaryDirectory(prefix="ormas-verify-home-") as scratch_home:
         env: dict[str, str] = {}
-        path = os.environ.get("PATH")
-        if path:
-            env["PATH"] = path
+        if path_prefix is not None:
+            env["PATH"] = path_prefix + os.pathsep + os.environ.get("PATH", "")
+            env["VIRTUAL_ENV"] = os.path.dirname(path_prefix)
+        else:
+            path = os.environ.get("PATH")
+            if path:
+                env["PATH"] = path
         env["HOME"] = scratch_home
         lang = os.environ.get("LANG")
         if lang:
