@@ -36,7 +36,7 @@ from ormas_subnet.validator import (
 from tests.test_skeleton import _FakeValidatorGateway, _init_repo, requires_git
 
 HOST_PY = f"3.{sys.version_info.minor}"
-TOOLCHAIN = {"kind": "python", "python": HOST_PY, "pip_install": ["--help"], "lock_paths": []}
+TOOLCHAIN = {"kind": "python", "python": HOST_PY, "pip_install": ["pip"], "lock_paths": []}  # "pip" is already satisfied in a fresh venv: no network
 BASE = dict(job_id="job_1", miner_id="miner:x", base_commit="a" * 40, result_commit="b" * 40,
             repo_url="git@github.com:x/y.git", verify_command="pytest -q",
             allowed_paths=["out.txt"], immutable_paths=[])
