@@ -67,8 +67,10 @@ or SN76.
   (`ormas_subnet/validator.py`, `neurons/validator.py`). The gateway settles a
   third-party miner's delivery only on unanimous validator acceptance and
   refuses its claim until a validator count is configured; our own trusted
-  miner still settles by its own verify run. In production no validators are
-  configured yet and only our miner runs. See "Known gaps" below and the
+  miner still settles by its own verify run. In production one validator is
+  configured (operated by Heron Cove) and every third-party delivery is gated
+  on it; the validator provisions the packet's declared `toolchain` before it
+  re-runs the tests (see `docs/protocol.md`). See "Known gaps" below and the
   decision doc §8.
 
 ## Plugging in your own `solve`
