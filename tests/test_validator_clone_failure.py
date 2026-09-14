@@ -12,8 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from ormas_subnet.validator import (
     OrmasValidatorClient,
     ValidatorConfig,
