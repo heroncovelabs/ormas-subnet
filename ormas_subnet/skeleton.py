@@ -21,9 +21,10 @@ import tempfile
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .client import OrmasMinerClient
 from .protocol import (
@@ -124,13 +125,59 @@ class SolveResult:
 SolveFn = Callable[[TaskDraft, Path], SolveResult]
 
 
-def _run_git(args: Sequence[str], *, cwd: Path) -> str:
+def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False,
+        env=dict(env) if env is not None else None,
     )
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+@contextmanager
+def _credential_git_env(credential: Mapping[str, Any] | None) -> Iterator[dict[str, str] | None]:
+    """Yield a GIT_SSH_COMMAND env for a job-scoped ssh_deploy_key, else None.
+
+    The private key is written to a 0600 file that exists only for the
+    duration of the ``with`` block. Never logs the key.
+    """
+    if not isinstance(credential, Mapping):
+        yield None
+        return
+    if credential.get("kind") != "ssh_deploy_key":
+        yield None
+        return
+    private_key = credential.get("private_key")
+    if not isinstance(private_key, str) or not private_key:
+        yield None
+        return
+    key_dir = tempfile.mkdtemp(prefix="ormas-job-key-")
+    path = os.path.join(key_dir, "id_job")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            payload = private_key if private_key.endswith("\n") else private_key + "\n"
+            os.write(fd, payload.encode())
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+        yield {
+            **os.environ,
+            "GIT_SSH_COMMAND": (
+                f"ssh -i {path} -o IdentitiesOnly=yes "
+                f"-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+            ),
+        }
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(key_dir)
+        except OSError:
+            pass
 
 
 def _build_receipt(lease_id: str, result: SolveResult) -> TaskReceipt:
@@ -393,14 +440,24 @@ class MinerSkeleton:
 
     def _clone_and_checkout(self, draft: TaskDraft) -> Path:
         workdir = self._fresh_workdir(draft.task_id)
-        _run_git(["clone", self.config.repo_url, str(workdir)], cwd=workdir.parent)
+        source = draft.repo_url if (getattr(draft, "repo_credential", None) and draft.repo_url) else self.config.repo_url
+        with _credential_git_env(getattr(draft, "repo_credential", None)) as env:
+            _run_git(["clone", source, str(workdir)], cwd=workdir.parent, env=env)
         if draft.base_commit:
             _run_git(["checkout", draft.base_commit], cwd=workdir)
         return workdir
 
-    def _publish(self, task_id: str, workdir: Path, result: SolveResult) -> str:
+    def _publish(self, task_id: str, workdir: Path, result: SolveResult, draft: TaskDraft | None = None) -> str:
         branch = f"ormas/job/{task_id}"
         _run_git(["branch", "-f", branch, result.result_commit], cwd=workdir)
+        if draft is not None and getattr(draft, "repo_credential", None) and draft.repo_url:
+            with _credential_git_env(draft.repo_credential) as env:
+                _run_git(
+                    ["push", draft.repo_url, f"{branch}:refs/heads/{branch}"],
+                    cwd=workdir,
+                    env=env,
+                )
+            return f"{_RESULT_REF_HEADS}{task_id}"
         if self.config.push_remote:
             _run_git(
                 ["push", self.config.push_remote, f"{branch}:refs/heads/{branch}"],
@@ -529,7 +586,7 @@ class MinerSkeleton:
         verify_exit_code = _run_verify_command(draft.verify_command, cwd=workdir)
         wall_s = time.monotonic() - start
 
-        result_ref = self._publish(draft.task_id, workdir, result)
+        result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
         material_sha = self._material_diff_sha256(workdir, draft.base_commit, result.result_commit)
         scope_ok, changed_paths = self._compute_scope(workdir, draft, result)
 
