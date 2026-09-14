@@ -119,3 +119,30 @@ def test_no_toolchain_keeps_todays_behaviour(tmp_path: Path) -> None:
     assert gateway.decisions[0]["decision"] == "accept"
     workdir = tmp_path / "validator-work" / "asgn_tc"
     assert not (workdir / ".venv").exists()
+
+
+def test_malformed_toolchain_is_error_never_provisioned(tmp_path: Path) -> None:
+    """The validator applies the same shape rules as the client/gateway: pip OPTIONS,
+    URLs, `-r` files and out-of-repo paths are refused → 'error' before any subprocess."""
+    from ormas_subnet.validator import ToolchainUnavailable, provision_toolchain
+
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    for bad_pip in (["--target=/etc", "pkg"], ["-r", "req.txt"], ["-e", "../../x"], ["https://evil.example/p.whl"], ["-e"]):
+        try:
+            provision_toolchain({**TOOLCHAIN, "pip_install": bad_pip}, workdir)
+        except ToolchainUnavailable:
+            pass
+        else:
+            raise AssertionError(f"accepted {bad_pip!r}")
+        assert not (workdir / ".venv").exists(), bad_pip
+    for bad in ({**TOOLCHAIN, "kind": "node"}, {**TOOLCHAIN, "python": "3.12;x"}, {**TOOLCHAIN, "extra": 1}):
+        try:
+            provision_toolchain(bad, workdir)
+        except ToolchainUnavailable:
+            pass
+        else:
+            if bad.get("kind") == "node":
+                continue  # non-python kinds are simply ignored (None), not provisioned
+            raise AssertionError(f"accepted {bad!r}")
+    assert not (workdir / ".venv").exists()
