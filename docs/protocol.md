@@ -179,6 +179,21 @@ on their assignment and is part of the signed evidence digest, so miner and
 validator provision the identical declared environment. A packet without a
 toolchain is verified exactly as before.
 
+`TaskDraft` may also carry **`repo_credential`** (protocol addition 2026-09-14) when the
+claiming miner has no local bind for the project's repository:
+
+```json
+"repo_credential": {"kind": "ssh_deploy_key", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----…",
+                    "fingerprint": "SHA256:…"}
+```
+
+It is the project's deploy key, served once, in the claim response, over the authenticated
+runner channel; it is absent when a bound `repo_id` already covers the repository. The reference
+skeleton clones `draft.repo_url` and pushes the result branch to it with that key, materialised
+as a `0600` file only for the duration of each git call and removed afterwards. Never persist,
+copy or log it; the gateway never re-serves it on list or status routes. A per-job, single-repo,
+read-scoped credential (GitHub App token) is the planned successor.
+
 Daily claims per token are capped (`daily_claim_cap`, default 50 unless the
 token row overrides it); exceeding it returns `429`.
 

@@ -198,27 +198,36 @@ class TaskDraft(_RunnerWireDTO):
     # Credential-free clone source for a miner with no local bind (https/ssh URL,
     # never a token); empty when a bound repo_id already covers it.
     repo_url: str = ""
+    # Served once on the claim response over the authenticated runner channel;
+    # never persisted or logged; mirrors the gateway's TaskDraft.
+    repo_credential: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "allowed_paths", tuple(self.allowed_paths))
         object.__setattr__(self, "work_packet", MappingProxyType(dict(self.work_packet)))
         object.__setattr__(self, "repair_findings", tuple(self.repair_findings))
+        if self.repo_credential is not None:
+            object.__setattr__(self, "repo_credential", MappingProxyType(dict(self.repo_credential)))
         evidence = self.repair_evidence
         if evidence is None:
             object.__setattr__(self, "repair_evidence", None)
-            return
-        snapshotted = snapshot_evidence(evidence)
-        if not isinstance(snapshotted, dict):
-            raise ValueError("repair_evidence must be a mapping")
-        object.__setattr__(self, "repair_evidence", MappingProxyType(snapshotted))
+        else:
+            snapshotted = snapshot_evidence(evidence)
+            if not isinstance(snapshotted, dict):
+                raise ValueError("repair_evidence must be a mapping")
+            object.__setattr__(self, "repair_evidence", MappingProxyType(snapshotted))
 
     def to_wire(self) -> dict[str, Any]:
         payload = super().to_wire()
         evidence = self.repair_evidence
         if evidence is None:
             payload.pop("repair_evidence", None)
-            return payload
-        payload["repair_evidence"] = snapshot_evidence(dict(evidence))
+        else:
+            payload["repair_evidence"] = snapshot_evidence(dict(evidence))
+        if self.repo_credential is None:
+            payload.pop("repo_credential", None)
+        else:
+            payload["repo_credential"] = dict(self.repo_credential)
         return payload
 
     @classmethod
@@ -228,6 +237,7 @@ class TaskDraft(_RunnerWireDTO):
         data = dict(payload)
         data.setdefault("repair_evidence", None)
         data.setdefault("repo_url", "")
+        data.setdefault("repo_credential", None)
         return super().from_wire(data)
 
 
