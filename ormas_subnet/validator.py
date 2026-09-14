@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -184,9 +185,14 @@ class ValidatorDaemon:
     def _clone(self, assignment: Mapping[str, Any]) -> Path:
         workdir = self.config.workdir_root / assignment["assignment_id"]
         if workdir.exists():
-            raise GitError(f"workdir already exists: {workdir}")
+            # Leftover half-created workdir from a failed attempt — replace it.
+            shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
-        _run_git(["clone", str(assignment["repo_url"]), str(workdir)], cwd=workdir.parent)
+        try:
+            _run_git(["clone", str(assignment["repo_url"]), str(workdir)], cwd=workdir.parent)
+        except GitError:
+            shutil.rmtree(workdir, ignore_errors=True)  # drop git's partial clone
+            raise
         return workdir
 
     def _decide(self, assignment: Mapping[str, Any], workdir: Path) -> str:
@@ -241,8 +247,14 @@ class ValidatorDaemon:
         if not assignments:
             return False
         assignment = assignments[0]
-        workdir = self._clone(assignment)
-        decision = self._decide(assignment, workdir)
+        try:
+            workdir = self._clone(assignment)
+        except GitError:
+            # The validator could not obtain the repo — its own review failed,
+            # so this is an "error" decision (see _decide), never a crash.
+            decision = "error"
+        else:
+            decision = self._decide(assignment, workdir)
 
         fields = canonical_evidence_fields(
             job_id=str(assignment["job_id"]),
