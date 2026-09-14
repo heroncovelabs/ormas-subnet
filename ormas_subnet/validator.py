@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .skeleton import GitError, _path_covered_by_allowed, _run_git, _run_verify_command
+from .skeleton import GitError, _credential_git_env, _path_covered_by_allowed, _run_git, _run_verify_command
 
 __all__ = [
     "VALIDATOR_PROTOCOL_V1",
@@ -315,7 +315,9 @@ class ValidatorDaemon:
             shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _run_git(["clone", str(assignment["repo_url"]), str(workdir)], cwd=workdir.parent)
+            # The read credential is served by the gateway per assignment and exists on disk only for this clone; later checkout/diff need no credential.
+            with _credential_git_env(assignment.get("repo_credential")) as env:
+                _run_git(["clone", str(assignment["repo_url"]), str(workdir)], cwd=workdir.parent, env=env)
         except GitError:
             shutil.rmtree(workdir, ignore_errors=True)  # drop git's partial clone
             raise
