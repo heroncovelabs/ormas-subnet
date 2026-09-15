@@ -43,7 +43,7 @@ def test_environment_artifacts_outside_allowed_paths_are_not_committed(tmp_path:
     assert _changed(workdir, base_commit, result_commit) == ["out.txt"]
     capture = gateway.completed["capture"]
     assert capture["scope_ok"] is True
-    assert sorted(capture.get("changed_paths") or []) == ["out.txt"]
+    assert sorted(c["path"] for c in (capture.get("changed_paths") or [])) == ["out.txt"]
     # The stray files still exist in the workdir — they were simply never staged.
     assert (workdir / ".rustup" / "settings.toml").exists()
     assert (workdir / "scratch.log").exists()
@@ -65,12 +65,13 @@ def test_listed_but_untouched_allowed_path_is_fine(tmp_path: Path) -> None:
 
 @requires_git
 def test_no_allowed_paths_keeps_add_all(tmp_path: Path) -> None:
-    """Keep-green: a legacy draft without allowed_paths stages everything as today."""
+    """Keep-green: a legacy draft without allowed_paths stages everything as today.
+    (The local gateway substitutes ["out.txt"] for None, so an EMPTY list is the legacy shape.)"""
     repo, base_commit = _init_repo(tmp_path)
     solver = make_shell_solver("echo mined >> out.txt && echo extra > extra.txt")
     gateway, skeleton = _run_one_task(
         tmp_path, repo=repo, base_commit=base_commit, verify_command="test -f out.txt",
-        solve_fn=solver, allowed_paths=None,
+        solve_fn=solver, allowed_paths=[],
     )
     workdir = skeleton.config.workdir_root / "task_1"
     result_commit = gateway.completed["terminal"]["result_commit"]
