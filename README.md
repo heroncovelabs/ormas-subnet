@@ -120,7 +120,7 @@ the key to a `0600` file only for the duration of each `git clone` / `git push`
 and removes it after (`skeleton._credential_git_env`); it is never logged or
 persisted. Validators clone with their own read-scoped `repo_credential` to
 re-run the tests (`ormas_subnet/validator.py`). Details and what you receive per
-job: [`docs/INSTALL.md`](docs/INSTALL.md).
+job: [`docs/INSTALL.md`](docs/INSTALL.md). First-run questions: [`docs/FAQ.md`](docs/FAQ.md).
 
 ### Fallback: bind a repository you already hold
 
