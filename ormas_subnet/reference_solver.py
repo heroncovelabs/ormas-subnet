@@ -24,6 +24,9 @@ def make_shell_solver(command: str, *, commit_message: str = "ormas-subnet: refe
     it actually verifies is the skeleton's job (it runs ``draft.verify_command``
     itself), not this solver's to declare.
 
+    The solver stages only the draft's allowed_paths so miner-side artifacts
+    never reach the customer repo.
+
     This solver made no model call, so it is the one honest case where
     reporting zero usage and a fixed identity is not a fabrication: it
     genuinely spent nothing and used no provider. Every one of those values
@@ -34,7 +37,18 @@ def make_shell_solver(command: str, *, commit_message: str = "ormas-subnet: refe
         proc = subprocess.run(command, shell=True, cwd=str(workdir), capture_output=True, text=True)
         ok = proc.returncode == 0
         changed = _changed_paths(workdir)
-        _run_git(["add", "-A"], cwd=workdir)
+        allowed = tuple(getattr(draft, "allowed_paths", None) or ())
+        if allowed:
+            try:
+                _run_git(["add", "--ignore-errors", "--", *allowed], cwd=workdir)
+            except GitError:
+                for path in allowed:
+                    try:
+                        _run_git(["add", "--ignore-errors", "--", path], cwd=workdir)
+                    except GitError:
+                        continue
+        else:
+            _run_git(["add", "-A"], cwd=workdir)
         # `git commit` exits 1 with nothing to commit; treat that as "no-op solve".
         try:
             _run_git(
