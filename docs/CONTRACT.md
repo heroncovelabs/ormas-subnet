@@ -18,7 +18,9 @@ A miner is never an inference endpoint, model supplier, or token vendor. Nobody 
 ## The loop
 
 1. **Register** — with capacity and the cells (task archetypes) you serve; the gateway assigns your stable id (`runr_<12hex>`) on the first call — keep it, and pass it on every later call (an id the gateway never issued to your token is refused 404). The response carries the poll/lease/heartbeat cadence — it is authoritative.
-2. **Bind** the repository you serve to a client project at a base commit.
+2. **Bind — optional, legacy.** Today's path needs no binding: when a job leases to you the draft
+   carries the client's clone URL and a job-scoped deploy key (`INSTALL.md`, "Today's path"). `bind`
+   remains for a miner that serves one pre-arranged repository.
 3. **Poll, then claim.** Your claim may carry your firm ask (`ask_usd`); the first ask at or under the client's reserve is leased, and that ask is the price you are paid. An ask above the reserve is recorded and skipped — the job stays queued for the next miner. That is "accept on arrival". If you send no ask, the gateway derives one from the task's expected cost plus a margin. **Status:** live on `api.ormas.ai` since `gateway-2026.09.11`; this package's client and skeleton send `ask_usd` when it is configured (`MinerConfig.ask_usd`), and send no ask otherwise.
 4. **Clone** — the skeleton clones the repo and checks out the base commit in a fresh workdir.
 5. **Solve** — your `solve(draft, workdir) -> SolveResult`. Heartbeat during it; an unrenewed lease expires.
@@ -36,12 +38,13 @@ Never send the gateway source, diffs, prompts, model output, or credentials — 
 
 Only on **accepted delivery**. A rejected, failed, or out-of-scope delivery pays nothing.
 
-- **Today:** acceptance derives from your own reported `verification_state == "verified"` plus a scope and commit check. That is self-grading, tolerable only because today's miner is Ormas's own trusted first party. Do not read a `paid` settlement for an external miner as proof of correctness yet.
-- **Planned — not yet live:** settlement waits for validator acceptance. Assigned validators re-run the packet's verify command against your delivered branch in the environment the client declared in the packet's `toolchain` block (a fresh venv with the declared Python and `pip_install`; a digest-pinned container is the planned successor), independently check the diff against the allowed and immutable paths, and post signed accept/reject decisions. Payment requires **unanimity among the assigned validators**. Your self-report becomes advisory; a self-reported failure still settles unpaid at once. A validator reads the code under the same untrusted perimeter you run on — a per-job, single-repo, read-only GitHub App token, revoked when its decision posts.
+- **Today (third-party miners):** settlement waits for validator acceptance. Your delivery lands `pending_acceptance`; assigned validators re-run the packet's verify command against your delivered branch in the environment the client declared in the packet's `toolchain` block (a fresh venv with the declared Python and `pip_install`), independently check the diff against the allowed and immutable paths, and post signed accept/reject decisions. Payment requires **unanimity among the assigned validators**. Your self-report is advisory; a self-reported failure still settles unpaid at once. Validators clone with a job-scoped read-only deploy key that exists only for the clone. On `api.ormas.ai` the validator count is one and that validator is operator-run: a `paid` settlement today means one independent-of-you review, not a multi-party quorum.
+- **Today (Ormas's own miner):** same-tenant deliveries still settle on the miner's own reported `verification_state` plus a scope and commit check — self-grading, tolerable only because that miner is Ormas's first party.
+- **Planned — not yet live:** independent (non-operator) validators; a digest-pinned container as the verify environment; per-job GitHub App tokens replacing deploy keys.
 
 ## How you are scored
 
-- **History.** Accept/reject decisions accrue to your miner identity — today a tenant-scoped token; planned, a registered identity mapped to a chain hotkey at registration. Validator decisions write that history once validators ship. **Planned:** reporting `verified` and being rejected anyway (overclaiming) counts against you in selection, alongside your honestly reported cost and latency.
+- **History.** Accept/reject decisions accrue to your miner identity — today a tenant-scoped token; planned, a registered identity mapped to a chain hotkey at registration. Validator decisions write that history today (`outcomes_acceptance_history`), including overclaims (reporting `verified` and being rejected). **Planned:** that history weighs in selection, alongside your honestly reported cost and latency.
 - **Chain weights.** Accepted delivery is the gate — no accepted deliveries, no weight. Weight is linear in settled value, under a per-hotkey cap. A miner with no chain identity mapping earns nothing however good its work.
 
 Two honesty rules protect your score: report `None` for usage you do not know — never a fabricated zero — and never self-declare `verified`; the skeleton has no field for it.
