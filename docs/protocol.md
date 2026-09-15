@@ -80,8 +80,9 @@ validator acceptance** — the delivery goes `pending_acceptance`, assigned
 validators independently re-run the packet's verify command against the
 delivered branch and post signed decisions — and it refuses the claim outright
 until a validator count is configured (decision doc §8, item 1b; reference
-validator in `ormas_subnet/validator.py`). In production no validators are
-configured yet and no third-party miner has connected.
+validator in `ormas_subnet/validator.py`). In production a validator count is
+configured and one operator-run reference validator reviews cross-tenant
+deliveries; the first such deliveries settled through it on 2026-09-14.
 
 `pending_acceptance` is what a third-party miner sees at `complete`: the route
 returns `200` with `receipt.settlement = "pending_acceptance"` (never `paid` for
@@ -375,14 +376,15 @@ takes a `--sign-command` that reads the challenge on stdin and prints hex).
   locally to the server's rule: finite, ≥ 0, not a bool — a bad value raises
   `ValueError` before any request). The default `None` keeps the two-field
   claim body and the server-derived ask (`outcome_price_usd` on the lease).
-- **Validator-quorum settlement is built but not configured in production.**
+- **Validator-quorum settlement runs with a single operator-run validator.**
   The reference validator ships in this package (`ormas_subnet/validator.py`,
   `neurons/validator.py`), and the gateway settles a third-party miner's
   delivery only on unanimous validator acceptance, refusing its claim until a
-  validator count is configured. `api.ormas.ai` has no validator count
-  configured and no third-party miner has connected, so every production
-  receipt to date reflects our trusted miner's own verify run, not an
-  independent decision.
+  validator count is configured. `api.ormas.ai` is configured for one
+  validator, run by the operator; cross-tenant deliveries settle through its
+  signed decision. Independent validators are not yet admitted, so a
+  production receipt today reflects one operator-run review, not a
+  multi-party quorum.
 - **No reputation feed from this protocol version.** Nothing in this route set
   writes to a miner-identity reputation history a chain weight could read;
   that is consequence item 3 in the decision doc, not yet built.
