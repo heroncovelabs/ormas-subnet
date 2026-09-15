@@ -199,13 +199,14 @@ No peer we found combines all five columns.
   validated locally to the server's rule); the default `None` keeps sending only
   `schema_version` + `runner_id` and the gateway derives the ask (flat
   per-project fee, or estimated cost plus margin).
-- **No validators configured in production yet.** The reference validator
+- **One operator-run validator in production.** The reference validator
   (this repo) and validator-quorum settlement (gateway, card `25ff6188`) are
-  built and deployed in `gateway-2026.09.11`, but `api.ormas.ai` has no
-  validator count configured and no third-party miner connected, so every
-  production receipt to date reflects our trusted miner's own verify run, not
-  an independent decision. Ed25519 is the dev-subnet signature scheme; sr25519
-  is the SN76 target.
+  live: `api.ormas.ai` is configured for one validator, run by the operator,
+  and third-party deliveries settle only on its signed acceptance (first such
+  deliveries settled 2026-09-14; the first non-operator miner connected
+  2026-09-15). Independent validators are not yet admitted, so a production
+  receipt today reflects one operator-run review, not a multi-party quorum.
+  Ed25519 is the dev-subnet signature scheme; sr25519 is the SN76 target.
 
 ## Other gateways
 

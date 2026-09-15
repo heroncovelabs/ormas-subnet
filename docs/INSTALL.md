@@ -60,6 +60,7 @@ Save as `miner.py`, export the env vars (`ORMAS_API_URL`, `ORMAS_MINER_TOKEN`, `
 
 ```python
 import os
+import sys
 from pathlib import Path
 
 from ormas_subnet import MinerConfig, MinerSkeleton, OrmasMinerClient, load_token
@@ -72,10 +73,11 @@ client = OrmasMinerClient(
     token=load_token(token_env="ORMAS_MINER_TOKEN"),
 )
 config = MinerConfig(
-    runner_id="",  # empty on first run — the gateway assigns runr_<12hex>;
-    # register() adopts it into config.runner_id and it is echoed back below.
-    # Save it (e.g. export ORMAS_RUNNER_ID and read it here) and pass the
-    # assigned id on every later run; a self-chosen id is refused 404.
+    # Empty on the first run — the gateway assigns runr_<12hex> and register()
+    # adopts it into config.runner_id. The library does NOT print it; the
+    # print() below does. Save it (export ORMAS_RUNNER_ID) and it is reused
+    # here on every later run; a self-chosen id is refused 404.
+    runner_id=os.environ.get("ORMAS_RUNNER_ID", ""),
     runner_version="0.1.0",
     platform="linux",
     capacity=1,
@@ -86,8 +88,13 @@ config = MinerConfig(
 )
 skeleton = MinerSkeleton(client, config, shell_solver)
 skeleton.register()
+print(f"runner_id={skeleton.config.runner_id}", file=sys.stderr)  # keep this; pass it next time
 skeleton.run_forever()
 ```
+
+On the second and later starts: `export ORMAS_RUNNER_ID=runr_…` (the value printed above) before
+launching, and the same example reuses it. The CLI (`python -m neurons.miner`) already prints
+`runner_id=<assigned>` to stderr on every start and takes `--runner-id` on later runs.
 
 Four fields a newcomer cannot guess:
 
