@@ -78,6 +78,7 @@ config = MinerConfig(
     # print() below does. Save it (export ORMAS_RUNNER_ID) and it is reused
     # here on every later run; a self-chosen id is refused 404.
     runner_id=os.environ.get("ORMAS_RUNNER_ID", ""),
+    miner_id="your-miner-name",  # optional public identity
     runner_version="0.1.0",
     platform="linux",
     capacity=1,

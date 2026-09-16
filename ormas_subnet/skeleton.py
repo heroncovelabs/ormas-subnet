@@ -322,6 +322,9 @@ class MinerConfig:
     the assigned id into this field. Afterwards it is the assigned/known id:
     pass the one the gateway issued; a non-empty id it has not issued to this
     token is refused 404.
+
+    ``miner_id`` is the chosen public miner identity; lowercase 3–40
+    ``[a-z0-9-]``; globally unique; optional.
     """
 
     runner_id: str
@@ -336,6 +339,7 @@ class MinerConfig:
     device_nonce: str | None = None
     heartbeat_interval_s: float = float(DEFAULT_HEARTBEAT_S)
     ask_usd: float | None = None
+    miner_id: str | None = None
 
 
 class MinerSkeleton:
@@ -388,6 +392,7 @@ class MinerSkeleton:
             platform=self.config.platform,
             capacity=self.config.capacity,
             health=health,
+            miner_id=self.config.miner_id,
         )
         response = self.client.register_runner(registration)
         if isinstance(response, Mapping):

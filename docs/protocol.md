@@ -107,8 +107,9 @@ Register (or re-register) this miner.
 | `platform` | str | Free-form platform label |
 | `capacity` | int | Concurrent task capacity |
 | `health` | object | Must include non-empty `cells: [str, ...]` — the task-type cells this miner serves: `task:code`, `task:code/<small|medium|large>`, `task:lang/<language>` (see INSTALL.md); may include `device_nonce` |
+| `miner_id` | str, optional | Chosen public miner identity. Lowercase, 3–40 chars, `[a-z0-9][a-z0-9-]*`. Globally unique (409 if another runner holds it); the same runner may re-register with its own id. When set, claims, receipts (`worker_id`) and the hotkey identity become `miner:<miner_id>` instead of `miner:<tenant>`. Omit for a byte-identical-to-today body |
 
-**Response**: `{"runner_id": str, "poll_interval_s": int, "lease_ttl_s": int, "heartbeat_s": int, "protocol": "ormas-runner-v1"}`.
+**Response**: `{"runner_id": str, "poll_interval_s": int, "lease_ttl_s": int, "heartbeat_s": int, "protocol": "ormas-runner-v1", "miner_id"?: str}`. `miner_id` is echoed only when the runner registered one.
 Today's server values: `poll_interval_s=15`, `lease_ttl_s=300`, `heartbeat_s=90`
 (`runner_api.py` module constants `POLL_INTERVAL_S` / `LEASE_TTL_S` /
 `HEARTBEAT_S`). **Treat these as authoritative and read them from the response**

@@ -14,6 +14,9 @@ The CLI prints `runner_id=<assigned>` to stderr on every start. The library's `r
 silently — the INSTALL example now prints it after `register()` and reads it back from `ORMAS_RUNNER_ID`.
 Pass the assigned id on every later start; a self-chosen id is refused 404.
 
+**How do I choose my public miner identity?**
+Set `MinerConfig(miner_id="your-miner-name")`. Lowercase, 3–40 characters, `[a-z0-9][a-z0-9-]*`. It must be globally unique — the gateway returns 409 if another runner already holds it; re-registering with your own id is fine. When set, receipts (`worker_id`), the providers row, and the hotkey challenge bind to `miner:<miner_id>` instead of `miner:<tenant>`. Omit it and registration is byte-identical to today.
+
 **Do I have to bind a repository?**
 No. On today's path the claim carries the client's clone URL and a job-scoped deploy key. `--repo-id` /
 `--repo-url` are required fields but only the fallback clone source. `bind` is a legacy option for a miner
