@@ -12,6 +12,7 @@ No model calls happen anywhere in this package.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shlex
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .client import OrmasMinerClient
+from .client import OrmasGatewayError, OrmasMinerClient
 from .protocol import (
     RepoRegistration,
     RunnerRegistration,
@@ -75,6 +76,8 @@ _UNKNOWN_MODEL = "unknown"
 # leading assignment tokens are stripped into the environment; the remaining
 # argv is executed directly, never through a shell.
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class GitError(RuntimeError):
@@ -362,6 +365,16 @@ class MinerSkeleton:
         # (see register()); the module defaults stand until then.
         self.poll_interval_s = float(DEFAULT_POLL_INTERVAL_S)
         self.lease_ttl_s = float(DEFAULT_LEASE_TTL_S)
+        # Set (from the heartbeat thread or a completion attempt) the moment the
+        # gateway tells us our lease is gone (409 lease_lost). A long-running
+        # ``solve_fn`` is expected to poll this cooperatively — the skeleton
+        # cannot interrupt arbitrary user code, only ask it to stop. Cleared at
+        # the start of every claimed run.
+        self.cancelled = threading.Event()
+        # Summary of the most recently claimed run (see ``_run_leased_task``).
+        # ``None`` until a lease has been claimed and handled at least once, so
+        # an idle ``run_once()`` never reports a stale prior run's summary.
+        self.last_run: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -523,16 +536,69 @@ class MinerSkeleton:
     # ------------------------------------------------------------------
 
     def _heartbeat_loop(
-        self, task_id: str, lease: TaskLease, stop: threading.Event,
+        self, task_id: str, lease: TaskLease, stop: threading.Event, state: dict[str, int],
     ) -> None:
+        """Renew the lease on a fixed cadence until told to stop or the lease is lost.
+
+        Runs for as long as the lease is held by the caller — the caller (see
+        :meth:`_run_leased_task`) only signals ``stop`` once the completion has
+        been resolved, not merely once ``solve_fn`` returns; that is the fix for
+        job_c978f3fe82be, whose lease had zero renewals because the heartbeat
+        thread was already dead during exactly the publish/verify/complete
+        window it died in.
+
+        A transient renewal failure is logged at WARNING (with the gateway's
+        HTTP status and message when it is an :class:`OrmasGatewayError`) and
+        the loop CONTINUES — the previous behaviour (``except Exception:
+        return``) is why that renewal count was zero even on a working
+        network: the thread died silently on the very first failure. A missed
+        renewal also erodes the live lease, so the FIRST failure is retried
+        immediately, recovering the tick it just cost rather than waiting out a
+        full new cadence on top of it. A second consecutive failure falls back
+        to the gateway's cadence: a refused connection fails in milliseconds, so
+        retrying every failure immediately would spin this thread against a dead
+        gateway. The normal cadence resumes as soon as a renewal succeeds. Only a confirmed ``lease_lost`` (409) stops
+        the loop outright: the lease is provably gone, so nothing is left to
+        renew, and ``self.cancelled`` is set so a cooperative ``solve_fn`` can
+        notice and stop early. ``state["renewals"]`` counts successful
+        renewals for the run summary. ``KeyboardInterrupt`` is a
+        ``BaseException``, not caught here, and propagates.
+        """
         interval = max(1.0, self.config.heartbeat_interval_s)
-        while not stop.wait(interval):
+        wait_s = interval
+        # One immediate retry recovers the tick a failure just cost the lease.
+        # A SECOND consecutive failure falls back to the gateway's cadence: with
+        # no floor at all, a refused connection (which fails in milliseconds)
+        # would turn this thread into a spin loop against a dead gateway.
+        consecutive_failures = 0
+        while not stop.wait(wait_s):
             try:
                 self.client.heartbeat_task(
                     task_id, self.config.runner_id, lease.lease_id, renew=True,
                 )
-            except Exception:  # noqa: BLE001 - a missed heartbeat is not fatal; lease may expire
-                return
+            except OrmasGatewayError as exc:
+                if exc.status_code == 409 and exc.error_type == "lease_lost":
+                    _LOGGER.warning(
+                        "lease lost for task %s: gateway %s [%s]: %s",
+                        task_id, exc.status_code, exc.error_type, exc.message,
+                    )
+                    self.cancelled.set()
+                    return
+                _LOGGER.warning(
+                    "heartbeat renewal failed for task %s: gateway %s [%s]: %s",
+                    task_id, exc.status_code, exc.error_type, exc.message,
+                )
+                consecutive_failures += 1
+                wait_s = 0.0 if consecutive_failures == 1 else interval
+                continue
+            except Exception as exc:  # noqa: BLE001 - transport error; keep renewing
+                _LOGGER.warning("heartbeat renewal failed for task %s: %s", task_id, exc)
+                consecutive_failures += 1
+                wait_s = 0.0 if consecutive_failures == 1 else interval
+                continue
+            state["renewals"] = state.get("renewals", 0) + 1
+            consecutive_failures = 0
+            wait_s = interval
 
     # ------------------------------------------------------------------
     # The loop
@@ -562,74 +628,188 @@ class MinerSkeleton:
 
     def _run_leased_task(self, lease: TaskLease, draft: TaskDraft, start: float) -> None:
         """The claim → complete path for one held lease. Errors propagate to
-        :meth:`run_once`, which reports them as a failed terminal."""
+        :meth:`run_once`, which reports them as a failed terminal.
+
+        The heartbeat thread keeps renewing across the ENTIRE lease hold — not
+        just through ``solve_fn`` — and is only stopped once the completion is
+        resolved: accepted, terminally refused, or the lease already lost. That
+        is what job_c978f3fe82be needed and did not get. ``self.last_run`` is
+        always set before this method returns or an exception leaves it (see
+        the ``finally`` below), so a caller can read the summary of even a
+        failed run.
+        """
+        self.cancelled.clear()
         workdir = self._clone_and_checkout(draft)
         stop = threading.Event()
+        state: dict[str, int] = {"renewals": 0}
         heartbeat = threading.Thread(
-            target=self._heartbeat_loop, args=(draft.task_id, lease, stop), daemon=True,
+            target=self._heartbeat_loop, args=(draft.task_id, lease, stop, state), daemon=True,
         )
         heartbeat.start()
+        last_run: dict[str, Any] = {
+            "task_id": draft.task_id,
+            "renewals": 0,
+            "lease_lost": False,
+            "completion_attempts": 0,
+            "completion_error": None,
+            "settlement": None,
+        }
         try:
             result = self.solve_fn(draft, workdir)
+
+            if self.cancelled.is_set():
+                # The lease is already gone (the heartbeat thread saw a 409
+                # lease_lost while solve_fn ran). Publishing/verifying/
+                # completing against a dead lease is pointless — and
+                # completing is explicitly forbidden (item 4 of the contract:
+                # "no completion is attempted on a dead lease").
+                return
+
+            self.client.heartbeat_task(
+                draft.task_id,
+                self.config.runner_id,
+                lease.lease_id,
+                renew=False,
+                event=TaskEvent(
+                    lease_id=lease.lease_id,
+                    state="verifying",
+                    occurred_at=lease.now,
+                    error_category=None,
+                ),
+            )
+
+            verify_exit_code = _run_verify_command(draft.verify_command, cwd=workdir)
+            wall_s = time.monotonic() - start
+
+            result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
+            material_sha = self._material_diff_sha256(workdir, draft.base_commit, result.result_commit)
+            scope_ok, changed_paths = self._compute_scope(workdir, draft, result)
+
+            verification_state = "verified" if (verify_exit_code == 0 and scope_ok) else "failed"
+            terminal = TaskTerminal(
+                lease_id=lease.lease_id,
+                verification_state=verification_state,
+                result_ref=result_ref,
+                settlement_state="unset",
+                rating=None,
+                result_commit=result.result_commit,
+            )
+            receipt = _build_receipt(lease.lease_id, result)
+            capture: dict[str, Any] = {
+                "status": verification_state,
+                "scope_ok": scope_ok,
+                "file_count": len(changed_paths),
+                "changed_paths": [{"path": p} for p in changed_paths],
+                "wall_s": wall_s,
+            }
+            # runner_api._project_attempts requires 0 <= verify_exit_code <= 255; a
+            # signal-killed process (negative returncode) is omitted rather than
+            # sent malformed.
+            if 0 <= verify_exit_code <= 255:
+                capture["attempts"] = [{"verify_exit_code": verify_exit_code}]
+            if material_sha is not None:
+                capture["material_diff_sha256"] = material_sha
+            if result.failure_class is not None:
+                capture["failure_class"] = result.failure_class
+
+            response = self._complete_with_retry(
+                draft.task_id,
+                lease,
+                start,
+                receipt=receipt,
+                terminal=terminal,
+                capture=capture,
+                last_run=last_run,
+            )
+            if isinstance(response, Mapping):
+                receipt_wire = response.get("receipt")
+                if isinstance(receipt_wire, Mapping):
+                    last_run["settlement"] = receipt_wire.get("settlement")
         finally:
             stop.set()
             heartbeat.join(timeout=5.0)
+            last_run["renewals"] = state.get("renewals", 0)
+            if self.cancelled.is_set():
+                last_run["lease_lost"] = True
+            self.last_run = last_run
 
-        self.client.heartbeat_task(
-            draft.task_id,
-            self.config.runner_id,
-            lease.lease_id,
-            renew=False,
-            event=TaskEvent(
-                lease_id=lease.lease_id,
-                state="verifying",
-                occurred_at=lease.now,
-                error_category=None,
-            ),
-        )
+    def _complete_with_retry(
+        self,
+        task_id: str,
+        lease: TaskLease,
+        start: float,
+        *,
+        receipt: TaskReceipt,
+        terminal: TaskTerminal,
+        capture: Mapping[str, Any],
+        last_run: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Call ``complete_task``, retrying a TRANSIENT refusal while the lease lives.
 
-        verify_exit_code = _run_verify_command(draft.verify_command, cwd=workdir)
-        wall_s = time.monotonic() - start
+        The retry bound is the lease itself, never an invented attempt count:
+        keep retrying only while ``time.monotonic() - start < self.lease_ttl_s``
+        (``lease_ttl_s`` comes from the gateway's registration response — see
+        :meth:`register` — not a local constant), leaving room for one more
+        attempt before the deadline. Backoff starts at the registered heartbeat
+        cadence (``self.config.heartbeat_interval_s``, also gateway-supplied)
+        and doubles each retry. There is no ``max_attempts``: the lease TTL is
+        the real, gateway-authoritative bound, so adding one would be an
+        arbitrary ceiling with no basis.
 
-        result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
-        material_sha = self._material_diff_sha256(workdir, draft.base_commit, result.result_commit)
-        scope_ok, changed_paths = self._compute_scope(workdir, draft, result)
-
-        verification_state = "verified" if (verify_exit_code == 0 and scope_ok) else "failed"
-        terminal = TaskTerminal(
-            lease_id=lease.lease_id,
-            verification_state=verification_state,
-            result_ref=result_ref,
-            settlement_state="unset",
-            rating=None,
-            result_commit=result.result_commit,
-        )
-        receipt = _build_receipt(lease.lease_id, result)
-        capture: dict[str, Any] = {
-            "status": verification_state,
-            "scope_ok": scope_ok,
-            "file_count": len(changed_paths),
-            "changed_paths": [{"path": p} for p in changed_paths],
-            "wall_s": wall_s,
-        }
-        # runner_api._project_attempts requires 0 <= verify_exit_code <= 255; a
-        # signal-killed process (negative returncode) is omitted rather than
-        # sent malformed.
-        if 0 <= verify_exit_code <= 255:
-            capture["attempts"] = [{"verify_exit_code": verify_exit_code}]
-        if material_sha is not None:
-            capture["material_diff_sha256"] = material_sha
-        if result.failure_class is not None:
-            capture["failure_class"] = result.failure_class
-
-        self.client.complete_task(
-            draft.task_id,
-            self.config.runner_id,
-            lease.lease_id,
-            receipt=receipt,
-            terminal=terminal,
-            capture=capture,
-        )
+        A TERMINAL refusal (HTTP 4xx other than 409) is never retried — the
+        gateway has decided, and burning the rest of the lease on a doomed
+        retry only delays the crash report. It is re-raised so
+        :meth:`run_once`'s existing contained-failure path (``_report_lease_failure``)
+        handles it. A 409 ``lease_lost`` means the lease is gone outright: no
+        retry, no further completion attempt, ``self.cancelled`` is set and
+        ``None`` is returned (not raised — there is nothing left to report a
+        crash against).
+        """
+        deadline = start + self.lease_ttl_s
+        backoff = max(1.0, self.config.heartbeat_interval_s)
+        attempts = 0
+        while True:
+            attempts += 1
+            last_run["completion_attempts"] = attempts
+            try:
+                response = self.client.complete_task(
+                    task_id, self.config.runner_id, lease.lease_id,
+                    receipt=receipt, terminal=terminal, capture=capture,
+                )
+            except OrmasGatewayError as exc:
+                last_run["completion_error"] = {
+                    "status_code": exc.status_code,
+                    "error_type": exc.error_type,
+                    "message": exc.message,
+                }
+                if exc.status_code == 409 and exc.error_type == "lease_lost":
+                    self.cancelled.set()
+                    return None
+                terminal_refusal = (
+                    exc.status_code is not None
+                    and 400 <= exc.status_code < 500
+                    and exc.status_code != 409
+                )
+                if terminal_refusal:
+                    raise
+                if time.monotonic() + backoff >= deadline:
+                    raise
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            except Exception as exc:  # noqa: BLE001 - a transport/connection error is transient too
+                last_run["completion_error"] = {
+                    "status_code": None,
+                    "error_type": None,
+                    "message": str(exc),
+                }
+                if time.monotonic() + backoff >= deadline:
+                    raise
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            last_run["completion_error"] = None
+            return response
 
     def _report_lease_failure(
         self, lease: TaskLease, draft: TaskDraft, exc: Exception, start: float,

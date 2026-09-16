@@ -23,10 +23,48 @@ A miner is never an inference endpoint, model supplier, or token vendor. Nobody 
    remains for a miner that serves one pre-arranged repository.
 3. **Poll, then claim.** Your claim may carry your firm ask (`ask_usd`); the first ask at or under the client's reserve is leased, and that ask is the price you are paid. An ask above the reserve is recorded and skipped — the job stays queued for the next miner. That is "accept on arrival". If you send no ask, the gateway derives one from the task's expected cost plus a margin. **Status:** live on `api.ormas.ai` since `gateway-2026.09.11`; this package's client and skeleton send `ask_usd` when it is configured (`MinerConfig.ask_usd`), and send no ask otherwise.
 4. **Clone** — the skeleton clones the repo and checks out the base commit in a fresh workdir.
-5. **Solve** — your `solve(draft, workdir) -> SolveResult`. Heartbeat during it; an unrenewed lease expires.
+5. **Solve** — your `solve(draft, workdir) -> SolveResult`. Heartbeat throughout — not only here; see "Keeping your lease alive" below.
 6. **Verify** — the skeleton runs the packet's verify command itself, in a bounded, credential-free environment with no shell, and computes `scope_ok` from a real `git diff`.
 7. **Publish** — your result commit lands on `refs/heads/ormas/job/<task_id>` in the client's repository.
 8. **Complete** — send the receipt, terminal, and capture: commit sha, changed paths, diff hash, verify exit code, usage.
+
+## Keeping your lease alive
+
+The registration response is authoritative for your cadence: `heartbeat_s` (how
+often to renew), `lease_ttl_s` (how long a lease survives without a renewal),
+and `poll_interval_s` (how often to poll for work). Honor those over any local
+default — a gateway cadence change should never require a new miner release.
+
+**Renew through the whole lease, not just through solve.** The lease must keep
+being renewed across solve, publish, verify, *and* complete — the skeleton
+does this for you, but if you build your own runner, do not stop heartbeating
+the moment `solve` returns. On 2026-09-16 a miner's job produced a correct,
+already-pushed result, then hit a transient failure on the completion POST —
+and had renewed its lease **zero times**, because its heartbeat had already
+been shut down for the publish/verify/complete phase. The lease expired before
+the retry could land. Good work, unpaid, for a reason that had nothing to do
+with the work.
+
+**A transient completion refusal is not a rejection.** An HTTP 5xx, or a
+connection/transport failure, means try again with backoff, for as long as
+the lease is still live — never past `lease_ttl_s` since the claim. There is
+no fixed attempt count to hit; the lease's remaining life is the only honest
+bound. An HTTP 4xx (other than 409) is different: the gateway has decided,
+and retrying burns lease time for nothing.
+
+**A 409 `lease_lost` means the work is no longer yours.** Someone or something
+else holds the lease now. Stop. Do not retry the heartbeat, do not attempt a
+completion — there is nothing left to complete against. If your solve is
+long-running, poll the skeleton's cancellation signal (`MinerSkeleton.cancelled`)
+cooperatively and stop your own work early; the skeleton can ask, but it
+cannot reach into your solver and interrupt it for you.
+
+**Completion errors carry the gateway's real status and body** —
+`OrmasGatewayError.status_code` / `.error_type` / `.message` — not a bare
+exception. A wrapper that swallows those into something like
+`completion_request_failed` throws away exactly the information you need to
+tell a transient blip from a terminal refusal, which is what turned a fixable
+retry into a lost job on 2026-09-16.
 
 ## What you see — and what the gateway never sees
 
