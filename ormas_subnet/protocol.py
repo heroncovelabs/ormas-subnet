@@ -166,9 +166,24 @@ class RunnerRegistration(_RunnerWireDTO):
     platform: str
     capacity: int
     health: Mapping[str, Any]
+    miner_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "health", MappingProxyType(dict(self.health)))
+
+    def to_wire(self) -> dict[str, Any]:
+        payload = super().to_wire()
+        if self.miner_id is None:
+            payload.pop("miner_id", None)
+        return payload
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> RunnerRegistration:
+        if not isinstance(payload, Mapping):
+            raise ValueError("payload must be a mapping")
+        data = dict(payload)
+        data.setdefault("miner_id", None)
+        return super().from_wire(data)
 
 
 @dataclass(frozen=True)

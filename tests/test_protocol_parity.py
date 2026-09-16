@@ -70,6 +70,7 @@ def _sample_for(name: str) -> dict:
         return dict(
             runner_id="r1", runner_version="0.1", platform="linux",
             capacity=1, health={"cells": ["code-edit-small"]},
+            miner_id="jake-miner",
         )
     if name == "RepoRegistration":
         return dict(

@@ -163,10 +163,15 @@ def main(argv: list[str] | None = None) -> int:
         ask_usd=args.ask_usd,
     )
     miner = MinerSkeleton(client, config, make_shell_solver(args.solve_command))
-    miner.register()
+    response = miner.register()
     # The gateway assigns the runner id on first registration; surface it so the
-    # operator can pass --runner-id on later runs.
-    print(f"runner_id={miner.config.runner_id}", file=sys.stderr)
+    # operator can pass --runner-id on later runs. Echo miner_id on the same
+    # line when the gateway bound a chosen public identity.
+    line = f"runner_id={miner.config.runner_id}"
+    echoed = response.get("miner_id") if isinstance(response, dict) else None
+    if echoed:
+        line += f" miner_id={echoed}"
+    print(line, file=sys.stderr)
     if args.bind_project:
         if not args.bind_base_commit:
             ap_err = "--bind-base-commit is required with --bind-project"
