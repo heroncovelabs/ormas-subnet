@@ -146,3 +146,31 @@ def test_malformed_toolchain_is_error_never_provisioned(tmp_path: Path) -> None:
                 continue  # non-python kinds are simply ignored (None), not provisioned
             raise AssertionError(f"accepted {bad!r}")
     assert not (workdir / ".venv").exists()
+
+
+@requires_git
+def test_missing_verifier_executable_is_a_signed_error_not_a_reject(tmp_path: Path) -> None:
+    repo, base = _init_repo(tmp_path)
+    result = _commit_result(repo, "raise SystemExit(0)\n")
+    assignment = _assignment(repo, base, result, "ormas-nonexistent-verifier-709e2a53", None)
+    gateway = _run_once(tmp_path, assignment)
+    assert gateway.decisions[0]["decision"] == "error", "launch failure became miner overclaim"
+    assert len(gateway.decisions[0]["signature_hex"]) == 128
+
+
+@requires_git
+def test_executed_verifier_exit_127_remains_a_reject(tmp_path: Path) -> None:
+    import shlex
+    repo, base = _init_repo(tmp_path)
+    result = _commit_result(repo, "raise SystemExit(0)\n")
+    command = shlex.quote(sys.executable) + " -c 'raise SystemExit(127)'"
+    gateway = _run_once(tmp_path, _assignment(repo, base, result, command, None))
+    assert gateway.decisions[0]["decision"] == "reject"
+
+
+@requires_git
+def test_unparseable_verifier_is_a_signed_error(tmp_path: Path) -> None:
+    repo, base = _init_repo(tmp_path)
+    result = _commit_result(repo, "raise SystemExit(0)\n")
+    gateway = _run_once(tmp_path, _assignment(repo, base, result, "python3 'unfinished", None))
+    assert gateway.decisions[0]["decision"] == "error"
