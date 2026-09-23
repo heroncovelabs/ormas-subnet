@@ -161,6 +161,102 @@ task description), `verify_command`, `allowed_paths`, `budget_usd`,
 `work_packet_sha256`, `attempt`, `parent_job_id` (non-empty on a repair),
 `repair_findings`, `repair_evidence` (present only on a repair attempt).
 
+### Public execution and acceptance additions (September 23 development candidate)
+
+These additions describe the candidate source contract, not a production rollout.
+The older credential/toolchain route below remains separate. See
+[Public tasks](PUBLIC_TASKS.md) for supported profiles and operator setup.
+
+A public `ormas.work-packet.v2` preparation includes:
+
+- `execution_environment`: `outcomes.execution-environment.v1`, with
+  `catalog_digest`, the exact catalog `profile`, path-to-SHA256 `lock_files` and
+  `acceptance_files`, and `service` only for the HTTP profile. The service has exactly
+  `argv` and `port`; the allowed shape is checked before base execution.
+- `execution_requirements`: the catalog/profile and environment/verifier digests,
+  protocol versions, public visibility, languages, OS/architecture, runtimes,
+  browser, packages, services, network policy, workspace mode and resource limits.
+  Version 2 also binds the `github-artifact-v1` publication protocol. Every required
+  task cell must match; language requirements are not an any-one-match hint.
+- `verifier_profile` and `verify_base`: the compiled verifier identity and an
+  `outcomes.base-preflight.v2` assertion-failing base bound to the same base commit,
+  environment and verifier. Missing/setup/timeout failures cannot stand in for it.
+
+The gateway and SDK recompile and compare the executable/configuration against the
+frozen catalog. They do not trust a client-supplied wrapper merely because its shape
+looks valid. Earlier admitted catalog versions remain loadable for in-flight jobs.
+
+`TaskDraft.acceptance_contract` is optional for legacy drafts and required on this
+public publication path. It has the exact keys `schema_version`, `policy`, `miner`,
+`validators`, `claim_nonce`, with schema `ormas.public-acceptance-contract.v1`:
+
+- `policy` uses `ormas.public-acceptance-policy.v1` and has exactly
+  `required_validators`, `catalog_digest`, `profile_id`, `protocol`, `liveness_s`,
+  `timeout_s`, `max_concurrent_assignments`, plus `schema_version`. Counts and times
+  are positive integers; concurrency is exactly one.
+- `miner` has `subject_id`, `operator_id`, `qualification_id`, `credential_id`,
+  `miner_id`. A validator record has the same first four fields; its credential is
+  a 64-lowercase-hex Ed25519 public key.
+- The validator list length equals `required_validators`. Subjects, credentials
+  and operators are distinct, and every validator operator differs from the miner
+  operator. The nonblank `claim_nonce` binds the selected capacity reservation.
+
+Registration and heartbeat do not grant qualification. Claims require current
+credential-bound qualification for the exact profile/catalog, matching task cells
+and available independent checker capacity. This includes operator-miner claims.
+
+Validator assignments carry an `execution_contract` with exactly `schema_version`,
+`work_packet_sha256`, `execution_environment`, `execution_requirements`,
+`verifier_profile`, `verify_base`. The schema is `outcomes.validation-contract.v2`;
+the packet hash is 64 lowercase hex characters. Assignments also carry the frozen
+`acceptance_contract`. Both objects join the canonical signed evidence alongside
+the existing repository/commit/verifier/scope fields. Validators reject malformed
+or mismatched projections before repository access; they do not need the task's
+private text, prices or miner model choices.
+
+Public validators require base exit 86, then classify the result's completed
+assertions as accept/reject. Runtime setup and timeout are neutral. A public
+completion cannot reduce its frozen checker count or substitute the miner's own
+verification for the independent decisions. Pending or missing decisions retain
+the agreed count and deadline.
+
+### Public artifact publication
+
+`POST /api/runner/v1/leases/{task_id}/publication` takes the existing authenticated
+miner token and headers `X-Ormas-Runner-Id`, `X-Ormas-Lease-Token`, `Content-Length`,
+with `Content-Type: application/vnd.ormas.public-artifact.v1`.
+
+The body is an eight-byte unsigned big-endian header length, canonical JSON header,
+then the concatenated file bytes. The header is at most 1 MiB and has exactly
+`schema_version: "ormas.public-artifact.v1"`, `base_commit`, `tree_sha`, `files`.
+JSON uses sorted keys, compact separators and ASCII escapes. File entries are sorted
+by path and have exactly `path`, `op`, `mode`, `byte_len`, `sha256`. An `upsert` has
+mode `100644` or `100755`, its byte count and lowercase SHA256; a `delete` has null
+mode/hash and zero bytes. Upsert bodies follow that same order. The artifact digest
+is SHA256 over the entire framed body. A successful JSON response includes the
+canonical `result_ref`, `result_commit`, `tree_sha` and `artifact_sha256`.
+The SDK's `outcomes_support.build_public_artifact` is the executable serializer;
+only committed regular files within allowed scope and the frozen publication bounds
+are admitted. Raw Git packs, symlinks and submodules are not this protocol.
+
+The gateway holds the saved repository write token, creates the canonical
+`refs/heads/ormas/job/<task_id>` result and verifies its exact tree and sole base
+parent. The public miner and validator use anonymous clones; a write credential is
+not included in their draft or assignment. The SDK verifies publication by fetching
+the canonical branch before completion. Replays bind the same artifact and result;
+an ambiguous publication cannot silently become a different commit. Completion
+still uses the existing authenticated endpoint and gateway receipt authority.
+
+The SDK journals the claim, bounded artifact and exact completion before external
+effects. After a process restart it resolves the journal before claiming another
+task; it does not call the solver again for that retained lease. Settling retains
+the completion; terminal acknowledgement requires a receipt, and a lost lease
+retains a tombstone. An interruption before the artifact was saved reports aborted
+with an unknown outcome. Corrupt/unsafe journal state refuses further work rather
+than guessing. No journal creates a second queue or settlement receipt.
+
+### Legacy toolchain and repository credentials
+
 `work_packet` may carry an optional **`toolchain`** block the client declared at
 prepare time (protocol addition 2026-09-14):
 
@@ -234,7 +330,9 @@ Report the outcome.
 `^[a-z0-9./:-]{1,80}$`), `prompt_tokens`, `completion_tokens`,
 `cache_read_input_tokens`, `cache_creation_input_tokens`, `reasoning_tokens`,
 `upstream_cost_usd` (nullable), `finish_reason` (nullable),
-`metering_complete` (bool).
+`metering_complete` (bool). `child_model_ids` is an optional list (defaults to
+empty) for operator diagnostics. Miners do not need to disclose child models or
+their per-job routing to qualify for network acceptance.
 
 **`TaskTerminal`**: `lease_id`, `verification_state` (one of
 `verified/failed/scope_violation/setup_failure/repair_refused/publish_failed/budget_exceeded/aborted`),

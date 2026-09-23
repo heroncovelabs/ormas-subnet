@@ -4,6 +4,14 @@ No token yet? Run the [local quickstart](QUICKSTART_LOCAL.md) first — the whol
 
 Get the package installed, get a token, run the skeleton with the reference solver, then plug in your own `solve`. What "miner" means here is defined in [`docs/DECISIONS.md`](DECISIONS.md); the commercial and acceptance terms are in [`docs/CONTRACT.md`](CONTRACT.md) (validator acceptance per [`docs/DECISIONS.md`](DECISIONS.md) §6 — the reference validator ships in this package; see [`README.md`](../README.md) "Known gaps" for what is live today); the wire contract is [`docs/protocol.md`](protocol.md); the code below comes from [`ormas_subnet/skeleton.py`](../ormas_subnet/skeleton.py) and [`ormas_subnet/reference_solver.py`](../ormas_subnet/reference_solver.py).
 
+For the September 23 public development candidate, read [Public tasks](PUBLIC_TASKS.md)
+first. Public clones are anonymous; saved GitHub write access stays at the gateway.
+All required task cells and exact environment qualifications must match, and every
+public miner—including the operator—requires independent acceptance. The credential
+and bind instructions below retain compatibility with the earlier non-public route;
+they are not the repository-access contract for public-profile jobs. Installing this
+candidate does not activate it in production.
+
 ## Prerequisites
 
 - Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). A **validator** host additionally needs every Python minor a client may declare in a packet `toolchain` installed as `python3.X` on `PATH` (today: `python3.12`); a declared interpreter that is missing makes the validator post `error` for that assignment, which is excluded from quorum. Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
@@ -108,7 +116,7 @@ Four fields a newcomer cannot guess:
   `outcomes-…` strings are the operator's own model-bound cells; they are not yours to
   register and, since gateway `2026.09.12`+1, a third-party miner registering only those never
   leases work. Registration accepts any string; a cell no queued job carries simply never leases.
-- **`workdir_root`** — fresh clones of the *client's repository* land here, one directory per `task_id`; keep it private (`mkdir -p -m 700 ~/.ormas/work`). `/tmp` is world-readable, periodically purged, and shared with every other user — the wrong place for client source. A directory left behind by a crashed job is replaced on the next claim (`_fresh_workdir`).
+- **`workdir_root`** — client clones land here, one directory per `task_id`; keep it private and persistent (`mkdir -p -m 700 ~/.ormas/work`). Public-profile jobs retain their checkout and journal for recovery after a crash. The older non-public route retains its fresh-checkout behavior. Do not delete a public recovery directory to force a new claim.
 - **`repo_url`** — `MinerConfig` requires it, but on today's path it is only the fallback: `_clone_and_checkout` clones `draft.repo_url` whenever the draft carries a `repo_credential` and a non-empty `repo_url`, and clones `config.repo_url` only when it does not. Point it at a repository you actually hold, or at the bound repository if you use the fallback below.
 - **`repo_id`** — `MinerConfig` requires it; it is the id sent in a bind request (`RepoRegistration.repo_id`). On the credential path the draft's own `repo_id` describes the job, and this field is not used to choose the clone source.
 
@@ -131,9 +139,30 @@ The CLI equivalent is `--bind-project <project_id> --bind-base-commit <sha>` on 
 
 One gateway rule applies to both paths: a third-party claim leases only when the gateway has a validator count configured, because a third-party delivery settles on validator acceptance, never on the miner's own report (`docs/protocol.md` §Lifecycle; [`README.md`](../README.md) "What this is NOT" for the production state).
 
-## Known gaps (skeleton)
+## Restart and completion recovery
 
-- Poll, heartbeat and lease cadences are adopted from the registration response; a job that crashes mid-run is reported to the gateway as a failed terminal and its workdir is replaced on the next claim; gateway errors surface as `OrmasGatewayError` with the gateway's `error.type` and message. Remaining gap: the skeleton does not retry a failed `complete` call — if the gateway is unreachable at that moment the lease expires server-side (a warning is emitted).
+Keep the same `workdir_root` across miner restarts. The public miner keeps a private
+atomic journal there, bound to the gateway, runner, task, lease and prepared packet.
+Only one process may own that journal. A restart resolves retained work before it
+claims another task; it never invokes the solver again for that retained lease.
+
+The miner saves the bounded artifact before publication and the exact completion
+request before posting it. If the process dies at either boundary, the normal
+miner loop replays those saved bytes through the gateway's idempotent endpoints.
+Transient completion failures are also retried in-process within the lease budget.
+A settling response keeps the completion pending. A terminal receipt acknowledges
+it; an explicit lost lease retains a tombstone and releases the miner for new work.
+
+If the process died before the artifact was saved, its provider outcome is unknown.
+The miner reports an aborted result without another solver call or an invented
+settlement receipt. Corrupt or unsafe recovery evidence refuses new work for
+inspection. Retain the journal and checkout; deleting them loses recovery evidence.
+The service manager must restart a stopped miner process: the SDK recovers work
+when launched, but does not itself supervise or reboot the host.
+
+Poll, heartbeat and lease cadences come from the gateway registration response.
+Gateway errors surface as `OrmasGatewayError` with the gateway's error type and
+message. Legacy, non-public jobs retain their existing completion behavior.
 
 ## Plug in your own `solve`
 

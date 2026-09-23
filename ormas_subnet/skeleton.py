@@ -22,12 +22,15 @@ import tempfile
 import threading
 import time
 import warnings
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .client import OrmasGatewayError, OrmasMinerClient
+from ._recovery import PublicRecovery, RecoveryRequired
+from .verification_context import verification_call
 from .protocol import (
     RepoRegistration,
     RunnerRegistration,
@@ -93,8 +96,9 @@ class SolveResult:
     """What a ``solve`` implementation hands back to the skeleton.
 
     ``result_commit`` must already exist in the workdir (solve commits its own
-    edits); the skeleton only creates the ``ormas/job/<task_id>`` branch and
-    publishes it, it does not commit on the miner's behalf.
+    edits). For public jobs, the gateway publishes that candidate tree as one
+    commit on the frozen base, and the skeleton fetches and verifies it. Legacy
+    jobs publish the solver's commit to ``ormas/job/<task_id>`` directly.
 
     The usage/cost fields below are all optional and default to ``None``
     ("unknown") rather than a fabricated zero — "unknown is never zero". The
@@ -136,6 +140,31 @@ def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+def _public_git(args, *, cwd):
+    from .outcomes_support import public_git
+    return public_git(args, cwd=cwd)
+
+
+def _public_packet(draft):
+    from .outcomes_support import has_public_execution, validate_public_execution_packet
+    raw = getattr(draft, 'work_packet', None)
+    packet = dict(raw) if isinstance(raw, Mapping) else {}
+    if not has_public_execution(packet):
+        return None
+    validate_public_execution_packet(packet)
+    if draft.base_commit != packet['execution_policy']['repo_base_sha'] or draft.verify_command != packet['verification_command']:
+        raise GitError('public draft contract mismatch')
+    return packet
+
+
+def _build_public_artifact(draft, workdir, result, target):
+    from .outcomes_support import build_public_artifact
+    packet = _public_packet(draft)
+    if packet is None:
+        raise GitError('public artifact contract required')
+    return build_public_artifact(packet, workdir, result.result_commit, target)
 
 
 @contextmanager
@@ -271,6 +300,7 @@ def _split_verify_command(verify_command: str) -> tuple[list[str], dict[str, str
 
 def _run_verify_command(
     verify_command: str, *, cwd: Path, path_prefix: str | None = None,
+    evidence_identity=None, raise_setup_errors: bool = False,
 ) -> int:
     """Run ``verify_command`` in ``cwd`` under a bounded, credential-free env.
 
@@ -281,10 +311,14 @@ def _run_verify_command(
     fails closed (1 / 127) rather than raising past the caller.
     When ``path_prefix`` is set, it is prepended to the child's ``PATH`` and
     ``VIRTUAL_ENV`` is set to that prefix's parent directory.
+    Validators set ``raise_setup_errors`` to distinguish a command that never
+    launched from a real verifier that returned the same numeric exit code.
     """
     try:
         argv, env_overrides = _split_verify_command(verify_command)
-    except VerifyCommandError:
+    except VerifyCommandError as exc:
+        if raise_setup_errors:
+            raise ValueError("invalid_verifier_command") from exc
         return 1
     with tempfile.TemporaryDirectory(prefix="ormas-verify-home-") as scratch_home:
         env: dict[str, str] = {}
@@ -301,10 +335,18 @@ def _run_verify_command(
             env["LANG"] = lang
         env.update(env_overrides)
         try:
-            proc = subprocess.run(
-                argv, cwd=str(cwd), env=env, capture_output=True, text=True,
-            )
+            with verification_call(verify_command, env, cwd=cwd,
+                                   identity=evidence_identity) as bound_env:
+                proc = subprocess.run(
+                    argv, cwd=str(cwd), env=bound_env, capture_output=True, text=True,
+                )
+        except ValueError:
+            if raise_setup_errors:
+                raise
+            return 74  # Missing/ambiguous retained evidence is not a verifier pass.
         except OSError:
+            if raise_setup_errors:
+                raise
             return 127
     return proc.returncode
 
@@ -375,6 +417,7 @@ class MinerSkeleton:
         # ``None`` until a lease has been claimed and handled at least once, so
         # an idle ``run_once()`` never reports a stale prior run's summary.
         self.last_run: dict[str, Any] | None = None
+        self._public_recovery: PublicRecovery | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -394,7 +437,11 @@ class MinerSkeleton:
         does not silently desynchronise every miner. Fields the response omits
         keep the module defaults. Returns the gateway's raw response.
         """
-        health: dict[str, Any] = {"cells": list(self.config.cells)}
+        cells = list(self.config.cells)
+        if any(c.startswith('task:lang/') for c in cells):
+            cells.append('task:publication/github-artifact-v1')
+            cells.append('task:acceptance/independent-v1')
+        health: dict[str, Any] = {"cells": list(dict.fromkeys(cells))}
         if self.config.device_nonce:
             health["device_nonce"] = self.config.device_nonce
         if health_extra:
@@ -458,6 +505,13 @@ class MinerSkeleton:
 
     def _clone_and_checkout(self, draft: TaskDraft) -> Path:
         workdir = self._fresh_workdir(draft.task_id)
+        if _public_packet(draft) is not None:
+            if draft.repo_credential is not None or not isinstance(draft.repo_url, str) or not re.fullmatch(
+                    r'https://github\.com/[a-z0-9-]+/[a-z0-9_.-]+\.git', draft.repo_url):
+                raise GitError('public anonymous repository required')
+            _public_git(['clone', '--no-checkout', draft.repo_url, str(workdir)], cwd=workdir.parent)
+            _public_git(['checkout', '--detach', draft.base_commit], cwd=workdir)
+            return workdir
         source = draft.repo_url if (getattr(draft, "repo_credential", None) and draft.repo_url) else self.config.repo_url
         with _credential_git_env(getattr(draft, "repo_credential", None)) as env:
             _run_git(["clone", source, str(workdir)], cwd=workdir.parent, env=env)
@@ -483,6 +537,43 @@ class MinerSkeleton:
             )
             return f"{_RESULT_REF_HEADS}{task_id}"
         return f"{_RESULT_REF_LOCAL}{task_id}"
+
+    def _publish_public(self, lease, draft, workdir, result, *, capture=None):
+        store = self._public_recovery
+        with ExitStack() as stack:
+            if store is not None:
+                pending = store.pending()
+                if pending is not None and pending['stage'] == 'claimed':
+                    if capture is None:
+                        raise RecoveryRequired('public artifact requires frozen capture')
+                    pending = store.checkpoint_artifact(
+                        lambda source: _build_public_artifact(draft, workdir, result, source),
+                        result=asdict(result), capture=capture,
+                    )
+                if pending is None or pending['stage'] != 'artifact':
+                    raise RecoveryRequired('public artifact checkpoint is missing')
+                source = stack.enter_context(store.artifact_source(pending))
+                length, digest, tree_sha = (pending['artifact_length'],
+                                           pending['artifact_sha256'], pending['tree_sha'])
+            else:
+                source = stack.enter_context(tempfile.TemporaryFile())
+                length, digest, tree_sha = _build_public_artifact(draft, workdir, result, source)
+            published = self.client.publish_result(draft.task_id, self.config.runner_id,
+                lease.lease_id, source=source, length=length)
+        commit = published.get('result_commit')
+        ref = f'refs/heads/ormas/job/{draft.task_id}'
+        if (published.get('result_ref') != ref or published.get('artifact_sha256') != digest
+                or published.get('tree_sha') != tree_sha or not isinstance(commit, str)
+                or not re.fullmatch('[0-9a-f]{40}', commit)):
+            raise GitError('public publication identity mismatch')
+        _public_git(['fetch', '--no-tags', draft.repo_url, commit], cwd=workdir)
+        fetched_tree = _public_git(['rev-parse', commit + '^{tree}'], cwd=workdir).decode().strip()
+        if fetched_tree != tree_sha:
+            raise GitError('public publication tree mismatch')
+        parents = _public_git(['rev-list', '--parents', '-n', '1', commit], cwd=workdir).decode().split()
+        if parents != [commit, draft.base_commit]:
+            raise GitError('public publication parent mismatch')
+        return ref, replace(result, result_commit=commit)
 
     def _material_diff_sha256(self, workdir: Path, base_commit: str, result_commit: str) -> str | None:
         if not base_commit or not result_commit:
@@ -615,16 +706,117 @@ class MinerSkeleton:
         claimed and handled). Only a claim failure, before any lease is held,
         propagates. ``KeyboardInterrupt`` is never swallowed.
         """
+        namespace = getattr(self.client, 'base_url', None)
+        if namespace and self.config.runner_id:
+            store = PublicRecovery(self.config.workdir_root, namespace, self.config.runner_id)
+            with store.lock():
+                self._public_recovery = store
+                try:
+                    return self._run_once_locked()
+                finally:
+                    self._public_recovery = None
+        return self._run_once_locked()
+
+    def _run_once_locked(self) -> bool:
+        store = self._public_recovery
+        if store is not None and (pending := store.pending()) is not None:
+            return self._recover_public(pending)
         claimed = self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
         if claimed is None:
             return False
         lease, draft = claimed
         start = time.monotonic()
         try:
+            if _public_packet(draft) is not None:
+                if store is None:
+                    raise RecoveryRequired('public recovery requires gateway identity')
+                store.begin(lease, draft)
+                if (self.config.workdir_root / draft.task_id).exists():
+                    raise RecoveryRequired('public checkout has no matching recovery record')
             self._run_leased_task(lease, draft, start)
+        except RecoveryRequired:
+            raise
         except Exception as exc:  # noqa: BLE001 - contained + reported; KeyboardInterrupt propagates
+            if store is not None and (pending := store.pending()) is not None:
+                if pending['stage'] in {'artifact', 'completion'}:
+                    # A publication or completion may already have reached the
+                    # gateway. Never replace it with a new failure completion.
+                    _LOGGER.warning('public task %s retained for exact recovery', draft.task_id)
+                    return False
             self._report_lease_failure(lease, draft, exc, start)
         return True
+
+    def _recover_public(self, pending) -> bool:
+        """Resolve retained public work before any claim or solver invocation."""
+        self.cancelled.clear()
+        lease = SimpleNamespace(lease_id=pending['lease_id'], task_id=pending['task_id'])
+        draft = SimpleNamespace(task_id=pending['task_id'], base_commit=pending['base_commit'],
+                                repo_url=pending['repo_url'])
+        start = time.monotonic()
+        last_run = {'task_id': draft.task_id, 'renewals': 0, 'lease_lost': False,
+                    'completion_attempts': 0, 'completion_error': None,
+                    'settlement': None, 'recovered': True}
+        self.last_run = last_run
+        if pending['stage'] == 'claimed':
+            # The process died before a bounded artifact was durably captured.
+            # Its provider outcome is unknown, so do not call the solver again.
+            self._report_lease_failure(lease, draft, RecoveryRequired('public execution interrupted'), start)
+            return self._public_recovery.pending() is None
+        if pending['stage'] == 'artifact':
+            workdir = self.config.workdir_root / draft.task_id
+            if workdir.is_symlink() or not workdir.is_dir():
+                raise RecoveryRequired('public recovery checkout is missing or unsafe')
+            try:
+                result_ref, result = self._publish_public(
+                    lease, draft, workdir, SolveResult(**pending['result']))
+            except OrmasGatewayError as exc:
+                if exc.status_code != 409 or exc.error_type != 'lease_lost':
+                    raise
+                self.cancelled.set()
+                last_run['lease_lost'] = True
+                self._acknowledge_public(None)
+                return True
+            capture = pending['capture']
+            self._freeze_public_completion(lease, result_ref, result, capture)
+            pending = self._public_recovery.pending()
+        kwargs = pending['completion']
+        response = self._complete_with_retry(
+            draft.task_id, lease, start, receipt=TaskReceipt.from_wire(kwargs['receipt']),
+            terminal=TaskTerminal.from_wire(kwargs['terminal']), capture=kwargs['capture'],
+            last_run=last_run,
+        )
+        self._acknowledge_public(response)
+        return self._public_recovery.pending() is None
+
+    def _freeze_public_completion(self, lease, result_ref, result, capture):
+        terminal = TaskTerminal(lease_id=lease.lease_id,
+            verification_state=capture['status'], result_ref=result_ref,
+            settlement_state='unset', rating=None, result_commit=result.result_commit)
+        receipt = _build_receipt(lease.lease_id, result)
+        if self._public_recovery is not None and self._public_recovery.pending() is not None:
+            self._public_recovery.freeze(receipt=receipt, terminal=terminal, capture=capture)
+        return receipt, terminal
+
+    def _acknowledge_public(self, response):
+        if self._public_recovery is None or self._public_recovery.pending() is None:
+            return
+        if self.cancelled.is_set():
+            # The gateway explicitly revoked this lease. Retain a tombstone so
+            # it can never trigger another local solver execution.
+            self._public_recovery.acknowledge()
+        elif isinstance(response, Mapping) and response.get('status') in {'done', 'failed'}:
+            receipt = response.get('receipt')
+            if (not isinstance(receipt, Mapping) or not isinstance(receipt.get('receipt_id'), str)
+                    or not receipt['receipt_id'].strip()):
+                raise RecoveryRequired('public completion response has no receipt acknowledgement')
+            if receipt.get('task_id', self.last_run['task_id']) != self.last_run['task_id']:
+                raise RecoveryRequired('public completion response identity mismatch')
+            self._public_recovery.acknowledge()
+        elif (isinstance(response, Mapping) and response.get('status') == 'outcome_unknown'
+                and self._public_recovery.pending().get('completion', {}).get('terminal', {}).get('verification_state') == 'aborted'):
+            self._public_recovery.acknowledge()
+        elif not isinstance(response, Mapping) or response.get('status') != 'settling':
+            raise RecoveryRequired('public completion response was not acknowledged')
 
     def _run_leased_task(self, lease: TaskLease, draft: TaskDraft, start: float) -> None:
         """The claim → complete path for one held lease. Errors propagate to
@@ -655,6 +847,11 @@ class MinerSkeleton:
             "settlement": None,
         }
         try:
+            packet = _public_packet(draft)
+            if packet is not None and _run_verify_command(draft.verify_command, cwd=workdir) != 86:
+                raise VerifyCommandError('public base did not reproduce the frozen assertion failure')
+            if self.cancelled.is_set():
+                return
             result = self.solve_fn(draft, workdir)
 
             if self.cancelled.is_set():
@@ -681,20 +878,10 @@ class MinerSkeleton:
             verify_exit_code = _run_verify_command(draft.verify_command, cwd=workdir)
             wall_s = time.monotonic() - start
 
-            result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
             material_sha = self._material_diff_sha256(workdir, draft.base_commit, result.result_commit)
             scope_ok, changed_paths = self._compute_scope(workdir, draft, result)
 
             verification_state = "verified" if (verify_exit_code == 0 and scope_ok) else "failed"
-            terminal = TaskTerminal(
-                lease_id=lease.lease_id,
-                verification_state=verification_state,
-                result_ref=result_ref,
-                settlement_state="unset",
-                rating=None,
-                result_commit=result.result_commit,
-            )
-            receipt = _build_receipt(lease.lease_id, result)
             capture: dict[str, Any] = {
                 "status": verification_state,
                 "scope_ok": scope_ok,
@@ -712,6 +899,12 @@ class MinerSkeleton:
             if result.failure_class is not None:
                 capture["failure_class"] = result.failure_class
 
+            if packet is not None:
+                result_ref, result = self._publish_public(lease, draft, workdir, result, capture=capture)
+            else:
+                result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
+            receipt, terminal = self._freeze_public_completion(lease, result_ref, result, capture)
+
             response = self._complete_with_retry(
                 draft.task_id,
                 lease,
@@ -725,6 +918,8 @@ class MinerSkeleton:
                 receipt_wire = response.get("receipt")
                 if isinstance(receipt_wire, Mapping):
                     last_run["settlement"] = receipt_wire.get("settlement")
+            self.last_run = last_run
+            self._acknowledge_public(response)
         finally:
             stop.set()
             heartbeat.join(timeout=5.0)
@@ -828,13 +1023,16 @@ class MinerSkeleton:
         that secondary failure only warns.
         """
         failure_class = "git_error" if isinstance(exc, GitError) else "solve_error"
+        public = self._public_recovery is not None and self._public_recovery.pending() is not None
+        if public:
+            failure_class = 'public_execution_interrupted'
         terminal = TaskTerminal(
             lease_id=lease.lease_id,
-            verification_state="failed",
+            verification_state="aborted" if public else "failed",
             result_ref=None,
             settlement_state="unset",
             rating=None,
-            result_commit=draft.base_commit,
+            result_commit="" if public else draft.base_commit,
         )
         receipt = _build_receipt(
             lease.lease_id,
@@ -849,8 +1047,11 @@ class MinerSkeleton:
             "failure_class": failure_class,
             "error": str(exc)[:_FAILURE_MESSAGE_MAX],
         }
+        if public:
+            self._public_recovery.freeze(receipt=receipt, terminal=terminal, capture=capture)
+            self.last_run = {'task_id': draft.task_id}
         try:
-            self.client.complete_task(
+            response = self.client.complete_task(
                 draft.task_id,
                 self.config.runner_id,
                 lease.lease_id,
@@ -858,6 +1059,8 @@ class MinerSkeleton:
                 terminal=terminal,
                 capture=capture,
             )
+            if public:
+                self._acknowledge_public(response)
         except Exception as report_exc:  # noqa: BLE001 - nothing more to do for this lease
             warnings.warn(
                 f"could not report crashed task {draft.task_id!r} to the gateway "

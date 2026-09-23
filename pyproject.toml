@@ -17,6 +17,9 @@ dependencies = [
 [tool.setuptools.packages.find]
 include = ["ormas_subnet*"]
 
+[tool.setuptools.package-data]
+"ormas_subnet" = ["client_assets/*.json", "client_assets/outcomes_support_history/*.json"]
+
 [tool.ruff]
 line-length = 100
 

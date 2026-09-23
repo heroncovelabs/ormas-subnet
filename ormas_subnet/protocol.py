@@ -21,6 +21,8 @@ from dataclasses import dataclass, fields
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 
+from .public_acceptance import validate_acceptance_contract
+
 RUNNER_PROTOCOL_V1 = "ormas-runner-v1"
 RUNNER_DEVICE_HEADER = "X-Ormas-Runner-Device"
 
@@ -216,6 +218,9 @@ class TaskDraft(_RunnerWireDTO):
     # Served once on the claim response over the authenticated runner channel;
     # never persisted or logged; mirrors the gateway's TaskDraft.
     repo_credential: Mapping[str, Any] | None = None
+    # Frozen server-owned public acceptance policy and claim plan. Legacy jobs
+    # omit this field entirely; public jobs require the qualified extension.
+    acceptance_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "allowed_paths", tuple(self.allowed_paths))
@@ -223,6 +228,13 @@ class TaskDraft(_RunnerWireDTO):
         object.__setattr__(self, "repair_findings", tuple(self.repair_findings))
         if self.repo_credential is not None:
             object.__setattr__(self, "repo_credential", MappingProxyType(dict(self.repo_credential)))
+        contract = self.acceptance_contract
+        if contract is not None:
+            object.__setattr__(
+                self,
+                "acceptance_contract",
+                MappingProxyType(validate_acceptance_contract(dict(contract))),
+            )
         evidence = self.repair_evidence
         if evidence is None:
             object.__setattr__(self, "repair_evidence", None)
@@ -243,6 +255,12 @@ class TaskDraft(_RunnerWireDTO):
             payload.pop("repo_credential", None)
         else:
             payload["repo_credential"] = dict(self.repo_credential)
+        if self.acceptance_contract is None:
+            payload.pop("acceptance_contract", None)
+        else:
+            payload["acceptance_contract"] = validate_acceptance_contract(
+                dict(self.acceptance_contract)
+            )
         return payload
 
     @classmethod
@@ -253,6 +271,7 @@ class TaskDraft(_RunnerWireDTO):
         data.setdefault("repair_evidence", None)
         data.setdefault("repo_url", "")
         data.setdefault("repo_credential", None)
+        data.setdefault("acceptance_contract", None)
         return super().from_wire(data)
 
 
@@ -291,9 +310,13 @@ class TaskReceipt(_RunnerWireDTO):
     upstream_cost_usd: float | None
     finish_reason: str | None
     metering_complete: bool
+    # Optional diagnostics for an operator that elects to report child models.
+    # Network acceptance never requires disclosure of a miner's model routing.
+    child_model_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "generation_ids", tuple(self.generation_ids))
+        object.__setattr__(self, "child_model_ids", tuple(self.child_model_ids))
 
 
 @dataclass(frozen=True)

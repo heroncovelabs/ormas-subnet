@@ -6,6 +6,13 @@
 
 Bittensor subnet 76 · operated by Heron Cove LLC · protocol, thin client, reference miner and reference validator: MIT.
 
+**September 23 development candidate:** start with [Public tasks and supported
+environments](docs/PUBLIC_TASKS.md). It documents automatic isolated preparation,
+public repository publication, profile qualification, independent acceptance and
+restart recovery. These changes are not a production deployment. Deployment and
+credential descriptions below describe the earlier route; they do not establish
+the current live miner or validator set.
+
 > **Disclosure.** Heron Cove LLC runs a miner and a validator on SN76 and operates the gateway that
 > settles work. Until validators gate settlement on the production gateway, acceptance is not
 > independent of us; we say so wherever a number appears (`/v1/public/providers` labels our miner

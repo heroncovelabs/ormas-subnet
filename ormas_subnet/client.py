@@ -250,6 +250,18 @@ class OrmasMinerClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def publish_result(self, task_id: str, runner_id: str, lease_token: str, *, source, length: int) -> dict[str, Any]:
+        """Upload the bounded public artifact automatically, without repository keys."""
+        task_id = require_task_id(task_id)
+        headers = dict(self._headers() or {})
+        headers.update({'X-Ormas-Runner-Id': runner_id, 'X-Ormas-Lease-Token': lease_token,
+            'Content-Type': 'application/vnd.ormas.public-artifact.v1', 'Content-Length': str(length)})
+        source.seek(0)
+        response = self._client.post(f'/api/runner/v1/leases/{task_id}/publication',
+            content=iter(lambda: source.read(65536), b''), headers=headers, timeout=180.0)
+        self._raise_for_status(response)
+        return response.json()
+
     def complete_task(
         self,
         task_id: str,

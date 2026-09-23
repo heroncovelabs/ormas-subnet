@@ -20,17 +20,27 @@ not this loop's shape.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .skeleton import GitError, _credential_git_env, _path_covered_by_allowed, _run_git, _run_verify_command
+from .public_acceptance import validate_acceptance_contract
+from .skeleton import (
+    GitError,
+    _credential_git_env,
+    _path_covered_by_allowed,
+    _run_git,
+    _run_verify_command,
+)
+from .verification_context import evidence_root
 
 __all__ = [
     "VALIDATOR_PROTOCOL_V1",
@@ -49,6 +59,42 @@ VALIDATOR_PROTOCOL_V1 = "ormas-validator-v1"
 SignFn = Callable[[str], str]
 
 
+# ── execution contract (card 709e2a53) ───────────────────────────────────────
+# COPY of ``tensorbox_spec.customer_api.outcomes_validators``'s shape check
+# (see module docstring — this package never imports tensorbox_spec). Keep the
+# two byte-identical: same key set, same schema_version literal, same
+# 64-lowercase-hex digest rule, same "nonempty dict" requirement per field.
+EXECUTION_CONTRACT_SCHEMA_VERSION = "outcomes.validation-contract.v2"
+_EXECUTION_CONTRACT_PACKET_FIELDS = (
+    "execution_environment", "execution_requirements", "verifier_profile", "verify_base",
+)
+_EXECUTION_CONTRACT_KEYS = frozenset(
+    {"schema_version", "work_packet_sha256", *_EXECUTION_CONTRACT_PACKET_FIELDS},
+)
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_execution_contract_shape(contract: Any) -> None:
+    """Fail closed on anything that isn't exactly the frozen contract shape —
+
+    see the gateway twin for the rationale (never silently drop a malformed
+    or partial contract from signed evidence).
+    """
+    if not isinstance(contract, dict):
+        raise ValueError("execution_contract must be a dict")
+    if set(contract.keys()) != _EXECUTION_CONTRACT_KEYS:
+        raise ValueError("execution_contract has an unexpected key set")
+    if contract.get("schema_version") != EXECUTION_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("execution_contract schema_version mismatch")
+    sha = contract.get("work_packet_sha256")
+    if not isinstance(sha, str) or _SHA256_HEX_RE.fullmatch(sha) is None:
+        raise ValueError("execution_contract work_packet_sha256 must be 64 lowercase hex chars")
+    for field in _EXECUTION_CONTRACT_PACKET_FIELDS:
+        value = contract.get(field)
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"execution_contract.{field} must be a nonempty dict")
+
+
 def canonical_evidence_fields(
     *,
     job_id: str,
@@ -60,6 +106,8 @@ def canonical_evidence_fields(
     allowed_paths: list[str],
     immutable_paths: list[str],
     toolchain: dict | None = None,
+    execution_contract: dict | None = None,
+    acceptance_contract: dict | None = None,
 ) -> dict[str, Any]:
     """The §4.2 evidence fields a validator signs over. Must byte-match the
 
@@ -80,11 +128,54 @@ def canonical_evidence_fields(
     }
     if isinstance(toolchain, dict) and toolchain:
         fields["toolchain"] = toolchain
+    if execution_contract is not None:
+        _validate_execution_contract_shape(execution_contract)
+        fields["execution_contract"] = copy.deepcopy(execution_contract)
+    if acceptance_contract is not None:
+        fields["acceptance_contract"] = validate_acceptance_contract(acceptance_contract)
     return fields
 
 
 class ToolchainUnavailable(RuntimeError):
     """Declared interpreter missing or venv/pip provision failed."""
+
+
+def validate_assignment_execution(assignment: Mapping[str, Any]) -> bool:
+    """Reconstruct the public execution projection before Git or execution.
+
+    The full private packet is intentionally absent from assignments. Its hash
+    is signed alongside these exact fields; the compiler validates the execution
+    projection without needing task text, prices or miner model choices.
+    """
+    contract = assignment.get("execution_contract")
+    if contract is None:
+        return False
+    _validate_execution_contract_shape(contract)
+    from .outcomes_support import validate_public_execution_packet
+
+    for name in ("base_commit", "result_commit"):
+        if not isinstance(assignment.get(name), str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", assignment[name]):
+            raise ValueError("public_assignment_commit_required")
+    for name in ("allowed_paths", "immutable_paths"):
+        paths = assignment.get(name)
+        if not isinstance(paths, list) or not paths or any(
+            not isinstance(path, str) or path.startswith(("/", "~")) or "\\" in path
+            or any(part in ("", ".", "..", ".git") for part in path.rstrip("/").split("/"))
+            for path in paths
+        ):
+            raise ValueError("public_assignment_scope_required")
+    packet = {name: contract[name] for name in _EXECUTION_CONTRACT_PACKET_FIELDS}
+    packet.update(
+        verification_command=assignment.get("verify_command"),
+        task_features={"languages": contract["execution_requirements"].get("languages")},
+        execution_policy={"repo_base_sha": assignment["base_commit"],
+                          "allowed_paths": assignment["allowed_paths"],
+                          "immutable_paths": assignment["immutable_paths"]},
+    )
+    if assignment.get("toolchain") is not None:
+        packet["toolchain"] = assignment["toolchain"]
+    validate_public_execution_packet(packet)
+    return True
 
 
 _TOOLCHAIN_REQ_RE = re.compile(
@@ -330,28 +421,70 @@ class ValidatorDaemon:
         failure); it is excluded from quorum (``outcomes_validators.resolve_quorum``)
         rather than counted against the miner.
         """
-        # The provisioned .venv is untracked, so the scope check (git diff --name-only base..result) is unaffected.
         try:
-            prefix = provision_toolchain(assignment.get("toolchain"), workdir)
-        except ToolchainUnavailable:
+            public_execution = validate_assignment_execution(assignment)
+            prefix = None if public_execution else provision_toolchain(assignment.get("toolchain"), workdir)
+        except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError):
             return "error"
         base_commit = str(assignment["base_commit"])
         result_commit = str(assignment["result_commit"])
         verify_command = str(assignment["verify_command"])
         allowed = list(assignment.get("allowed_paths") or [])
         immutable = list(assignment.get("immutable_paths") or [])
+        validation_run_id = uuid.uuid4().hex
+
+        def scope_valid():
+            diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
+            changed = [p for p in diff_out.splitlines() if p]
+            return not any(_path_covered_by_allowed(p, immutable) for p in changed) and (
+                not allowed or all(_path_covered_by_allowed(p, allowed) for p in changed))
+
+        if public_execution:
+            try:
+                if not scope_valid():
+                    return "reject"
+            except GitError:
+                return "error"
 
         try:
             _run_git(["checkout", base_commit], cwd=workdir)
         except GitError:
             return "error"
-        base_exit = _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix)
+        def verify(phase):
+            if evidence_root(verify_command) is None:
+                return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
+                                           raise_setup_errors=True)
+            return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
+                                       raise_setup_errors=True, evidence_identity={
+                "job_id": assignment.get("job_id"), "role": "validator",
+                "assignment_id": assignment.get("assignment_id"), "phase": phase,
+                "validation_run_id": validation_run_id,
+                "evidence_digest_sha256": assignment.get("evidence_digest_sha256"),
+            })
+
+        try:
+            base_exit = verify("base")
+        except (ValueError, OSError):
+            return "error"
+        if public_execution and base_exit != 86:
+            # The frozen preflight could not be reproduced. An already-green
+            # or broken base is no evidence of a miner's implementation quality.
+            return "error"
+        if evidence_root(verify_command) is not None and base_exit in (74, 127):
+            return "error"  # A capture/setup refusal is not an intended red base.
 
         try:
             _run_git(["checkout", result_commit], cwd=workdir)
         except GitError:
             return "error"
-        result_exit = _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix)
+        try:
+            result_exit = verify("result")
+        except (ValueError, OSError):
+            return "error"
+        if public_execution:
+            return {0: "accept", 86: "reject"}.get(result_exit, "error")
+        if evidence_root(verify_command) is not None and result_exit in (74, 127):
+            return "error"
 
         try:
             diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
@@ -380,31 +513,44 @@ class ValidatorDaemon:
         if not assignments:
             return False
         assignment = assignments[0]
+        decision = "error"
+        expected_digest = assignment.get("evidence_digest_sha256")
+        if not isinstance(expected_digest, str) or _SHA256_HEX_RE.fullmatch(expected_digest) is None:
+            # There is no valid assignment identity to acknowledge. Never sign
+            # an invented empty digest or access a repository for this row.
+            return True
         try:
-            workdir = self._clone(assignment)
-        except GitError:
-            # The validator could not obtain the repo — its own review failed,
-            # so this is an "error" decision (see _decide), never a crash.
-            decision = "error"
+            fields = canonical_evidence_fields(
+                job_id=str(assignment["job_id"]),
+                miner_id=str(assignment["miner_id"]),
+                base_commit=str(assignment["base_commit"]),
+                result_commit=str(assignment["result_commit"]),
+                repo_url=assignment.get("repo_url"),
+                verify_command=str(assignment["verify_command"]),
+                allowed_paths=list(assignment.get("allowed_paths") or []),
+                immutable_paths=list(assignment.get("immutable_paths") or []),
+                toolchain=(
+                    assignment.get("toolchain") if isinstance(assignment.get("toolchain"), dict) else None
+                ),
+                execution_contract=assignment.get("execution_contract"),
+                acceptance_contract=assignment.get("acceptance_contract"),
+            )
+            digest = evidence_digest_hex(fields)
+            if digest != expected_digest:
+                raise ValueError("assignment_evidence_mismatch")
+            validate_assignment_execution(assignment)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
         else:
-            decision = self._decide(assignment, workdir)
-
-        fields = canonical_evidence_fields(
-            job_id=str(assignment["job_id"]),
-            miner_id=str(assignment["miner_id"]),
-            base_commit=str(assignment["base_commit"]),
-            result_commit=str(assignment["result_commit"]),
-            repo_url=assignment.get("repo_url"),
-            verify_command=str(assignment["verify_command"]),
-            allowed_paths=list(assignment.get("allowed_paths") or []),
-            immutable_paths=list(assignment.get("immutable_paths") or []),
-            toolchain=assignment.get("toolchain") if isinstance(assignment.get("toolchain"), dict) else None,
-        )
-        digest = evidence_digest_hex(fields)
-        if digest != assignment.get("evidence_digest_sha256"):
-            # The assignment we reviewed doesn't match what the gateway signed
-            # over — never sign a decision on evidence we can't reproduce.
-            decision = "error"
-        signature_hex = self.sign_fn(digest)
+            try:
+                workdir = self._clone(assignment)
+            except GitError:
+                pass
+            else:
+                decision = self._decide(assignment, workdir)
+        # An error acknowledges the original assignment identity, including a
+        # malformed contract. It cannot enter the acceptance quorum, and avoids
+        # retrying a deterministic invalid assignment through an empty signature.
+        signature_hex = self.sign_fn(expected_digest)
         self.client.post_decision(assignment["assignment_id"], decision=decision, signature_hex=signature_hex)
         return True
