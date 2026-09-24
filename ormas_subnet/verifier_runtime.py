@@ -949,6 +949,34 @@ def _validate_config(cfg):
         raise RuntimeRefusal("invalid_dependency_locks")
 
 
+def _share_rootless_projection(root):
+    """Expose scratch owner read/execute to its mapped group, never to others.
+
+    The containing scratch directory remains 0700. Only explicit readonly bind
+    mounts enter containers; the original checkout and credentials are untouched.
+    """
+    uid, gid = os.getuid(), os.getgid()
+    for path in [root, *root.rglob('*')]:
+        item = path.lstat()
+        if (item.st_uid != uid
+                or not (stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode))):
+            raise RuntimeRefusal('rootless_projection_owner_mismatch')
+        mode = stat.S_IMODE(item.st_mode) & 0o700
+        if item.st_gid != gid:
+            os.chown(path, -1, gid, follow_symlinks=False)
+        path.chmod(mode | ((mode >> 3) & 0o050))
+
+
+def _check_rootless_map(raw, host_id):
+    try:
+        rows = [tuple(map(int, line.split())) for line in raw.decode('ascii').splitlines()]
+    except (ValueError, UnicodeError):
+        raise RuntimeRefusal('rootless_identity_map_mismatch') from None
+    if (not rows or any(len(row) != 3 for row in rows)
+            or rows[0] != (0, host_id, 1)):
+        raise RuntimeRefusal('rootless_identity_map_mismatch')
+
+
 def run_verifier(cfg, *, cwd=None):
     _validate_config(cfg)
     source = Path(cwd or os.getcwd()).resolve()
@@ -1004,9 +1032,19 @@ def run_verifier(cfg, *, cwd=None):
         report_path = '/tmp/' + uuid.uuid4().hex + '.xml'
         test_argv, report_kind = structured_test_argv(cfg, driver, report_path)
         fetch_dependencies(cfg, candidate, artifacts, deadline)
-        code, info = command(["docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"], required=False)
-        if code or info.strip() not in (b"linux/x86_64", b"linux/amd64"):
+        code, info = command(["docker", "info", "--format", "{{json .}}"], required=False)
+        try:
+            runtime_info = json.loads(info)
+        except (ValueError, UnicodeError):
+            raise RuntimeRefusal("runtime_platform_unavailable") from None
+        if (code or not isinstance(runtime_info, dict) or runtime_info.get('OSType') != 'linux'
+                or runtime_info.get('Architecture') not in ('x86_64', 'amd64')):
             raise RuntimeRefusal("runtime_platform_unavailable")
+        rootless = bool({'rootless', 'name=rootless'}.intersection(runtime_info.get('SecurityOptions') or []))
+        # Guest group 0 maps to the checker's ordinary host group in rootless
+        # Docker. Only projection readers need it. Candidate processes retain
+        # their nonzero UID and original group, distinct from the keeper/probe.
+        reader_gid = 0 if rootless else gid
         code, _ = command(["docker", "image", "inspect", cfg["image"]], required=False)
         if code:
             command(["docker", "pull", "--platform", cfg["platform"], cfg["image"]])
@@ -1062,11 +1100,24 @@ def run_verifier(cfg, *, cwd=None):
                                                 '--label', f'ormas.parentpid={os.getpid()}',
                                                 '--label', f'ormas.expires={int(time.time()) + cfg["limits"]["timeout_s"] + 10}',
                                                 cfg['image'], str(cfg['limits']['timeout_s'] + 10)])
-            command(options + ['--name', installer, '--network', 'none', '--user', f'{uid}:{gid}', '--mount',
+            if rootless and name == candidate_container:
+                # Prove the selected daemon's actual namespace mapping before
+                # granting group access or running anything from the checkout.
+                for kind, host_id in (('uid', uid), ('gid', gid)):
+                    _, mapping = command(['docker', 'exec', '--user', f'{uid}:{gid}', name,
+                                          '/bin/cat', f'/proc/self/{kind}_map'], limit=4096)
+                    _check_rootless_map(mapping, host_id)
+                for projection_root in (candidate, driver, artifacts, helpers):
+                    _share_rootless_projection(projection_root)
+                os.chown(bridge_root, -1, gid)
+                os.chown(bridge_root / 'socket', -1, gid)
+                bridge_root.chmod(0o710)
+                (bridge_root / 'socket').chmod(0o660)
+            command(options + ['--name', installer, '--network', 'none', '--user', f'{uid}:{reader_gid}', '--mount',
                                f'type=bind,source={projection},target=/source,readonly', cfg['image'],
                                'cp', '-a', '/source/.', '/work/'])
             if cfg['install_argv']:
-                command(options + ['--name', installer, '--network', 'none', '--user', f'{uid}:{gid}', '--mount',
+                command(options + ['--name', installer, '--network', 'none', '--user', f'{uid}:{reader_gid}', '--mount',
                                    f'type=bind,source={artifacts},target=/artifacts,readonly', cfg['image'],
                                    '/usr/bin/timeout', '--signal=KILL', str(max(1, int(deadline - time.monotonic())))]
                         + cfg['install_argv'])
@@ -1115,7 +1166,7 @@ def run_verifier(cfg, *, cwd=None):
                         raise
                     time.sleep(.1)
             bridge.http_execute = http_observe
-        code, output = command(["docker", "exec", '--user', f'{uid}:{gid}', verifier] + test_argv, required=False)
+        code, output = command(["docker", "exec", '--user', f'{uid}:{reader_gid}', verifier] + test_argv, required=False)
         # Drain any observation already accepted by the host before deciding.
         # A late transport/refusal result must not be hidden by a test report.
         bridge.close()
