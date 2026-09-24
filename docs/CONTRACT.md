@@ -1,5 +1,10 @@
 # The miner contract
 
+The current public-code release candidate is defined in
+[PUBLIC_TASKS.md](PUBLIC_TASKS.md); its frozen support profiles and acceptance
+policy take precedence over the earlier private-repository path described below.
+The September 24 reward policy is in [economics.md](economics.md), awaiting activation.
+
 One page, in order of authority:
 
 - [`docs/DECISIONS.md`](DECISIONS.md) — the owner-locked decision that defines a miner. Normative; it wins any disagreement.
@@ -83,7 +88,15 @@ Only on **accepted delivery**. A rejected, failed, or out-of-scope delivery pays
 ## How you are scored
 
 - **History.** Accept/reject decisions accrue to your miner identity — today a tenant-scoped token; planned, a registered identity mapped to a chain hotkey at registration. Validator decisions write that history today (`outcomes_acceptance_history`), including overclaims (reporting `verified` and being rejected). **Planned:** that history weighs in selection, alongside your honestly reported cost and latency.
-- **Chain weights.** Accepted delivery is the gate — no accepted deliveries, no weight. Weight is linear in settled value, under a per-hotkey cap. A miner with no chain identity mapping earns nothing however good its work.
+- **Chain weights — approved policy, awaiting activation.** Fully funded accepted
+  delivery can earn a 1× accepted-bid target in gross miner alpha at a frozen
+  reference price. Observed miner emissions reduce the target; unused miner
+  allocation is burned. Known same-controller work is excluded, including company
+  jobs served by `miner:ormas-operator-1` and `miner:nc-arm64`. Genuine outside-client work
+  served by either remains eligible, as does company work served by independent
+  miners. No mapped chain identity means no weight. Customer USD is retained by
+  Heron Cove; the target is not a USD payout or realization guarantee. See
+  [economics.md](economics.md) for the complete terms and rollout limits.
 
 Two honesty rules protect your score: report `None` for usage you do not know — never a fabricated zero — and never self-declare `verified`; the skeleton has no field for it.
 

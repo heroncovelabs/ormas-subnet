@@ -1,6 +1,7 @@
 # Design decisions this repository implements
 
-Recorded by the subnet owner (Heron Cove LLC) on 2026-09-10. Everything in this repository
+Recorded by the subnet owner (Heron Cove LLC) on 2026-09-10; reward policy updated
+2026-09-24. Everything in this repository
 follows these; where any document here disagrees with this page, this page wins.
 
 1. **A miner delivers whole outcomes, never inference.** A miner clones the client's repository
@@ -8,7 +9,8 @@ follows these; where any document here disagrees with this page, this page wins.
    result branch, and reports evidence. It is never an inference endpoint, model supplier, or
    token vendor. Nobody is paid for tokens, completions, or uptime.
 2. **Firm bids; paid only on accepted delivery.** A miner posts a firm ask for the whole task.
-   It is paid that ask when the delivery is accepted, and nothing when it is not.
+   Accepted, fully funded delivery can earn a 1× bid target in gross miner alpha
+   under rule 8. The USD-denominated bid is not a USD payout guarantee.
 3. **Everything that makes a miner good is the miner's business.** Model routing, hardware,
    energy, harness, caching, orchestration loop — none of it is specified by the network. The
    network rewards accepted outcomes at the best price, latency, and quality.
@@ -29,8 +31,14 @@ follows these; where any document here disagrees with this page, this page wins.
    agent process, in an ephemeral sandbox with default-deny egress and no data retention. The
    client opts a project in to third-party miners and validators. Ormas never receives source,
    diffs, prompts, or credentials.
-8. **Chain weights.** Accepted delivery is a gate; weight is linear in settled value under a
-   per-hotkey cap; a miner with no chain identity mapping earns nothing.
+8. **Chain weights — approved policy, not activated.** Exactly funded accepted bids
+   create a 1× gross miner-alpha target at a frozen reference price. Finalized miner
+   emissions reduce the outstanding target; unused miner allocation is explicitly
+   burned. No incentive bonus, reserve fund or treasury top-up. Known same-controller
+   work is excluded: company jobs served by `miner:ormas-operator-1` or `miner:nc-arm64` earn
+   zero; genuine outside-client work served by either remains eligible, as does
+   company work served by independent miners. Missing verified chain mapping earns
+   nothing. See [economics.md](economics.md) for accounting and rollout limits.
 
 ## Not yet decided
 
