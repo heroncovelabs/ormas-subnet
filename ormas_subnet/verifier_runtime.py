@@ -1052,7 +1052,11 @@ def run_verifier(cfg, *, cwd=None):
         # still in use, so concurrent current executions cannot lose their data.
         _, old_volumes = command(["docker", "volume", "ls", "-q", "--filter", "label=ormas.verifier=v1"])
         for old_volume in old_volumes.decode().splitlines():
-            _, metadata = command(["docker", "volume", "inspect", old_volume])
+            code, metadata = command(["docker", "volume", "inspect", old_volume], required=False)
+            # Another verifier can remove its finished volume after the list.
+            # Reaping is opportunistic; never delete an uninspected volume.
+            if code:
+                continue
             expiry = json.loads(metadata)[0].get("Labels", {}).get("ormas.expires", "")
             if expiry.isdigit() and int(expiry) < int(time.time()):
                 command(["docker", "volume", "rm", old_volume], required=False)
