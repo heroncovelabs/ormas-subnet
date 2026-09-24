@@ -13,15 +13,6 @@ restart recovery. These changes are not a production deployment. Deployment and
 credential descriptions below describe the earlier route; they do not establish
 the current live miner or validator set.
 
-> **Disclosure.** Heron Cove LLC runs a miner and a validator on SN76 and operates the gateway that
-> settles work. Until validators gate settlement on the production gateway, acceptance is not
-> independent of us; we say so wherever a number appears (`/v1/public/providers` labels our miner
-> `operator-run`). Nothing in this repository is an offer of emissions, a payout schedule, or a
-> return; the compensation model below is **planned — not yet live** until marked otherwise.
-
-Working on this repo with a coding agent? Start at [`AGENTS.md`](AGENTS.md) (repository map,
-authoritative specs, commands, boundaries). Found a vulnerability? [`SECURITY.md`](SECURITY.md).
-
 This package is normative under
 [`docs/DECISIONS.md`](docs/DECISIONS.md)
 (owner-locked 2026-09-10): **the runner is the miner.** A miner posts a firm bid
@@ -39,13 +30,10 @@ or SN76.
 - A **thin HTTP client** (`ormas_subnet/client.py`, `OrmasMinerClient`) for those
   routes.
 - A **reference miner skeleton** (`ormas_subnet/skeleton.py`, `MinerSkeleton`) —
-  register → poll for a lease → clone the client's repository fresh with the
-  job's `repo_credential` from the draft and check out the base commit →
+  register → bind a repo → poll for a lease → clone/checkout the base commit →
   call your `solve(draft, workdir) -> SolveResult` → **actually run
-  `draft.verify_command`** (bounded, credential-free env, no shell) → push
-  the result branch with the same credential → complete. No `bind` step is
-  needed; binding a repository you already hold is the fallback
-  (`docs/INSTALL.md`). `solve` is the one pluggable step; completion
+  `draft.verify_command`** (bounded, credential-free env, no shell) → publish
+  the result branch → complete. `solve` is the one pluggable step; completion
   itself is honest, not self-declared: the receipt is built only from usage
   `solve` reports (an unknown value is never fabricated as zero), `scope_ok`
   is computed from a real `git diff` against `allowed_paths` (never asserted),
@@ -68,20 +56,14 @@ or SN76.
   a task well lives here.
 - **Not an inference endpoint.** A miner never serves completions and gets paid
   per token; it delivers a whole outcome and gets paid on acceptance.
-- **Not yet settled by validators on the production gateway.** Today the
-  production gateway derives settlement from the miner's own reported
-  `verification_state` plus a scope/commit check — acceptable only because our
-  own miner is trusted. The **reference validator** — which clones the job's
-  repo, independently re-runs the verify command on base and result, checks
-  scope from `git diff`, signs, and posts accept/reject — ships here
-  (`ormas_subnet/validator.py`, `neurons/validator.py`). The gateway settles a
-  third-party miner's delivery only on unanimous validator acceptance and
-  refuses its claim until a validator count is configured; our own trusted
-  miner still settles by its own verify run. In production one validator is
-  configured (operated by Heron Cove) and every third-party delivery is gated
-  on it; the validator provisions the packet's declared `toolchain` before it
-  re-runs the tests (see `docs/protocol.md`). See "Known gaps" below and the
-  decision doc §8.
+- **Validator acceptance is separate from a miner finishing.** The reference
+  validator clones the repo, reproduces the base failure, checks scope and tests
+  the exact result, then signs accept/reject. It ships as the installed
+  `ormas-validator` command. The public path waits for the frozen validator
+  policy, including operator-miner work. V1 requires separate owners; the explicit
+  v2 alpha permits our validator to check our miner and discloses operator control.
+  See [supported public tasks](docs/PUBLIC_TASKS.md) for protocol, qualification
+  and rollout limits. Installing this SDK does not establish live qualification.
 
 ## Plugging in your own `solve`
 
@@ -109,35 +91,14 @@ def solve(draft: TaskDraft, workdir: Path) -> SolveResult:
 
 client = OrmasMinerClient(base_url="https://api.ormas.ai", token=my_token)
 config = MinerConfig(
-    runner_id="",  # empty on first run; the gateway assigns runr_<12hex>
-    runner_version="0.1.0", platform="linux",
-    capacity=1, cells=("task:code",), workdir_root=Path.home() / ".ormas" / "work",
-    # Required fields, but only the fallback clone source: when the draft
-    # carries repo_credential + repo_url the skeleton clones and pushes there.
+    runner_id="my-miner-01", runner_version="0.1.0", platform="linux",
+    capacity=1, cells=("outcomes-grok-46-native",), workdir_root=Path.home() / ".ormas" / "work",
     repo_id="my-repo", repo_url="https://github.com/acme/target.git",
 )
 skeleton = MinerSkeleton(client, config, solve)
 skeleton.register()
-skeleton.run_forever()
-```
-
-Each claimed `TaskDraft` names the client's repository (`repo_url`) and carries a
-deploy key for it (`repo_credential`, kind `ssh_deploy_key`). The skeleton writes
-the key to a `0600` file only for the duration of each `git clone` / `git push`
-and removes it after (`skeleton._credential_git_env`); it is never logged or
-persisted. Validators clone with their own read-scoped `repo_credential` to
-re-run the tests (`ormas_subnet/validator.py`). Details and what you receive per
-job: [`docs/INSTALL.md`](docs/INSTALL.md). First-run questions: [`docs/FAQ.md`](docs/FAQ.md).
-
-### Fallback: bind a repository you already hold
-
-If the operator onboarded your miner against a specific project and you already
-have a clone URL your host can push to, bind it once between `register()` and
-`run_forever()`. Drafts for a bound repository arrive without `repo_credential`,
-and the skeleton clones `config.repo_url` and pushes to `config.push_remote`.
-
-```python
 skeleton.bind(project_id="proj_abc123", base_commit="<sha>")
+skeleton.run_forever()
 ```
 
 ## Completion is honest, not self-declared
@@ -162,38 +123,6 @@ run at all. All three are now real:
 See `docs/protocol.md` § "What this package's reference skeleton actually
 does at completion" for the exact rules.
 
-## How miners are paid (planned — not yet live)
-
-Ormas (Heron Cove LLC) sells verified coding Outcomes to customers in USD and is responsible for
-delivery. Miners are Ormas's suppliers: they bid a USD price per Outcome (`ask_usd`), and when their
-work is accepted that USD bid becomes their **emission target**. Independent validators convert
-targets into SN76 emission weights every epoch using the on-chain alpha price and a published
-TAO/USD reference, so **miners are paid in alpha by the chain**. Any USD not covered by an epoch's
-emissions **carries forward** as a visible balance; persistent balances are **topped up in alpha from
-Ormas's treasury** on a daily netting schedule, after a KYC/W-9/W-8 gate. Every balance and payment
-is **recomputable from public per-epoch artifacts**. Ormas never converts a customer's dollars for a
-miner, never holds alpha for anyone, and never pays miners in dollars by default. Bids are USD
-*targets*; what an epoch actually pays varies with the alpha price. Detail and the open parameters:
-[`docs/economics.md`](docs/economics.md); the obligations: [`MINER_TERMS.md`](MINER_TERMS.md) (draft).
-
-### How this compares to other subnets
-
-From the operators' own documentation, read 2026-09-12/13. Check the sources; these summaries are ours.
-
-| | SN4 Targon (Manifold) | SN28 sayGM (T34) | SN51 Lium (Datura) | SN76 Ormas |
-|---|---|---|---|---|
-| What is priced in USD | per-card-hour targets and caps | traffic value served (discount off retail) | rental fees | the accepted Outcome bid |
-| Who converts USD → weight | validators, at a TAO price | validators, from public epoch artifacts | — (emissions separate from pay) | validators, at pool price × published TAO/USD reference |
-| Miner paid in | emissions only | emissions only | 95% of USD fees in alpha from Lium's treasury, daily, T+2, plus emissions | emissions; shortfall carried forward, then topped up in alpha from treasury |
-| Unallocated emission | burned | — | — | weight to owner UID (burn/recycle per hyperparameter) |
-| Public per-epoch ledger | no | yes (every earning recomputable) | no | yes (sayGM standard) |
-| Seller of record to the customer | Manifold | T34 | Lium (pass-through shape) | Heron Cove LLC |
-
-Sources: `docs.targon.com/providers/miner/` (mirrored in `manifold-inc/targon`), sayGM's public
-miner ledger and docs, Lium's provider docs. We copy Targon's USD-target conversion and sayGM's
-public ledger; the on-chain carry-forward and the US seller standing behind the target are ours.
-No peer we found combines all five columns.
-
 ## Known gaps (as of 2026-09-12, documented rather than papered over)
 
 - **Firm asks are live.** The gateway's claim body accepts an optional
@@ -206,14 +135,12 @@ No peer we found combines all five columns.
   validated locally to the server's rule); the default `None` keeps sending only
   `schema_version` + `runner_id` and the gateway derives the ask (flat
   per-project fee, or estimated cost plus margin).
-- **One operator-run validator in production.** The reference validator
-  (this repo) and validator-quorum settlement (gateway, card `25ff6188`) are
-  live: `api.ormas.ai` is configured for one validator, run by the operator,
-  and third-party deliveries settle only on its signed acceptance (first such
-  deliveries settled 2026-09-14; the first non-operator miner connected
-  2026-09-15). Independent validators are not yet admitted, so a production
-  receipt today reflects one operator-run review, not a multi-party quorum.
-  Ed25519 is the dev-subnet signature scheme; sr25519 is the SN76 target.
+- **Unified validator installation is still release work.** This package ships
+  task checking. The combined checker/chain service kit and live public-profile
+  qualification must be proved separately. Task decisions use Ed25519; the chain
+  wallet is a separate identity and is never passed into the task checker. The
+  existing weight service relays a gateway-computed vector; packaging it with
+  checking does not create independent reward calculation.
 
 ## Other gateways
 

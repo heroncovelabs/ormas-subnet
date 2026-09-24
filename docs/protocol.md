@@ -203,7 +203,27 @@ public publication path. It has the exact keys `schema_version`, `policy`, `mine
 
 Registration and heartbeat do not grant qualification. Claims require current
 credential-bound qualification for the exact profile/catalog, matching task cells
-and available independent checker capacity. This includes operator-miner claims.
+and available checker capacity under the frozen policy. This includes operator-miner claims.
+
+The explicit operator-run alpha uses `ormas.public-acceptance-contract.v2` with
+the same outer keys and `ormas.public-acceptance-policy.v2`. Its policy adds exactly
+`verification_mode: "operator-run"` and a nonblank `validator_operator_id` to the
+v1 policy fields, sets `protocol` to the v2 contract schema, and requires exactly
+one validator. The validator must belong to that frozen operator; the miner may
+belong to the same or another qualified operator. V1 contracts cannot contain this
+exception or these extra keys. The complete v2 contract is signed with the rest
+of the assignment evidence.
+
+V2 requires explicit `task:acceptance/operator-run-v2` miner opt-in and separately
+approved v2 qualifications. The gateway checks the capability before any bid,
+at atomic claim and when resuming a lease. Alpha configuration is explicit:
+`OUTCOMES_PUBLIC_ACCEPTANCE_POLICY=operator-run-v2` and
+`OUTCOMES_PUBLIC_VALIDATOR_OPERATOR_ID=<qualified operator id>`. The default is
+`independent-v1`; blank/unknown modes or an incomplete owner/quorum configuration
+refuse admission. Existing queued and running jobs retain their original policy.
+The client job response exposes that frozen policy. This is policy-class consent
+on the current standing-ask route; exact per-job pre-bid negotiation is not yet
+provided by this opt-in (see [public task limits](PUBLIC_TASKS.md)).
 
 Validator assignments carry an `execution_contract` with exactly `schema_version`,
 `work_packet_sha256`, `execution_environment`, `execution_requirements`,
@@ -217,7 +237,7 @@ private text, prices or miner model choices.
 Public validators require base exit 86, then classify the result's completed
 assertions as accept/reject. Runtime setup and timeout are neutral. A public
 completion cannot reduce its frozen checker count or substitute the miner's own
-verification for the independent decisions. Pending or missing decisions retain
+verification for the validator's decisions. Pending or missing decisions retain
 the agreed count and deadline.
 
 ### Public artifact publication

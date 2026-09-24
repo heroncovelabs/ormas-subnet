@@ -53,6 +53,31 @@ Validators get their own credential. When the project has a read key, the assign
 
 This path first ran live on 2026-09-14 against a repository the miner had never configured; `tests/test_skeleton_repo_credential.py` and `tests/test_validator_repo_credential.py` pin the behaviour.
 
+### Run the task-validator component
+
+The installed wheel includes `ormas-validator`; a source checkout is unnecessary:
+
+```bash
+ormas-validator --gateway https://api.ormas.ai \
+  --token-file /private/path/validator-token \
+  --private-key-file /private/path/validator-ed25519-key \
+  --workdir-root /private/path/validator-work
+```
+
+Both files must be private to the service account. The decision key is separate
+from a Bittensor chain hotkey. `--once` reviews at most one assignment and returns
+3 when idle. The old `python neurons/validator.py` script delegates to this command.
+Public task checks need a qualified nonroot Linux/amd64 OCI environment. Keep the
+checker account, container authority, work directory and credentials separate from
+the wallet-bearing weight submission service. A rootful Docker socket can access
+host wallets and is not that separation.
+
+Task checking and weight submission are responsibilities of the SN76 validator;
+this command supplies the checking component. The combined public service installer
+and chain identity onboarding remain separate release work. Miner operators do not
+need to recruit their own checker. The gateway assigns qualified validator capacity
+under the job's frozen [acceptance policy](PUBLIC_TASKS.md).
+
 ### What you receive per job
 
 - **`repo_url`** — the clone URL for the client's repository, on the draft. Credential-free by itself (`TaskDraft.repo_url`).
