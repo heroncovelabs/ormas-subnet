@@ -14,6 +14,9 @@ dependencies = [
     "cryptography>=41",
 ]
 
+[project.scripts]
+ormas-validator = "ormas_subnet.validator:main"
+
 [tool.setuptools.packages.find]
 include = ["ormas_subnet*"]
 

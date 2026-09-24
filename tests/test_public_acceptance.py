@@ -123,6 +123,53 @@ def test_policy_and_contract_validation_return_independent_snapshots() -> None:
     assert private_contract["validators"][0]["subject_id"] == "val_1"
 
 
+def _operator_run_contract() -> dict:
+    contract = _contract()
+    contract["schema_version"] = "ormas.public-acceptance-contract.v2"
+    contract["policy"].update(
+        schema_version="ormas.public-acceptance-policy.v2",
+        protocol=contract["schema_version"],
+        verification_mode="operator-run",
+        validator_operator_id="operator:ormas",
+        required_validators=1,
+    )
+    contract["miner"]["operator_id"] = "operator:ormas"
+    contract["validators"] = contract["validators"][:1]
+    contract["validators"][0]["operator_id"] = "operator:ormas"
+    return contract
+
+
+def test_operator_run_alpha_round_trips_and_binds_signed_owner_policy() -> None:
+    contract = _operator_run_contract()
+    assert public_acceptance.validate_acceptance_contract(contract) == contract
+    wire = public_protocol.TaskDraft(**_draft_kwargs(), acceptance_contract=contract).to_wire()
+    assert public_protocol.TaskDraft.from_wire(wire).acceptance_contract == contract
+    before = evidence_digest_hex(_evidence(contract))
+    other = copy.deepcopy(contract)
+    other["policy"]["validator_operator_id"] = "operator:other"
+    other["validators"][0]["operator_id"] = "operator:other"
+    assert evidence_digest_hex(_evidence(other)) != before
+    assert public_acceptance.acceptance_task_cell(contract["policy"]) == "task:acceptance/operator-run-v2"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda value: value["policy"].pop("verification_mode"),
+    lambda value: value["policy"].pop("validator_operator_id"),
+    lambda value: value["policy"].update(validator_operator_id=" "),
+    lambda value: value["policy"].update(verification_mode="independent"),
+    lambda value: value["policy"].update(required_validators=2),
+    lambda value: value["policy"].update(extra=True),
+    lambda value: value["validators"][0].update(operator_id="operator:unapproved"),
+    lambda value: value.update(schema_version="ormas.public-acceptance-contract.v1"),
+    lambda value: value["policy"].update(protocol="ormas.public-acceptance-contract.v1"),
+])
+def test_operator_run_alpha_refuses_missing_or_changed_terms(mutate) -> None:
+    contract = _operator_run_contract()
+    mutate(contract)
+    with pytest.raises(ValueError):
+        public_acceptance.validate_acceptance_contract(contract)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

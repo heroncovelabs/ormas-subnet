@@ -8,6 +8,8 @@ from typing import Any
 
 ACCEPTANCE_CONTRACT_SCHEMA = "ormas.public-acceptance-contract.v1"
 ACCEPTANCE_POLICY_SCHEMA = "ormas.public-acceptance-policy.v1"
+OPERATOR_RUN_CONTRACT_SCHEMA = "ormas.public-acceptance-contract.v2"
+OPERATOR_RUN_POLICY_SCHEMA = "ormas.public-acceptance-policy.v2"
 
 _CATALOG_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ED25519_PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -52,15 +54,24 @@ def _require_positive_int(value: Any, name: str) -> int:
 
 def validate_acceptance_policy(value: Any) -> dict[str, Any]:
     """Validate and independently snapshot the server-owned public policy."""
-    policy = _require_exact_dict(value, _POLICY_KEYS, "acceptance policy")
-    if policy["schema_version"] != ACCEPTANCE_POLICY_SCHEMA:
+    operator_run = isinstance(value, dict) and value.get("schema_version") == OPERATOR_RUN_POLICY_SCHEMA
+    keys = _POLICY_KEYS | {"verification_mode", "validator_operator_id"} if operator_run else _POLICY_KEYS
+    policy = _require_exact_dict(value, keys, "acceptance policy")
+    if policy["schema_version"] not in (ACCEPTANCE_POLICY_SCHEMA, OPERATOR_RUN_POLICY_SCHEMA):
         raise ValueError("acceptance policy schema_version mismatch")
     _require_positive_int(policy["required_validators"], "required_validators")
+    if operator_run and (
+        policy["verification_mode"] != "operator-run" or policy["required_validators"] != 1
+    ):
+        raise ValueError("operator-run alpha requires one validator and an explicit verification_mode")
+    if operator_run:
+        _require_nonblank(policy["validator_operator_id"], "validator_operator_id")
     digest = policy["catalog_digest"]
     if not isinstance(digest, str) or _CATALOG_DIGEST_RE.fullmatch(digest) is None:
         raise ValueError("catalog_digest must be sha256: plus 64 lowercase hex chars")
     _require_nonblank(policy["profile_id"], "profile_id")
-    if policy["protocol"] != ACCEPTANCE_CONTRACT_SCHEMA:
+    protocol = OPERATOR_RUN_CONTRACT_SCHEMA if operator_run else ACCEPTANCE_CONTRACT_SCHEMA
+    if policy["protocol"] != protocol:
         raise ValueError("acceptance policy protocol mismatch")
     _require_positive_int(policy["liveness_s"], "liveness_s")
     _require_positive_int(policy["timeout_s"], "timeout_s")
@@ -88,9 +99,11 @@ def _validate_subject(value: Any, *, miner: bool) -> dict[str, Any]:
 def validate_acceptance_contract(value: Any) -> dict[str, Any]:
     """Validate and independently snapshot a frozen public claim plan."""
     contract = _require_exact_dict(value, _CONTRACT_KEYS, "acceptance contract")
-    if contract["schema_version"] != ACCEPTANCE_CONTRACT_SCHEMA:
+    if contract["schema_version"] not in (ACCEPTANCE_CONTRACT_SCHEMA, OPERATOR_RUN_CONTRACT_SCHEMA):
         raise ValueError("acceptance contract schema_version mismatch")
     policy = validate_acceptance_policy(contract["policy"])
+    if contract["schema_version"] != policy["protocol"]:
+        raise ValueError("acceptance contract and policy protocol mismatch")
     miner = _validate_subject(contract["miner"], miner=True)
     validators = contract["validators"]
     if not isinstance(validators, list):
@@ -98,19 +111,36 @@ def validate_acceptance_contract(value: Any) -> dict[str, Any]:
     if len(validators) != policy["required_validators"]:
         raise ValueError("validators length must equal required_validators")
     checked = [_validate_subject(item, miner=False) for item in validators]
+    if policy["protocol"] == OPERATOR_RUN_CONTRACT_SCHEMA and any(
+        item["operator_id"] != policy["validator_operator_id"] for item in checked
+    ):
+        raise ValueError("operator-run validator must belong to the frozen validator operator")
     for field in ("subject_id", "credential_id", "operator_id"):
         values = [item[field] for item in checked]
         if len(set(values)) != len(values):
             raise ValueError(f"validator {field}s must be distinct")
-    if any(item["operator_id"] == miner["operator_id"] for item in checked):
+    if policy["protocol"] == ACCEPTANCE_CONTRACT_SCHEMA and any(
+        item["operator_id"] == miner["operator_id"] for item in checked
+    ):
         raise ValueError("validator operators must differ from the miner operator")
     _require_nonblank(contract["claim_nonce"], "claim_nonce")
     return copy.deepcopy(contract)
 
 
+def acceptance_task_cell(value: Any) -> str:
+    """The miner explicitly advertises the acceptance terms its firm offers cover."""
+    policy = validate_acceptance_policy(value)
+    if policy["protocol"] == OPERATOR_RUN_CONTRACT_SCHEMA:
+        return "task:acceptance/operator-run-v2"
+    return "task:acceptance/independent-v1"
+
+
 __all__ = [
     "ACCEPTANCE_CONTRACT_SCHEMA",
     "ACCEPTANCE_POLICY_SCHEMA",
+    "OPERATOR_RUN_CONTRACT_SCHEMA",
+    "OPERATOR_RUN_POLICY_SCHEMA",
+    "acceptance_task_cell",
     "validate_acceptance_contract",
     "validate_acceptance_policy",
 ]

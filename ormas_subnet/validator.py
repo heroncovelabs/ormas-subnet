@@ -554,3 +554,71 @@ class ValidatorDaemon:
         signature_hex = self.sign_fn(expected_digest)
         self.client.post_decision(assignment["assignment_id"], decision=decision, signature_hex=signature_hex)
         return True
+
+
+def _load_cli_secret(*, token_env: str | None, token_path: str | None) -> str:
+    """Read a service credential without following links or exposing its bytes."""
+    import os
+    import stat
+
+    from .client import load_token
+
+    if token_path is None:
+        return load_token(token_env=token_env)
+    error = "validator credential must be a private regular file owned by the service user"
+    if not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError(error)
+    try:
+        fd = os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) not in (0o400, 0o600) or info.st_size > 8192):
+                raise ValueError(error)
+            value = os.read(fd, 8193).decode("utf-8").strip()
+            if not value or len(value) > 8192:
+                raise ValueError(error)
+            return value
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeError):
+        raise ValueError(error) from None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the installed task-checker component of the SN76 validator."""
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Ormas SN76 task validator")
+    parser.add_argument("--gateway", required=True, help="Gateway base URL")
+    token_args = parser.add_mutually_exclusive_group(required=True)
+    token_args.add_argument("--token-env", help="Env var holding the validator bearer token")
+    token_args.add_argument("--token-file", help="Private file holding the validator bearer token")
+    key_args = parser.add_mutually_exclusive_group(required=True)
+    key_args.add_argument("--private-key-env", help="Env var holding the hex Ed25519 decision key")
+    key_args.add_argument("--private-key-file", help="Private file holding the hex Ed25519 decision key")
+    parser.add_argument("--workdir-root", default=str(Path.cwd() / "ormas-validator-work"))
+    parser.add_argument("--once", action="store_true", help="Review one assignment, exit 3 if idle")
+    parser.add_argument("--poll-interval-s", type=float, default=15.0)
+    args = parser.parse_args(argv)
+    if not 0 < args.poll_interval_s < float("inf"):
+        parser.error("--poll-interval-s must be finite and positive")
+    token = _load_cli_secret(token_env=args.token_env, token_path=args.token_file)
+    private_key = _load_cli_secret(token_env=args.private_key_env, token_path=args.private_key_file)
+    sign_fn, pubkey = make_ed25519_signer(private_key)
+    client = OrmasValidatorClient(base_url=args.gateway, token=token)
+    try:
+        daemon = ValidatorDaemon(client, ValidatorConfig(workdir_root=Path(args.workdir_root)), sign_fn)
+        daemon.register(pubkey_hex=pubkey)
+        if args.once:
+            return 0 if daemon.run_once() else 3
+        while True:
+            if not daemon.run_once():
+                time.sleep(args.poll_interval_s)
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -83,7 +83,7 @@ timeouts are neutral setup failures. They cannot establish fail-on-base or count
 miner overclaim. A completed assertion failure is different: the environment ran
 the agreed check and the candidate did not satisfy it.
 
-## Miner selection and independent acceptance
+## Miner selection and validator acceptance
 
 The prepared task exposes its environment, interface, limits, languages, scope,
 publication protocol and acceptance policy before a claim. Miners choose which
@@ -108,12 +108,22 @@ independently qualified checkers with available capacity. Current qualifications
 allow one assignment per actor. Onboarding remains by invitation during this pilot.
 The miner's per-job model choice and routing remain its own implementation.
 
-The gateway freezes the checker count and identities at claim time. Checker
-operators must differ from the miner operator and from one another. Each checker
-validates the contract, reproduces base failure, checks candidate scope, reruns the
-frozen verifier and signs its decision. Public operator-miner work has the same
-independent-acceptance requirement. Losing a checker cannot silently reduce the
-required count; the existing deadline and neutral-failure rules apply.
+The gateway freezes the policy at admission and checker identities at claim.
+V1 requires checker operators to differ from the miner and one another. V2 is an
+explicit **operator-run alpha**: one qualified validator belonging to the operator
+named in the policy reruns the tests and signs the result. That operator may also
+own the miner. This does not establish independent ownership or control. Each
+validator reproduces base failure, checks candidate scope and reruns the frozen
+verifier. Losing it cannot reduce the required count; deadline and no-charge rules
+still apply.
+
+V2 needs separately approved protocol qualifications. A miner must explicitly add
+`task:acceptance/operator-run-v2` to its cells (`--cell` on the reference miner,
+`--task-cell` on the operator miner). The SDK does not opt miners into these terms
+automatically. The current standing-ask route conveys policy-class consent; the
+full per-job owner and timeout arrive in the draft. The controlled operator pilot
+can use its known terms. General third-party bidding still needs pre-bid disclosure
+of the exact policy before claiming that all terms were individually quoted.
 
 ## Repository access, publication and recovery
 
@@ -131,7 +141,8 @@ An interruption before the artifact was saved reports an unknown outcome; it doe
 not fabricate a zero-cost receipt. See [restart recovery](INSTALL.md#restart-and-completion-recovery).
 
 The client can reconnect using its job identifier and reuse the saved project for
-the next task. Completion remains pending until the frozen independent acceptance
+the next task. Its job response shows `acceptance_policy`, including the alpha mode
+and validator operator. Completion remains pending until the frozen acceptance
 policy is satisfied. The gateway is the receipt and settlement authority.
 
 New languages, interfaces and environments expand through versioned qualifications.
