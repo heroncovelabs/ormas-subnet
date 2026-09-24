@@ -47,8 +47,10 @@ Your token carries a daily claim cap (10 at onboarding; raised on request). Leas
 come from the register response and are authoritative.
 
 **Is there a chain emission?**
-Not yet. Payment today is the accepted ask in USD credit. The alpha model in `docs/economics.md` is planned,
-not live; `CONTRACT.md` marks every planned item.
+Yes, SN76 already emits alpha. The approved 1× accepted-bid target and surplus-burn
+policy is an implementation candidate awaiting activation. Customer USD stays with
+Heron Cove; miners receive protocol alpha, not USD credit payouts. See
+[economics.md](economics.md) for funding, self-dealing exclusions and rollout limits.
 
 **GitHub sign-in on ormas.ai says my email is already linked.**
 That account already exists via Google (same email); sign in with Google. If GitHub "returned an error",
