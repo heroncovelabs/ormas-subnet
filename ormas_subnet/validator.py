@@ -414,6 +414,21 @@ class ValidatorDaemon:
             raise
         return workdir
 
+    def _checkout_commit(self, workdir: Path, commit: str) -> None:
+        """Check out ``commit`` in a validator-owned clone, then drop phase dirt.
+
+        Base verification may edit tracked files or create untracked and ignored
+        artifacts. Those must not survive into the result phase or block the
+        checkout. Declared toolchain trees (``.venv``) are provisioned outside
+        the commits and stay. This never touches the caller's repository.
+        """
+        _run_git(["checkout", "--force", commit], cwd=workdir)
+        _run_git(["reset", "--hard", commit], cwd=workdir)
+        _run_git(
+            ["clean", "-fdx", "--exclude", ".venv", "--exclude", ".venv/**"],
+            cwd=workdir,
+        )
+
     def _decide(self, assignment: Mapping[str, Any], workdir: Path) -> str:
         """Independent accept/reject/error — never the miner's self-report.
 
@@ -447,7 +462,13 @@ class ValidatorDaemon:
                 return "error"
 
         try:
-            _run_git(["checkout", base_commit], cwd=workdir)
+            # Public OCI verification snapshots its own source. Only the legacy
+            # host path shares one checkout across phases, so only that path
+            # must discard base-generated files before each commit.
+            if public_execution:
+                _run_git(["checkout", base_commit], cwd=workdir)
+            else:
+                self._checkout_commit(workdir, base_commit)
         except GitError:
             return "error"
         def verify(phase):
@@ -474,7 +495,10 @@ class ValidatorDaemon:
             return "error"  # A capture/setup refusal is not an intended red base.
 
         try:
-            _run_git(["checkout", result_commit], cwd=workdir)
+            if public_execution:
+                _run_git(["checkout", result_commit], cwd=workdir)
+            else:
+                self._checkout_commit(workdir, result_commit)
         except GitError:
             return "error"
         try:
