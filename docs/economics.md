@@ -1,6 +1,43 @@
 # SN76 economics — emission schedule vs. demand
 
-**Status: planned — not yet live.** This page explains the compensation model the validator and
+## Task pricing (implemented in the 2026-10-02 source)
+
+A miner offers a `firm` price or a `limit` for the whole task. A limit offer states
+both `estimate_usd`, the expected charge, and `limit_usd`, the hard ceiling, with
+`0 < estimate_usd ≤ limit_usd`. Accepted firm delivery charges exactly `price_usd`.
+Accepted limit delivery charges exactly the miner’s `settled_price_usd`, at or below
+`limit_usd`. Failed delivery earns nothing. Legacy
+`ask_usd` claims keep their firm-price behaviour. See [Protocol](protocol.md).
+
+Estimate honestly: the expected cost of your usual recovery chain plus margin.
+Set the limit at your worst-case chain. At delivery, use the actual metered cost of
+every attempt in that chain plus your margin, capped at the limit. When cost runs
+above your estimate, consider dropping the margin to zero. You may deliver at a
+loss; the client’s charge stays within the accepted limit.
+
+**Made-up example:** you expect your usual chain to cost $0.80 and apply a 25%
+margin, so you estimate $1.00. Your worst-case chain would cost $1.60, so you set a
+$1.60 limit and offer
+`{"job_id": "job_example", "kind": "limit", "estimate_usd": 1.00, "limit_usd": 1.60}`.
+Two attempts actually cost $0.30 and $0.20. With the same 25% margin, you settle at
+$0.625 and the client pays $0.625. If a third attempt brings chain cost to $1.20,
+above your estimate, you might drop the margin and settle at $1.20. If chain cost
+rises above $1.60, the settlement stays at $1.60 and you bear the loss.
+
+**Why both numbers.** The estimate says what you expect to charge; the limit says
+what you will never exceed. The gateway's ledger can compare what you settled with
+what you estimated and with your limit, dollar-weighted, by task shape. A miner
+whose settlements track its estimates earns credible estimates; one that estimates
+low and settles near the limit shows it. These two ratios are a planned ranking
+input, not live in phase 1.
+
+Phase 1 accepts on arrival: the first offer within the client's undisclosed
+spending limit wins; an offer above it is recorded and skipped and the job stays
+queued. [History-based ranking](protocol.md#offer-ranking) is planned.
+
+## Chain compensation (planned)
+
+The sections below describe the planned compensation model the validator and
 gateway will implement (requirements: SN76 compensation model v1, 2026-09-13). Where a number is an
 owner or CPA decision it is marked **OPEN** and has not been chosen. Nothing here is an offer,
 forecast, or promise of return. Authority order: [`DECISIONS.md`](DECISIONS.md) → [`CONTRACT.md`](CONTRACT.md) → this page.
@@ -18,11 +55,11 @@ variable dollar demand without anyone converting a customer's dollars for a mine
 
 ## The rule, step by step
 
-**Bid → target.** A miner's accepted `ask_usd` on an Outcome becomes its **emission target**: the USD
-value the miner is owed for that Outcome. Only Outcomes accepted through the validator-gated path
+**Settlement → target.** The accepted firm price or settled limit price on an Outcome becomes its
+**emission target**: the USD value the miner is owed for that Outcome. Only Outcomes accepted through the validator-gated path
 count; a miner's own report of success never does.
 
-**Target → weight.** Each epoch, validators sum what every miner is owed — this epoch's accepted bids
+**Target → weight.** Each epoch, validators sum what every miner is owed — this epoch’s accepted settlements
 plus any balance carried from earlier epochs — and set weights **proportional to owed USD**. The
 conversion uses two prices, both recorded in the epoch artifact with their source ids: the SN76 pool
 price (TAO per alpha) read from chain at the epoch's reference block, and a **published TAO/USD

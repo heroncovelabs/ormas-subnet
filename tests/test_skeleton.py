@@ -346,3 +346,211 @@ def test_validator_daemon_rejects_when_result_still_fails_verify(tmp_path: Path)
     gateway = _run_validator_once(tmp_path, assignment=assignment)
 
     assert gateway.decisions[0]["decision"] == "reject"
+
+
+class _OfferGateway(FakeGateway):
+    def __init__(self, *, base_commit: str, queue_status: int = 200, running: bool = False,
+                 queue_body: Any = None) -> None:
+        super().__init__(task_id="task_1", base_commit=base_commit, verify_command="test -f out.txt")
+        self.queue_status = queue_status
+        self.queue_body = queue_body
+        self.running = running
+        self.gets: list[str] = []
+        self.jobs = [{
+            "job_id": "task_1", "created_at": "2026-10-02T19:00:00Z",
+            "envelope": {"size_class": "small", "turn_budget": 24},
+        }, {
+            "job_id": "task_2", "created_at": "2026-10-02T19:01:00Z",
+            "envelope": {"size_class": "medium", "turn_budget": 48},
+        }]
+
+    def get(self, path: str, headers: Any = None) -> _FakeResponse:
+        self.gets.append(path)
+        if self.queue_body is not None:
+            return _FakeResponse(self.queue_status, self.queue_body)
+        return _FakeResponse(self.queue_status, {"schema_version": "ormas.runner-queue.v1",
+                                                "jobs": self.jobs})
+
+    def _handle_claim(self, body: dict[str, Any]):
+        if body.get("offers") == [] and not self.running:
+            self.claims.append(body)
+            return _FakeResponse(204, None)
+        response = super()._handle_claim(body)
+        if response.status_code == 200:
+            terms = next((offer for offer in body.get("offers", [])
+                          if offer["job_id"] == self.task_id), None)
+            if terms is not None:
+                response._body["lease"].update(bid_id="bid-1", offer_kind=terms["kind"],
+                    estimate_usd=terms.get("estimate_usd"), limit_usd=terms.get("limit_usd"))
+            elif self.running:
+                response._body["lease"].update(bid_id="bid-running", offer_kind="limit",
+                                             estimate_usd=0.9, limit_usd=1.25)
+        return response
+
+
+def _offer_skeleton(tmp_path: Path, *, offer_fn=None, settle_fn=None, ask_usd=None,
+                    queue_status=200, running=False, queue_body=None):
+    repo, base_commit = _init_repo(tmp_path)
+    gateway = _OfferGateway(base_commit=base_commit, queue_status=queue_status, running=running,
+                            queue_body=queue_body)
+    client = OrmasMinerClient("https://fake.invalid", "ormr_test", http_client=gateway)
+    config = MinerConfig(
+        runner_id="miner-1", runner_version="test", platform="linux", capacity=1,
+        cells=("code-edit-small",), workdir_root=tmp_path / "work", repo_id="repo1",
+        repo_url=str(repo), push_remote=None, ask_usd=ask_usd,
+        offer_fn=offer_fn, settle_fn=settle_fn,
+    )
+    return gateway, MinerSkeleton(client, config, make_shell_solver("echo mined >> out.txt"))
+
+
+@requires_git
+def test_offer_hook_prices_each_entry_and_declines_without_legacy_ask(tmp_path: Path) -> None:
+    seen = []
+
+    def offer(entry):
+        seen.append(entry)
+        if entry["envelope"]["size_class"] == "small":
+            return {"job_id": entry["job_id"], "kind": "limit", "estimate_usd": 0.9, "limit_usd": 1.25}
+        return None
+
+    gateway, skeleton = _offer_skeleton(tmp_path, offer_fn=offer, ask_usd=0.75)
+    assert skeleton.run_once() is True
+    assert seen == gateway.jobs
+    assert gateway.claims[0] == {
+        "schema_version": "ormas-runner-v1", "runner_id": "miner-1",
+        "offers": [{"job_id": "task_1", "kind": "limit", "estimate_usd": 0.9, "limit_usd": 1.25}],
+    }
+    assert gateway.completed["terminal"]["settled_price_usd"] == 1.25
+
+
+@requires_git
+@pytest.mark.parametrize("running", [False, True])
+def test_all_declined_still_claims_empty_offers_to_resume_running_lease(
+    tmp_path: Path, running: bool,
+) -> None:
+    gateway, skeleton = _offer_skeleton(tmp_path, offer_fn=lambda _entry: None, running=running)
+    assert skeleton.run_once() is running
+    assert gateway.claims[0]["offers"] == []
+    assert "ask_usd" not in gateway.claims[0]
+    if running:
+        assert gateway.completed["terminal"]["settled_price_usd"] == 1.25
+
+
+@requires_git
+def test_offer_hook_falls_back_to_legacy_ask_only_on_queue_404(tmp_path: Path) -> None:
+    seen = []
+    gateway, skeleton = _offer_skeleton(
+        tmp_path, offer_fn=lambda entry: seen.append(entry), ask_usd=0.75, queue_status=404,
+    )
+    assert skeleton.run_once() is True
+    assert seen == []
+    assert gateway.claims[0] == {
+        "schema_version": "ormas-runner-v1", "runner_id": "miner-1", "ask_usd": 0.75,
+    }
+    assert "settled_price_usd" not in gateway.completed["terminal"]
+
+
+@requires_git
+def test_old_gateway_queue_404_is_remembered_and_not_probed_again(tmp_path: Path) -> None:
+    """FastAPI's route-missing 404 carries ``detail`` and no ``error.type``."""
+    gateway, skeleton = _offer_skeleton(
+        tmp_path, offer_fn=lambda _entry: pytest.fail("old gateway has no queue entries"),
+        ask_usd=0.75, queue_status=404, queue_body={"detail": "Not Found"},
+    )
+    assert skeleton.run_once() is True
+    assert skeleton.run_once() is False
+    assert gateway.gets == ["/api/runner/v1/queue?runner_id=miner-1"]
+    legacy = {"schema_version": "ormas-runner-v1", "runner_id": "miner-1", "ask_usd": 0.75}
+    assert gateway.claims == [legacy, legacy]
+
+
+@requires_git
+def test_typed_not_found_queue_404_is_raised_without_legacy_claim(tmp_path: Path) -> None:
+    """A new gateway's 404 means an unknown runner or no priced binding."""
+    from ormas_subnet.client import OrmasGatewayError
+
+    gateway, skeleton = _offer_skeleton(
+        tmp_path, offer_fn=lambda _entry: None, ask_usd=0.75, queue_status=404,
+        queue_body={"error": {"type": "not_found_error", "message": "runner not found"}},
+    )
+    for _ in range(2):
+        with pytest.raises(OrmasGatewayError) as raised:
+            skeleton.run_once()
+        assert (raised.value.status_code, raised.value.error_type) == (404, "not_found_error")
+    assert len(gateway.gets) == 2, "a typed 404 must not be remembered as an old gateway"
+    assert gateway.claims == []
+
+
+@requires_git
+@pytest.mark.parametrize("status", [403, 503])
+def test_queue_refusal_does_not_fall_back_to_blind_claim(tmp_path: Path, status: int) -> None:
+    from ormas_subnet.client import OrmasGatewayError
+
+    gateway, skeleton = _offer_skeleton(
+        tmp_path, offer_fn=lambda _entry: None, ask_usd=0.75, queue_status=status,
+    )
+    with pytest.raises(OrmasGatewayError) as raised:
+        skeleton.run_once()
+    assert raised.value.status_code == status
+    assert gateway.claims == []
+
+
+@requires_git
+@pytest.mark.parametrize("price, expected", [(0.0, 0.0), (0.75, 0.75), (2.0, 1.25)])
+def test_limit_settlement_hook_is_capped_at_the_accepted_limit(
+    tmp_path: Path, price: float, expected: float,
+) -> None:
+    settled = []
+
+    def settle(lease, result):
+        settled.append((lease, result))
+        return price
+
+    gateway, skeleton = _offer_skeleton(tmp_path,
+        offer_fn=lambda entry: {"job_id": entry["job_id"], "kind": "limit", "estimate_usd": 0.9, "limit_usd": 1.25},
+        settle_fn=settle)
+    assert skeleton.run_once() is True
+    assert len(settled) == 1
+    lease, result = settled[0]
+    assert lease.bid_id == "bid-1" and lease.limit_usd == 1.25
+    assert result.result_commit == gateway.completed["terminal"]["result_commit"]
+    assert gateway.completed["terminal"]["settled_price_usd"] == expected
+
+
+@requires_git
+@pytest.mark.parametrize("ask", [None, 0.75])
+def test_default_hooks_preserve_legacy_loop_body_and_do_not_read_queue(
+    tmp_path: Path, ask: float | None,
+) -> None:
+    gateway, skeleton = _offer_skeleton(tmp_path, ask_usd=ask)
+    assert skeleton.run_once() is True
+    assert gateway.gets == []
+    expected = {"schema_version": "ormas-runner-v1", "runner_id": "miner-1"}
+    if ask is not None:
+        expected["ask_usd"] = ask
+    assert gateway.claims[0] == expected
+    assert "settled_price_usd" not in gateway.completed["terminal"]
+
+
+@requires_git
+def test_firm_offer_never_calls_settle_hook_or_adds_settled_price(tmp_path: Path) -> None:
+    def settle(_lease, _result):
+        pytest.fail("firm delivery must not call settle_fn")
+
+    gateway, skeleton = _offer_skeleton(tmp_path,
+        offer_fn=lambda entry: {"job_id": entry["job_id"], "kind": "firm", "price_usd": 0.75},
+        settle_fn=settle)
+    assert skeleton.run_once() is True
+    assert gateway.completed["terminal"]["verification_state"] == "verified"
+    assert "settled_price_usd" not in gateway.completed["terminal"]
+
+
+@requires_git
+@pytest.mark.parametrize("price", [-0.1, float("nan"), float("inf"), True, "0.75"])
+def test_invalid_settled_price_never_becomes_a_verified_delivery(tmp_path: Path, price) -> None:
+    gateway, skeleton = _offer_skeleton(tmp_path,
+        offer_fn=lambda entry: {"job_id": entry["job_id"], "kind": "limit", "estimate_usd": 0.9, "limit_usd": 1.25},
+        settle_fn=lambda _lease, _result: price)
+    assert skeleton.run_once() is True
+    assert gateway.completed["terminal"]["verification_state"] == "failed"
+    assert "settled_price_usd" not in gateway.completed["terminal"]
