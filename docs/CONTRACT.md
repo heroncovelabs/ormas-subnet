@@ -4,29 +4,27 @@ One page, in order of authority:
 
 - [`docs/DECISIONS.md`](DECISIONS.md) — the owner-locked decision that defines a miner. Normative; it wins any disagreement.
 - the validator acceptance design (summarized in [`docs/DECISIONS.md`](DECISIONS.md) §6) — how acceptance will work. Design signed off by the owner on 2026-09-10; implementation is in progress, so anything drawn from it below is marked **planned — not yet live**.
-- [`README.md`](../README.md) and [`protocol.md`](protocol.md) — the wire protocol as implemented today. They describe what is live now.
+- [`README.md`](../README.md) and [`protocol.md`](protocol.md) — the wire protocol as implemented today. They describe the implemented source; deployment follows its release.
 - [`ormas_subnet/skeleton.py`](../ormas_subnet/skeleton.py) and [`ormas_subnet/reference_solver.py`](../ormas_subnet/reference_solver.py) — the code you actually run.
 
 A name note: the wire protocol is `/api/runner/v1` / `ormas-runner-v1`. Those names ship today and predate the miner vocabulary; they change when the miner-identity work rewrites the routes. Everywhere else the software is the miner.
 
 ## What a miner is
 
-A miner posts a **firm bid** — an ask — for a whole task and is paid only when its delivery is **accepted**. It clones the client's repository, solves with its own agent, harness, and models, verifies, and publishes a result branch. The client's own harness does **task preparation** only: it freezes the task packet and calls no model through Ormas.
+A miner offers a **firm price** or a **limit** for a whole task and is paid only when its delivery is **accepted**. Firm delivery pays exactly the accepted price. Limit delivery pays exactly the miner's settled price, at or below the accepted limit. It clones the client's repository, solves with its own agent, harness, and models, verifies, and publishes a result branch. The client's own harness does **task preparation** only: it freezes the task packet and calls no model through Ormas.
 
 A miner is never an inference endpoint, model supplier, or token vendor. Nobody pays for tokens, completions, or uptime.
 
 ## The loop
 
 1. **Register** — with capacity and the cells (task archetypes) you serve; the gateway assigns your stable id (`runr_<12hex>`) on the first call — keep it, and pass it on every later call (an id the gateway never issued to your token is refused 404). The response carries the poll/lease/heartbeat cadence — it is authoritative.
-2. **Bind — optional, legacy.** Today's path needs no binding: when a job leases to you the draft
-   carries the client's clone URL and a job-scoped deploy key (`INSTALL.md`, "Today's path"). `bind`
-   remains for a miner that serves one pre-arranged repository.
-3. **Poll, then claim.** Your claim may carry your firm ask (`ask_usd`); the first ask at or under the client's reserve is leased, and that ask is the price you are paid. An ask above the reserve is recorded and skipped — the job stays queued for the next miner. That is "accept on arrival". If you send no ask, the gateway derives one from the task's expected cost plus a margin. **Status:** live on `api.ormas.ai` since `gateway-2026.09.11`; this package's client and skeleton send `ask_usd` when it is configured (`MinerConfig.ask_usd`), and send no ask otherwise.
+2. **Bind — optional, legacy.** Bounded-packet (public-profile) jobs use gateway publication. Public-repository jobs clone anonymously; private-repository jobs use a per-job read credential. The legacy unbound route carries a repository credential; `bind` serves a pre-arranged repository. See `INSTALL.md`.
+3. **Queue, offer, then claim.** The queue exposes a privacy-safe task envelope. Offer `{job_id, kind: "firm", price_usd}` or `{job_id, kind: "limit", estimate_usd, limit_usd}` (`0 < estimate_usd ≤ limit_usd`), or decline by omitting the job. Phase 1 accepts on arrival: the first offer within the client's undisclosed spending limit wins; an offer above it is recorded and skipped and the job stays queued. Legacy `ask_usd`/`asks` claims keep firm-price behaviour. [History-based ranking](protocol.md#offer-ranking) is planned.
 4. **Clone** — the skeleton clones the repo and checks out the base commit in a fresh workdir.
 5. **Solve** — your `solve(draft, workdir) -> SolveResult`. Heartbeat throughout — not only here; see "Keeping your lease alive" below.
-6. **Verify** — the skeleton runs the packet's verify command itself, in a bounded, credential-free environment with no shell, and computes `scope_ok` from a real `git diff`.
-7. **Publish** — your result commit lands on `refs/heads/ormas/job/<task_id>` in the client's repository.
-8. **Complete** — send the receipt, terminal, and capture: commit sha, changed paths, diff hash, verify exit code, usage.
+6. **Verify** — both routes run without a shell in a credential-free environment: `PATH`, scratch `HOME`, `LANG`, plus the packet's explicit `NAME=value` assignments. The public profile runs in a digest-pinned OCI image with `--network none`, `--cap-drop ALL`, `--read-only` and resource limits. It computes `scope_ok` from a real `git diff`.
+7. **Publish** — the bounded-packet (public-profile) path uploads a bounded committed-file artifact for the gateway to publish; the legacy path pushes the branch. Both use `refs/heads/ormas/job/<task_id>`.
+8. **Complete** — send the receipt, terminal, and capture: commit sha, changed paths, diff hash, verify exit code, usage. A verified limit delivery also supplies `settled_price_usd`; firm/legacy terminals omit it.
 
 ## Keeping your lease alive
 
@@ -66,24 +64,35 @@ exception. A wrapper that swallows those into something like
 tell a transient blip from a terminal refusal, which is what turned a fixable
 retry into a lost job on 2026-09-16.
 
-## What you see — and what the gateway never sees
+## What you see and send
 
-You see the client's repository at the base commit (clients opt in), the task brief, the acceptance criteria, the verify command, and the allowed and immutable paths. Stay inside the allowed paths; a delivery outside them pays nothing.
+Before offering, you see the privacy-safe queue envelope listed in `protocol.md`.
+After claim, you see the repository at the base commit, task brief, acceptance
+criteria, verify command, allowed and immutable paths, and frozen acceptance
+policy. Stay inside the allowed paths; an out-of-scope delivery pays nothing.
 
-Never send the gateway source, diffs, prompts, model output, or credentials — the wire rejects those by field name (full list in `protocol.md`). Evidence is hashes, path lists, exit codes, and usage counts. The gateway never clones your work; all it knows of your model and harness is the provider/model string and usage you report.
+Completion carries hashes, path lists, exit codes and usage counts. It rejects
+raw source, diffs, prompts, output and credentials by field name. Public-profile artifact
+publication separately sends committed source file bytes for the gateway to
+publish. Legacy claims may carry a repository credential; keep it private.
 
 ## When you get paid
 
 Only on **accepted delivery**. A rejected, failed, or out-of-scope delivery pays nothing.
 
-- **Today (third-party miners):** settlement waits for validator acceptance. Your delivery lands `pending_acceptance`; assigned validators re-run the packet's verify command against your delivered branch in the environment the client declared in the packet's `toolchain` block (a fresh venv with the declared Python and `pip_install`), independently check the diff against the allowed and immutable paths, and post signed accept/reject decisions. Payment requires **unanimity among the assigned validators**. Your self-report is advisory; a self-reported failure still settles unpaid at once. Validators clone with a job-scoped read-only deploy key that exists only for the clone. On `api.ormas.ai` the validator count is one and that validator is operator-run: a `paid` settlement today means one independent-of-you review, not a multi-party quorum.
-- **Today (Ormas's own miner):** same-tenant deliveries still settle on the miner's own reported `verification_state` plus a scope and commit check — self-grading, tolerable only because that miner is Ormas's first party.
-- **Planned — not yet live:** independent (non-operator) validators; a digest-pinned container as the verify environment; per-job GitHub App tokens replacing deploy keys.
+- **Bounded-packet (public-profile) jobs:** settlement waits for unanimous assigned-validator acceptance under the frozen policy. V1 separates miner and validator operators; the explicit v2 alpha uses an operator-run checker. Both apply to the operator's miner too. Miners and validators clone public-repository jobs anonymously; private-repository jobs use a per-job read credential, with the Standard/Protected service level stated separately. Validators run the qualified, frozen execution environment.
+- **Legacy jobs:** cross-tenant delivery requires assigned-validator acceptance; same-tenant delivery uses the miner's report plus scope and commit checks. A legacy Python `toolchain` declares the validator's venv; repository access may use a separate read key.
+- **Release work:** independent validator admission and the combined public validator service. See [Public tasks](PUBLIC_TASKS.md).
+
+Estimate a limit offer from the expected cost of your usual recovery chain plus
+margin, and set the limit at your worst-case chain. Settle from actual metered
+chain cost plus margin, within the limit. You bear any loss above it. `settle_fn` supplies that price; the skeleton caps it at the limit and defaults
+to the limit when unset. The hook must be deterministic and must not raise. A raising hook never reprices the delivery. On the public (bounded-packet) path the published work is held for recovery, no completion is sent, and every later poll re-raises until the hook returns a valid price; only a task without a public packet completes as `failed`. See [Economics](economics.md) for a made-up example.
 
 ## How you are scored
 
-- **History.** Accept/reject decisions accrue to your miner identity — today a tenant-scoped token; planned, a registered identity mapped to a chain hotkey at registration. Validator decisions write that history today (`outcomes_acceptance_history`), including overclaims (reporting `verified` and being rejected). **Planned:** that history weighs in selection, alongside your honestly reported cost and latency.
-- **Chain weights.** Accepted delivery is the gate — no accepted deliveries, no weight. Weight is linear in settled value, under a per-hotkey cap. A miner with no chain identity mapping earns nothing however good its work.
+- **History.** Validator decisions record accept/reject history, including overclaims. Register a verified hotkey mapping after onboarding (see `INSTALL.md`). [History-based ranking](protocol.md#offer-ranking) is planned; phase 1 follows the spending-limit rule above.
+- **Chain weights — planned.** Accepted delivery is the gate — no accepted deliveries, no weight. Weight is linear in settled value, under a per-hotkey cap. A miner with no chain identity mapping earns nothing however good its work.
 
 Two honesty rules protect your score: report `None` for usage you do not know — never a fabricated zero — and never self-declare `verified`; the skeleton has no field for it.
 
@@ -91,7 +100,21 @@ Two honesty rules protect your score: report `None` for usage you do not know �
 
 Model routing, hardware, energy, harness, caching, the orchestration loop — all of it lives inside your miner, and none of it is specified by Ormas. The network rewards accepted outcomes at the best price, latency, and quality; how you produce them is your edge. This repo ships protocol mechanics only. Your `solve` is the mining.
 
-**Toolchains are yours too.** A task's verify command may be pytest, `node --test`, `npm test`, `cargo test`, `go test`, or anything else the client's repository uses. You provision every runtime and test tool your miner needs; Ormas never installs, specifies, or pays for one. Serve only the verifier classes you can actually run — the gateway keeps your history per verifier class, so your Python record says nothing about your Node record, and a task you claim but cannot verify fails as a `setup_failure` that counts against you. Today Python and Node carry real volume; Rust and Go are recognised but have no history yet. **Planned — not yet live:** declining a cell you do not serve, without penalty, at bid time.
+**Execution environments.** Public-profile jobs specify a frozen catalog environment
+and require current qualification for it. You provision your host to run that
+profile. Legacy jobs may declare a Python toolchain or depend on tools you
+provision. Serve only the verifier classes you can actually run — the gateway keeps
+your history per verifier class, so your Python record says nothing about your
+Node record. A task you claim but cannot verify fails as a `setup_failure` that
+counts against you. Today Python and Node carry real volume; Rust and Go are
+recognised but have no history yet. Public-profile validator runtime setup and
+timeout failures are neutral, as described in [protocol.md](protocol.md#public-execution-and-acceptance-additions-september-23-development-candidate).
+With per-job offers, return `None` from `offer_fn` or omit the job to decline before
+claiming.
+
+**Terminology.** Firm/limit are offer kinds. Standard/Protected are Ormas service
+levels. Public/private are GitHub visibility; a private repository's service
+level is specified separately.
 
 ## Other gateways
 

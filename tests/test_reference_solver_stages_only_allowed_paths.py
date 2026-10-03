@@ -14,7 +14,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
 
 from ormas_subnet.reference_solver import make_shell_solver
 from tests.test_skeleton import _init_repo, _run_one_task, requires_git

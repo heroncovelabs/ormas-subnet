@@ -7,15 +7,14 @@ package (public). If you are implementing a miner in another language, this page
 plus the DTO field lists below should be enough — no other document is required.
 
 Read [`docs/DECISIONS.md`](DECISIONS.md)
-first for the *why*: a miner posts a firm bid for a whole task and is paid only on
-accepted delivery; every optimization dimension (model, routing, harness, cost)
+first for the *why*: a miner offers a firm price or a limit for a whole task and
+is paid only on accepted delivery; every optimization dimension (model, routing, harness, cost)
 lives inside the miner; this protocol is the shape of the conversation, not the
 mining logic.
 
 ## Transport
 
-- All routes are `POST` (except the paths embedding `{task_id}`, which are also
-  `POST` — there are no `GET`s in this control plane today).
+- The queue route is `GET`; the other routes below are `POST`.
 - Base path: `/api/runner/v1`.
 - Auth: `Authorization: Bearer <token>` where `<token>` is a runner token issued
   out of band (starts with `ormr_`). A missing/invalid/rate-limited token
@@ -24,14 +23,16 @@ mining logic.
   every subsequent request must carry `X-Ormas-Runner-Device: <nonce>` matching
   what the gateway stored, or the request is rejected as unauthorized. First
   registration may omit it (the gateway can fall back to the header value).
-- Every request body must include `"schema_version": "ormas-runner-v1"`. A
-  missing/wrong value is rejected as `400 unknown_field:schema_version`.
+- Every JSON request body must include `"schema_version": "ormas-runner-v1"`. A
+  missing/wrong value is rejected as `400 unknown_field:schema_version`. The queue
+  GET has no body; binary publication uses its own schema below.
 - **Strict allowlists.** Every route rejects any field not on its allowlist
   (`400 unknown_field:<field>`), and separately rejects a small set of
   universally forbidden fields even before the allowlist check
   (`400 forbidden_field:<field>`): `provider_key`, `repo_path`, `raw_source`,
   `raw_prompt`, `raw_output`, `raw_diff`, `tenant_id`, `client_0`, `rao`. These
-  never cross the wire in either direction.
+  are excluded from control-plane JSON. Public artifact publication separately
+  carries committed source file bytes, as specified below.
 
 ## Error shape
 
@@ -56,7 +57,7 @@ same shape as a `200`, replay-safe).
 ## Lifecycle
 
 ```
-register runner  ──▶  bind repo(s)  ──▶  poll claim ──(204 idle)──▶ poll claim ...
+register runner  ──▶  queue + offers (or legacy claim) ──(204 idle)──▶ poll ...
                                               │
                                         (200: lease + draft)
                                               ▼
@@ -71,26 +72,22 @@ register runner  ──▶  bind repo(s)  ──▶  poll claim ──(204 idle)
                                             complete ──▶ 200 done | 202 settling (poll again) | 410 replay
 ```
 
-Acceptance today: for a miner in the client's own tenant (our trusted miner) the
-gateway derives `settlement` from the miner's own `terminal.verification_state`
-plus a scope check on `capture.scope_ok` and a valid 40-hex `result_commit`.
-This is **self-reported**, acceptable only because that miner is ours. For a
-third-party (cross-tenant) miner the gateway settles only on **unanimous
-validator acceptance** — the delivery goes `pending_acceptance`, assigned
-validators independently re-run the packet's verify command against the
-delivered branch and post signed decisions — and it refuses the claim outright
-until a validator count is configured (decision doc §8, item 1b; reference
-validator in `ormas_subnet/validator.py`). In production a validator count is
-configured and one operator-run reference validator reviews cross-tenant
-deliveries; the first such deliveries settled through it on 2026-09-14.
+Public-profile jobs settle under their frozen acceptance contract. V1 requires
+separate miner and validator operators; the explicit v2 alpha permits an
+operator-run checker. Both require validator acceptance, including for the
+operator's miner. See the public acceptance fields below.
 
-`pending_acceptance` is what a third-party miner sees at `complete`: the route
-returns `200` with `receipt.settlement = "pending_acceptance"` (never `paid` for
-a cross-tenant delivery), and the miner's job ends there. Settlement then
-follows the validator quorum — unanimous accept settles `paid` at exactly the
-accepted ask; any reject settles `no_delivery`/`validator_reject`, unpaid. There
-is no miner-facing route to learn the verdict in this protocol version; do not
-build a callback around one.
+On the legacy route, a same-tenant delivery uses the miner's reported
+`terminal.verification_state`, `capture.scope_ok` and a valid result commit.
+Cross-tenant delivery requires unanimous assigned-validator acceptance and
+refuses a claim until a validator count is configured. The reference validator
+ships in `ormas_subnet/validator.py`.
+
+A delivery awaiting validators returns `200` with
+`receipt.settlement = "pending_acceptance"`. Accepted firm delivery pays exactly
+the accepted price; accepted limit delivery pays exactly the pinned settled
+price within the limit. Rejected delivery is unpaid. This route set provides
+no miner-facing verdict callback.
 
 ## Routes
 
@@ -128,38 +125,289 @@ shape works; this client always sends the flattened form.
 
 **Response**: `{"repo_id": str, "project_id": str}`.
 
+### `GET /api/runner/v1/queue?runner_id=<assigned-id>`
+
+List eligible task shapes before offering. `OrmasMinerClient.list_queue(runner_id)`
+URL-encodes the assigned id and returns an object with `schema_version` and `jobs`.
+Listing creates no lease. Qualification, capacity, task cells, execution profile,
+service level, publication and admission checks still apply. At capacity, `jobs`
+is empty. The skeleton falls back to the legacy `ask_usd` claim only on a queue
+HTTP 404 with no `error.type`, indicating an older gateway without this route,
+and remembers that fallback for the process. A 404 with
+`error.type == "not_found_error"` is raised to the operator: it can mean an unknown
+runner, or no priced binding and no eligible project. Other queue errors also
+surface to the caller.
+
+Each job has exactly `job_id`, `created_at` and `envelope`. The envelope admits
+only these keys; absent or invalid values are omitted:
+
+| Key | Shape |
+|---|---|
+| `size_class` | `small`, `medium` or `large` |
+| `attempt_limit` | Nonnegative integer |
+| `turn_budget` | Nonnegative integer |
+| `archetype` | Task archetype label |
+| `execution_profile_id` | Known execution profile id |
+| `languages` | List of canonical language labels |
+| `task_text_chars` | Nonnegative integer |
+| `acceptance_criteria_count` | Nonnegative integer |
+| `immutable_paths_count` | Nonnegative integer |
+| `verify_command_category` | `pytest`, `node`, `cargo`, `go`, `shell` or `other` |
+| `allowed_paths_count` | Nonnegative integer |
+| `source_path_bucket` | `f(1|2-3|4-10|11+)/d(1|2|3|4+)` |
+| `service_level` | `standard` or `protected` |
+| `repository_visibility` | `public` or `private` |
+
+Counts exclude booleans. The envelope contains task shape, without task text,
+source, actual paths or the exact acceptance policy. Standard/Protected are
+Ormas service levels; public/private are GitHub repository visibility. A private
+repository's service level is stated separately.
+
+Example request: `GET /api/runner/v1/queue?runner_id=runr_0123456789ab`.
+A response with a subset of valid envelope keys:
+
+```json
+{
+  "schema_version": "ormas.runner-queue.v1",
+  "jobs": [{
+    "job_id": "job-1",
+    "created_at": "2026-10-02T00:00:00Z",
+    "envelope": {
+      "service_level": "standard",
+      "repository_visibility": "public",
+      "turn_budget": 12,
+      "allowed_paths_count": 1,
+      "source_path_bucket": "f1/d1"
+    }
+  }, {
+    "job_id": "job-2",
+    "created_at": "2026-10-02T00:01:00Z",
+    "envelope": {
+      "service_level": "standard",
+      "repository_visibility": "public",
+      "turn_budget": 24,
+      "allowed_paths_count": 1,
+      "source_path_bucket": "f1/d1"
+    }
+  }]
+}
+```
+
+### Offer ranking
+
+Phase 1 accepts on arrival: the first offer within the client's undisclosed
+spending limit wins; an offer above it is recorded and skipped and the job stays
+queued. The planned next phase ranks on settled-price history by task shape:
+dollar-weighted settled-to-estimate and settled-to-limit ratios per miner,
+favouring low limits.
+
 ### `POST /api/runner/v1/leases`
 
-Poll for work. **Body**: `{"schema_version": ..., "runner_id": str, "ask_usd"?: number}`
-— nothing else is accepted. `ask_usd` (optional, finite, ≥ 0) is the miner's firm
-ask for any job leased on this claim. Selection is accept-on-arrival: a job is
-leased to this miner when `ask_usd` is at or under the client's reserve; an ask
-above the reserve is recorded and the job is skipped (it stays queued for the
-next miner). When `ask_usd` is absent the server derives the ask (flat per-project
-fee, or estimated cost plus margin) and applies the same reserve gate. Every ask
-is recorded with its arrival offset. **Deployment status:** `ask_usd` is live on
-`api.ormas.ai` since `gateway-2026.09.11`. This package's client sends it when configured
-(`claim_task(..., ask_usd=...)` / `MinerConfig.ask_usd`); with no ask
-configured the body is exactly `schema_version` + `runner_id`.
+Offer and claim through
+`claim_task(runner_id, *, ask_usd=None, offers=None, claim_request_id=None)`.
+Phase 1 follows the [offer-selection rule](#offer-ranking) above.
+
+An offers request uses this body:
+
+```json
+{
+  "schema_version": "ormas-runner-v1",
+  "runner_id": "runr_0123456789ab",
+  "offers": [
+    {"job_id": "job-1", "kind": "firm", "price_usd": 0.20},
+    {"job_id": "job-2", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30}
+  ]
+}
+```
+
+A firm entry has exactly `job_id`, `kind` and `price_usd`. A limit entry has
+exactly `job_id`, `kind`, `estimate_usd` and `limit_usd`, both required, with
+`0 < estimate_usd <= limit_usd`. Amounts must be positive finite numbers,
+excluding booleans. Omitted jobs are declined.
+`offers: []` claims nothing new and may re-serve an eligible running lease.
+`offers` is mutually exclusive with legacy `ask_usd` and `asks`; invalid fields,
+amounts, kind/amount pairs, a missing estimate, an estimate above the limit or
+duplicate jobs return `400 unknown_field:offers`.
+`OrmasMinerClient.claim_task` validates `offers` locally and raises `ValueError`
+before sending a malformed offer.
+
+Legacy `ask_usd` and per-job `asks` requests keep their firm-price behaviour.
+`ask_usd` is optional, finite and nonnegative, excluding booleans. The public
+client exposes `ask_usd`; the gateway also accepts `asks`. Same-tenant claims
+with no pricing field use the gateway default. A third-party (cross-tenant)
+claim must send `ask_usd`, `asks` or `offers`, or gets `400 ask_required`.
+
+| HTTP | Message | When |
+|---|---|---|
+| 400 | `ask_required` | A third-party claim omits all three pricing fields |
+
+`claim_request_id` is optional. When present it must be 1..64 characters from
+`[A-Za-z0-9_-]`; anything else returns `400 invalid_claim_request_id`. Null or
+omitted adds no lease field. A valid id is echoed on a fresh lease. A re-served
+lease echoes the originally stored id (null if none), without replacing it.
 
 **Response**:
 - `204 No Content` — nothing queued for this miner right now.
 - `200` — `{"lease": <TaskLease wire>, "draft": <TaskDraft wire>}`.
 
-If this miner already holds a running lease (e.g. after a restart), the same
-lease + a refreshed draft is returned instead of a new claim — a miner never
-holds two concurrent leases.
+Below its registered capacity, a runner receives a new lease. At capacity, the
+claim returns an already-running lease (same lease token, refreshed draft)
+instead of another one. An empty offers list may also re-serve a running lease
+below capacity. `claim_request_id` is on the payload only when this request sent
+a valid id, and then it is the original stored value.
+
+Offer-specific fields from a successful limit claim (`lease` projection):
+
+```json
+{
+  "outcome_price_usd": 0.30,
+  "bid_id": "bid_0123456789ab",
+  "offer_kind": "limit",
+  "estimate_usd": 0.20,
+  "limit_usd": 0.30
+}
+```
+
+A firm claim has `offer_kind: "firm"`, its price as `outcome_price_usd`, and
+`estimate_usd: null` and `limit_usd: null`. Legacy responses omit these offer fields.
 
 **`TaskLease`**: `lease_id` (also the *lease token* used in every subsequent
 call for this task), `task_id`, `expires_at`, `selected_cell`, `provider_pin`,
-`fallback_policy`, `hold_ref`, `now`, `outcome_price_usd` (the fee this miner
-will be paid on accepted delivery — fixed, not proposed by the miner).
+`fallback_policy`, `hold_ref`, `now`, `outcome_price_usd` (the accepted firm
+price or limit), `claim_request_id` (present only when this request sent a valid
+id; on a re-served lease the value is the original stored id, or null), `bid_id`
+(nullable accepted-offer id), `offer_kind` (`firm` or `limit`, defaults to `firm`),
+`estimate_usd` (nullable; the accepted expected charge for a limit offer, null
+for firm), `limit_usd` (nullable; the accepted ceiling for a limit offer, null for
+firm). Legacy leases without offer fields decode with `bid_id=null`,
+`offer_kind="firm"`, `estimate_usd=null` and `limit_usd=null`.
 
 **`TaskDraft`**: `task_id`, `runner_id`, `repo_id`, `base_commit`, `brief` (the
 task description), `verify_command`, `allowed_paths`, `budget_usd`,
 `work_packet` (the full frozen packet — task, acceptance criteria, etc.),
 `work_packet_sha256`, `attempt`, `parent_job_id` (non-empty on a repair),
 `repair_findings`, `repair_evidence` (present only on a repair attempt).
+
+### Public execution and acceptance additions (September 23 development candidate)
+
+These additions describe the candidate source contract, not a production rollout.
+The older credential/toolchain route below remains separate. See
+[Public tasks](PUBLIC_TASKS.md) for supported profiles and operator setup.
+
+A public `ormas.work-packet.v2` preparation includes:
+
+- `execution_environment`: `outcomes.execution-environment.v1`, with
+  `catalog_digest`, the exact catalog `profile`, path-to-SHA256 `lock_files` and
+  `acceptance_files`, and `service` only for the HTTP profile. The service has exactly
+  `argv` and `port`; the allowed shape is checked before base execution.
+- `execution_requirements`: the catalog/profile and environment/verifier digests,
+  protocol versions, public visibility, languages, OS/architecture, runtimes,
+  browser, packages, services, network policy, workspace mode and resource limits.
+  Version 2 also binds the `github-artifact-v1` publication protocol. Every required
+  task cell must match; language requirements are not an any-one-match hint.
+- `verifier_profile` and `verify_base`: the compiled verifier identity and an
+  `outcomes.base-preflight.v2` assertion-failing base bound to the same base commit,
+  environment and verifier. Missing/setup/timeout failures cannot stand in for it.
+
+The gateway and SDK recompile and compare the executable/configuration against the
+frozen catalog. They do not trust a client-supplied wrapper merely because its shape
+looks valid. Earlier admitted catalog versions remain loadable for in-flight jobs.
+
+`TaskDraft.acceptance_contract` is optional for legacy drafts and required on this
+public publication path. It has the exact keys `schema_version`, `policy`, `miner`,
+`validators`, `claim_nonce`, with schema `ormas.public-acceptance-contract.v1`:
+
+- `policy` uses `ormas.public-acceptance-policy.v1` and has exactly
+  `required_validators`, `catalog_digest`, `profile_id`, `protocol`, `liveness_s`,
+  `timeout_s`, `max_concurrent_assignments`, plus `schema_version`. Counts and times
+  are positive integers; concurrency is exactly one.
+- `miner` has `subject_id`, `operator_id`, `qualification_id`, `credential_id`,
+  `miner_id`. A validator record has the same first four fields; its credential is
+  a 64-lowercase-hex Ed25519 public key.
+- The validator list length equals `required_validators`. Subjects, credentials
+  and operators are distinct, and every validator operator differs from the miner
+  operator. The nonblank `claim_nonce` binds the selected capacity reservation.
+
+Registration and heartbeat do not grant qualification. Claims require current
+credential-bound qualification for the exact profile/catalog, matching task cells
+and available checker capacity under the frozen policy. This includes operator-miner claims.
+
+The explicit operator-run alpha uses `ormas.public-acceptance-contract.v2` with
+the same outer keys and `ormas.public-acceptance-policy.v2`. Its policy adds exactly
+`verification_mode: "operator-run"` and a nonblank `validator_operator_id` to the
+v1 policy fields, sets `protocol` to the v2 contract schema, and requires exactly
+one validator. The validator must belong to that frozen operator; the miner may
+belong to the same or another qualified operator. V1 contracts cannot contain this
+exception or these extra keys. The complete v2 contract is signed with the rest
+of the assignment evidence.
+
+V2 requires explicit `task:acceptance/operator-run-v2` miner opt-in and separately
+approved v2 qualifications. The gateway checks the capability before any bid,
+at atomic claim and when resuming a lease. Alpha configuration is explicit:
+`OUTCOMES_PUBLIC_ACCEPTANCE_POLICY=operator-run-v2` and
+`OUTCOMES_PUBLIC_VALIDATOR_OPERATOR_ID=<qualified operator id>`. The default is
+`independent-v1`; blank/unknown modes or an incomplete owner/quorum configuration
+refuse admission. Existing queued and running jobs retain their original policy.
+The client job response exposes that frozen policy. This is policy-class consent
+through standing asks or per-job offers. The queue envelope omits the exact
+policy; that policy arrives in the claimed draft. Exact pre-offer policy
+negotiation remains planned (see [public task limits](PUBLIC_TASKS.md)).
+
+Validator assignments carry an `execution_contract` with exactly `schema_version`,
+`work_packet_sha256`, `execution_environment`, `execution_requirements`,
+`verifier_profile`, `verify_base`. The schema is `outcomes.validation-contract.v2`;
+the packet hash is 64 lowercase hex characters. Assignments also carry the frozen
+`acceptance_contract`. Both objects join the canonical signed evidence alongside
+the existing repository/commit/verifier/scope fields. Validators reject malformed
+or mismatched projections before repository access; they do not need the task's
+private text, prices or miner model choices.
+
+Public validators require base exit 86, then classify the result's completed
+assertions as accept/reject. Runtime setup and timeout are neutral. A public
+completion cannot reduce its frozen checker count or substitute the miner's own
+verification for the validator's decisions. Pending or missing decisions retain
+the agreed count and deadline.
+
+### Public artifact publication
+
+`POST /api/runner/v1/leases/{task_id}/publication` takes the existing authenticated
+miner token and headers `X-Ormas-Runner-Id`, `X-Ormas-Lease-Token`, `Content-Length`,
+with `Content-Type: application/vnd.ormas.public-artifact.v1`.
+
+The body is an eight-byte unsigned big-endian header length, canonical JSON header,
+then the concatenated file bytes. The header is at most 1 MiB and has exactly
+`schema_version: "ormas.public-artifact.v1"`, `base_commit`, `tree_sha`, `files`.
+JSON uses sorted keys, compact separators and ASCII escapes. File entries are sorted
+by path and have exactly `path`, `op`, `mode`, `byte_len`, `sha256`. An `upsert` has
+mode `100644` or `100755`, its byte count and lowercase SHA256; a `delete` has null
+mode/hash and zero bytes. Upsert bodies follow that same order. The artifact digest
+is SHA256 over the entire framed body. A successful JSON response includes the
+canonical `result_ref`, `result_commit`, `tree_sha` and `artifact_sha256`.
+The SDK's `outcomes_support.build_public_artifact` is the executable serializer;
+only committed regular files within allowed scope and the frozen publication bounds
+are admitted. Raw Git packs, symlinks and submodules are not this protocol.
+
+The gateway holds the saved repository write token, creates the canonical
+`refs/heads/ormas/job/<task_id>` result and verifies its exact tree and sole base
+parent. For both miners and validators, public-repository jobs clone anonymously;
+private-repository jobs use a per-job read credential, with the Standard/Protected
+service level stated separately. A write credential is absent from their draft
+or assignment. The SDK verifies publication by fetching
+the canonical branch before completion. Replays bind the same artifact and result;
+an ambiguous publication cannot silently become a different commit. Completion
+still uses the existing authenticated endpoint and gateway receipt authority.
+
+The SDK journals the full lease, including its offer id, kind and ceiling, the
+bounded artifact and exact completion before external effects. The saved terminal
+includes the settled price; replay uses it without calling pricing callbacks again.
+After a process restart it resolves the journal before claiming another task;
+it does not call the solver again for that retained lease. Settling retains
+the completion; terminal acknowledgement requires a receipt, and a lost lease
+retains a tombstone. An interruption before the artifact was saved reports aborted
+with an unknown outcome. Corrupt/unsafe journal state refuses further work rather
+than guessing. No journal creates a second queue or settlement receipt.
+
+### Legacy toolchain and repository credentials
 
 `work_packet` may carry an optional **`toolchain`** block the client declared at
 prepare time (protocol addition 2026-09-14):
@@ -234,7 +482,9 @@ Report the outcome.
 `^[a-z0-9./:-]{1,80}$`), `prompt_tokens`, `completion_tokens`,
 `cache_read_input_tokens`, `cache_creation_input_tokens`, `reasoning_tokens`,
 `upstream_cost_usd` (nullable), `finish_reason` (nullable),
-`metering_complete` (bool).
+`metering_complete` (bool). `child_model_ids` is an optional list (defaults to
+empty) for operator diagnostics. Miners do not need to disclose child models or
+their per-job routing to qualify for network acceptance.
 
 **`TaskTerminal`**: `lease_id`, `verification_state` (one of
 `verified/failed/scope_violation/setup_failure/repair_refused/publish_failed/budget_exceeded/aborted`),
@@ -242,7 +492,44 @@ Report the outcome.
 `local:ormas/job/<task_id>` — anything else is rejected), `settlement_state`
 (free-form, not validated server-side today), `rating` (nullable, `"1"`–`"5"`
 as a string), `result_commit` (40-hex sha, required non-empty when
-`verification_state == "verified"`).
+`verification_state == "verified"`). `settled_price_usd` is optional and omitted
+when null. A verified limit delivery supplies a finite value from zero through
+`limit_usd`; the client is charged exactly that price on accepted delivery.
+Firm/legacy terminals and non-deliveries omit `settled_price_usd`.
+
+For a verified limit delivery with a $0.30 ceiling, a terminal example is:
+
+```json
+{
+  "lease_id": "lease-1",
+  "verification_state": "verified",
+  "result_ref": "refs/heads/ormas/job/job-2",
+  "settlement_state": "unset",
+  "rating": null,
+  "result_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "settled_price_usd": 0.05
+}
+```
+
+The first valid settlement is atomically pinned while the lease is running.
+Retries send that same value. Completed replay returns the stored receipt with
+`410` before validating a new settlement value.
+
+All five settlement refusals are HTTP 400 `invalid_request_error`:
+
+| Message | When |
+|---|---|
+| `settled_price_not_allowed:settled_price_usd` | A firm/legacy terminal supplies the field |
+| `settled_price_required:settled_price_usd` | A verified limit delivery omits it |
+| `settled_price_invalid:settled_price_usd` | The value is nonnumeric, boolean, nonfinite or negative |
+| `settled_over_limit:settled_price_usd` | The value exceeds the limit, or the stored ceiling is invalid |
+| `settled_price_mismatch:settled_price_usd` | A running lease supplies a different value after pinning |
+
+Example refusal:
+
+```json
+{"error": {"type": "invalid_request_error", "message": "settled_over_limit:settled_price_usd"}}
+```
 
 **`capture`** (all optional, this route's own allowlist — separate from the
 DTOs above): `status`, `session_id` (≤128 chars), `model_ids` (list[str]),
@@ -262,9 +549,11 @@ diff, prompt, or model output over this route — only its hash and metadata.**
 
 **Response**:
 - `200 {"status": "done"|"failed", "receipt": {...projection...}}` — the
-  projected receipt never includes `pricing`, hidden reserve math, or
-  anything from the forbidden list; it does include `settlement`,
-  `customer_billed_usd`, `debit_status`, `upstream_cost_usd`.
+  projected receipt excludes `pricing` and forbidden fields. It includes
+  `settlement`, `customer_billed_usd`, `debit_status`, `upstream_cost_usd`.
+  Only limit-job receipts also show `offer_kind`, `estimate_usd`, `limit_usd`
+  and `settled_usd`. A paid limit receipt's fields for the terminal above include
+  `{"offer_kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30, "settled_usd": 0.05}`.
 - `202 {"status": "settling", "retry_after_s": N}` — settlement is still in
   flight (e.g. a debit hasn't confirmed); re-send the identical `complete`
   call after `retry_after_s`. This is safe to retry — the server recognizes an
@@ -273,11 +562,40 @@ diff, prompt, or model output over this route — only its hash and metadata.**
   landed); body is the same shape as `200`, safe to treat as authoritative.
 
 Settlement derivation (informational — you do not construct this, the server
-does): `verified` + `scope_ok` + a valid commit → `"paid"`; `verified` but
+does): a verified in-scope delivery with a valid commit can proceed to acceptance.
+Validator-gated jobs await their frozen policy; the legacy same-tenant path
+can settle directly. `verified` but
 `scope_ok=false` → `"no_delivery"`/`scope_violation`; `verified` but an invalid
 commit → `"no_delivery"`/`publish_failed`; any other `verification_state` →
 `"no_delivery"` with a failure class derived from the state (or your own
 `capture.failure_class`, if it's a recognized value for that state).
+
+### Pricing callbacks in the reference skeleton
+
+`MinerConfig.offer_fn` receives each `{job_id, created_at, envelope}` queue entry.
+Return a wire offer (`{job_id, kind: "firm", price_usd}` or
+`{job_id, kind: "limit", estimate_usd, limit_usd}`),
+or `None` to decline. The skeleton lists the queue, collects those offers and
+claims with them. Only a queue HTTP 404 without `error.type` enables the legacy
+`ask_usd` fallback, remembered for the process. A 404 carrying
+`error.type == "not_found_error"` is raised to the operator, as described under
+[Queue](#get-apirunnerv1queuerunner_idassigned-id); other errors also surface.
+Leaving both callbacks unset preserves the legacy `ask_usd` flow.
+
+`MinerConfig.settle_fn(lease, result)` supplies the price for a verified limit
+delivery. It must be deterministic, must not raise, and must return a finite
+nonnegative number, excluding booleans. The skeleton caps it at `lease.limit_usd`;
+when unset, it settles at the limit. An invalid return or a raising hook is
+never silently repriced. On the public (bounded-packet) path the published work
+is held for recovery, no completion is sent, and every later poll re-raises until
+the hook returns a valid price; only a task without a public packet completes as
+`failed`. It sends no settled price for firm leases
+or non-deliveries. Recovery replays the saved completion without solving or repricing.
+
+Set your estimate from the expected cost of your usual recovery chain plus
+margin, and your limit at the worst-case chain. Settle from actual metered cost
+of every attempt plus margin, within that ceiling. You bear
+any loss above it. See the made-up example in [Economics](economics.md).
 
 ### What this package's reference skeleton actually does at completion
 
@@ -292,10 +610,9 @@ it does not trust `solve`'s self-report for anything settlement-relevant:
   missing `upstream_cost_usd` is sent as `None` — the DTO's nullable float —
   never coerced to `0.0`. A missing `provider`/`model` is sent as the literal
   `"unknown"` (an empty string would fail the server's `model` regex). Only
-  the reference solver (`reference_solver.py`) legitimately reports
-  `provider="reference"`, `model="reference-shell-solver"`, all-zero usage,
-  and `metering_complete=True` — because it made no model call — and that
-  comes from the solver's own `SolveResult`, not a skeleton default.
+  the reference solver (`reference_solver.py`) legitimately reports all-zero
+  usage and `metering_complete=True` because it makes no model call. That
+  evidence comes from its own `SolveResult`.
 - **`scope_ok`.** Computed from `git diff --name-only <base_commit>
   <result_commit>` in the workdir — never asserted `True`. `SolveResult
   .changed_paths` (the solver's own report) is used only as a cross-check; a
@@ -308,14 +625,16 @@ it does not trust `solve`'s self-report for anything settlement-relevant:
   `solve` returns — it never trusted a `SolveResult.verified` self-declaration
   (that field no longer exists). Parsing mirrors the private runner's
   `_split_verify_command`: leading POSIX `NAME=value` assignments are
-  stripped into the environment, the remaining argv runs directly with no
-  shell. The child environment is bounded and credential-free — only `PATH`,
-  a fresh scratch `HOME`, and `LANG` cross in; no provider keys, no ambient
-  secrets. When the draft's `work_packet.toolchain` is present, the reference
-  skeleton does not yet provision it (the private miner does); a reference
-  miner that wants to serve such packets should provision `.venv` as described
-  under `TaskDraft` before running the verify. `verification_state` is `"verified"` only when the exit code is 0
-  **and** `scope_ok`; otherwise `"failed"`. The exit code is recorded in
+  stripped into the environment. Both routes run the remaining argv with no shell
+  in a credential-free environment: `PATH`, scratch `HOME`, `LANG`, plus the
+  packet's explicit `NAME=value` assignments. Ambient provider keys and secrets
+  are omitted. The public profile uses a digest-pinned OCI image with
+  `--network none`, `--cap-drop ALL`, `--read-only` and resource limits. When the draft's
+  `work_packet.toolchain` is present, the reference skeleton does not yet
+  provision it (the private miner does); a reference miner serving such packets
+  should provision `.venv` as described under `TaskDraft` before verification.
+  `verification_state` is `"verified"` only when the exit code is 0 **and**
+  `scope_ok`; otherwise `"failed"`. The exit code is recorded in
   `capture.attempts` (`[{"verify_exit_code": N}]`), the same shape the
   private runner uses (`outcomes_worker.py`'s per-attempt projection).
 
@@ -367,25 +686,14 @@ takes a `--sign-command` that reads the challenge on stdin and prints hex).
 | 409 | `hotkey_claimed` | Hotkey already registered to a different miner identity |
 | 503 | `hotkey_verification_unavailable` | Verification subsystem unavailable |
 
-## Known gaps between this doc and the decision record
+## Source and release status
 
-- **Firm asks are live.** The gateway's claim body accepts an optional `ask_usd`
-  (the miner's firm ask) — deployed on `api.ormas.ai` in `gateway-2026.09.11`;
-  the first ask at or under the client's reserve is leased, and an ask above it
-  is recorded and skipped. This package sends it when configured
-  (`client.claim_task(..., ask_usd=...)` / `MinerConfig.ask_usd`, validated
-  locally to the server's rule: finite, ≥ 0, not a bool — a bad value raises
-  `ValueError` before any request). The default `None` keeps the two-field
-  claim body and the server-derived ask (`outcome_price_usd` on the lease).
-- **Validator-quorum settlement runs with a single operator-run validator.**
-  The reference validator ships in this package (`ormas_subnet/validator.py`,
-  `neurons/validator.py`), and the gateway settles a third-party miner's
-  delivery only on unanimous validator acceptance, refusing its claim until a
-  validator count is configured. `api.ormas.ai` is configured for one
-  validator, run by the operator; cross-tenant deliveries settle through its
-  signed decision. Independent validators are not yet admitted, so a
-  production receipt today reflects one operator-run review, not a
-  multi-party quorum.
-- **No reputation feed from this protocol version.** Nothing in this route set
-  writes to a miner-identity reputation history a chain weight could read;
-  that is consequence item 3 in the decision doc, not yet built.
+- **`ask_usd` is live since `gateway-2026.09.11`.** The queue route, offers and
+  limit settlement arrive with the next gateway release. Until then the queue
+  returns 404 without `error.type`, and the skeleton falls back to `ask_usd`.
+- **History-based ranking is planned.** See [Offer ranking](#offer-ranking) for
+  Phase 1 selection and the next phase.
+- **A `paid` receipt on `api.ormas.ai` today reflects one operator-run validator.**
+  The reference checking component ships here. Independent validator admission
+  and the combined public validator service remain release work; see
+  [Public tasks](PUBLIC_TASKS.md).

@@ -20,17 +20,30 @@ not this loop's shape.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .skeleton import GitError, _credential_git_env, _path_covered_by_allowed, _run_git, _run_verify_command
+from .public_acceptance import SUPPORTED_ACCEPTANCE_CONTRACTS, validate_acceptance_contract
+from .skeleton import (
+    GitError,
+    _app_read_expired,
+    _credential_git_env,
+    _refreshed_app_read,
+    _path_covered_by_allowed,
+    _run_git,
+    _run_verify_command,
+)
+from .verification_context import evidence_root
 
 __all__ = [
     "VALIDATOR_PROTOCOL_V1",
@@ -49,6 +62,42 @@ VALIDATOR_PROTOCOL_V1 = "ormas-validator-v1"
 SignFn = Callable[[str], str]
 
 
+# ── execution contract (card 709e2a53) ───────────────────────────────────────
+# COPY of ``tensorbox_spec.customer_api.outcomes_validators``'s shape check
+# (see module docstring — this package never imports tensorbox_spec). Keep the
+# two byte-identical: same key set, same schema_version literal, same
+# 64-lowercase-hex digest rule, same "nonempty dict" requirement per field.
+EXECUTION_CONTRACT_SCHEMA_VERSION = "outcomes.validation-contract.v2"
+_EXECUTION_CONTRACT_PACKET_FIELDS = (
+    "execution_environment", "execution_requirements", "verifier_profile", "verify_base",
+)
+_EXECUTION_CONTRACT_KEYS = frozenset(
+    {"schema_version", "work_packet_sha256", *_EXECUTION_CONTRACT_PACKET_FIELDS},
+)
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_execution_contract_shape(contract: Any) -> None:
+    """Fail closed on anything that isn't exactly the frozen contract shape —
+
+    see the gateway twin for the rationale (never silently drop a malformed
+    or partial contract from signed evidence).
+    """
+    if not isinstance(contract, dict):
+        raise ValueError("execution_contract must be a dict")
+    if set(contract.keys()) != _EXECUTION_CONTRACT_KEYS:
+        raise ValueError("execution_contract has an unexpected key set")
+    if contract.get("schema_version") != EXECUTION_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("execution_contract schema_version mismatch")
+    sha = contract.get("work_packet_sha256")
+    if not isinstance(sha, str) or _SHA256_HEX_RE.fullmatch(sha) is None:
+        raise ValueError("execution_contract work_packet_sha256 must be 64 lowercase hex chars")
+    for field in _EXECUTION_CONTRACT_PACKET_FIELDS:
+        value = contract.get(field)
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"execution_contract.{field} must be a nonempty dict")
+
+
 def canonical_evidence_fields(
     *,
     job_id: str,
@@ -60,6 +109,8 @@ def canonical_evidence_fields(
     allowed_paths: list[str],
     immutable_paths: list[str],
     toolchain: dict | None = None,
+    execution_contract: dict | None = None,
+    acceptance_contract: dict | None = None,
 ) -> dict[str, Any]:
     """The §4.2 evidence fields a validator signs over. Must byte-match the
 
@@ -80,11 +131,54 @@ def canonical_evidence_fields(
     }
     if isinstance(toolchain, dict) and toolchain:
         fields["toolchain"] = toolchain
+    if execution_contract is not None:
+        _validate_execution_contract_shape(execution_contract)
+        fields["execution_contract"] = copy.deepcopy(execution_contract)
+    if acceptance_contract is not None:
+        fields["acceptance_contract"] = validate_acceptance_contract(acceptance_contract)
     return fields
 
 
 class ToolchainUnavailable(RuntimeError):
     """Declared interpreter missing or venv/pip provision failed."""
+
+
+def validate_assignment_execution(assignment: Mapping[str, Any]) -> bool:
+    """Reconstruct the public execution projection before Git or execution.
+
+    The full private packet is intentionally absent from assignments. Its hash
+    is signed alongside these exact fields; the compiler validates the execution
+    projection without needing task text, prices or miner model choices.
+    """
+    contract = assignment.get("execution_contract")
+    if contract is None:
+        return False
+    _validate_execution_contract_shape(contract)
+    from .outcomes_support import validate_public_execution_packet
+
+    for name in ("base_commit", "result_commit"):
+        if not isinstance(assignment.get(name), str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", assignment[name]):
+            raise ValueError("public_assignment_commit_required")
+    for name in ("allowed_paths", "immutable_paths"):
+        paths = assignment.get(name)
+        if not isinstance(paths, list) or not paths or any(
+            not isinstance(path, str) or path.startswith(("/", "~")) or "\\" in path
+            or any(part in ("", ".", "..", ".git") for part in path.rstrip("/").split("/"))
+            for path in paths
+        ):
+            raise ValueError("public_assignment_scope_required")
+    packet = {name: contract[name] for name in _EXECUTION_CONTRACT_PACKET_FIELDS}
+    packet.update(
+        verification_command=assignment.get("verify_command"),
+        task_features={"languages": contract["execution_requirements"].get("languages")},
+        execution_policy={"repo_base_sha": assignment["base_commit"],
+                          "allowed_paths": assignment["allowed_paths"],
+                          "immutable_paths": assignment["immutable_paths"]},
+    )
+    if assignment.get("toolchain") is not None:
+        packet["toolchain"] = assignment["toolchain"]
+    validate_public_execution_packet(packet)
+    return True
 
 
 _TOOLCHAIN_REQ_RE = re.compile(
@@ -250,7 +344,11 @@ class OrmasValidatorClient:
     def register(self, *, pubkey_hex: str) -> dict[str, Any]:
         resp = self._client.post(
             "/api/validator/v1/registrations",
-            json={"schema_version": VALIDATOR_PROTOCOL_V1, "pubkey_hex": pubkey_hex},
+            json={
+                "schema_version": VALIDATOR_PROTOCOL_V1,
+                "pubkey_hex": pubkey_hex,
+                "acceptance_contracts": list(SUPPORTED_ACCEPTANCE_CONTRACTS),
+            },
         )
         resp.raise_for_status()
         return resp.json()
@@ -261,6 +359,15 @@ class OrmasValidatorClient:
         payload = resp.json()
         assignments = payload.get("assignments") if isinstance(payload, Mapping) else None
         return list(assignments) if isinstance(assignments, list) else []
+
+    def read_repository_credential(self, assignment_id: str) -> dict[str, Any]:
+        """``{repo_credential}`` for this checker's current assignment."""
+        resp = self._client.post(
+            f"/api/validator/v1/assignments/{assignment_id}/repo-credential",
+            json={"schema_version": VALIDATOR_PROTOCOL_V1},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def post_decision(self, assignment_id: str, *, decision: str, signature_hex: str) -> dict[str, Any]:
         resp = self._client.post(
@@ -292,6 +399,297 @@ class ValidatorConfig:
     workdir_root: Path
 
 
+@dataclass
+class _ReviewFlight:
+    """One in-flight child review. The signer stays on the parent daemon."""
+
+    proc: Any
+    recv: Any
+    assignment: Mapping[str, Any]
+    digest: str
+
+
+def _with_usable_read_credential(client: Any, assignment: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The assignment with its expired App read token replaced for this checker.
+
+    Only an expired App token is refreshed, through the checker's own assignment.
+    Without a client (a review child) the expired token is kept and the read
+    refuses it. A refused refresh raises ``GitError``.
+    """
+    if not _app_read_expired(assignment.get("repo_credential")) or client is None:
+        return assignment
+    fresh = _refreshed_app_read(
+        lambda: client.read_repository_credential(assignment["assignment_id"]))
+    return {**assignment, "repo_credential": fresh}
+
+
+def _child_sign_refused(digest_hex: str) -> str:
+    raise RuntimeError("validator signing key must not enter a review child")
+
+
+def review_assignment(workdir_root: str, assignment: Mapping[str, Any]) -> str:
+    """Picklable child entry: clone and decide. No client and no signing key.
+
+    ``_clone`` reads ``config.workdir_root`` only. ``_decide`` uses the assignment
+    and the workdir, not the client or the signer.
+    """
+    reviewer = ValidatorDaemon(
+        client=None,  # type: ignore[arg-type]
+        config=ValidatorConfig(workdir_root=Path(workdir_root)),
+        sign_fn=_child_sign_refused,
+    )
+    try:
+        workdir = reviewer._clone(assignment)
+    except GitError:
+        return "error"
+    return reviewer._decide(assignment, workdir)
+
+
+def _child_process_main(
+    send_conn: Any,
+    workdir_root: str,
+    assignment: dict[str, Any],
+    review_fn: Callable[[str, Mapping[str, Any]], str],
+) -> None:
+    """Spawn target. A missing result means the parent posts nothing."""
+    try:
+        try:
+            decision = review_fn(workdir_root, assignment)
+        except GitError:
+            decision = "error"
+        if isinstance(decision, str):
+            send_conn.send(decision)
+    finally:
+        send_conn.close()
+
+
+def _release_process(proc: Any) -> None:
+    if proc.is_alive():
+        return
+    close = getattr(proc, "close", None)
+    if close is not None:
+        close()
+
+
+def _finish_flight(flight: _ReviewFlight, poll_interval_s: float) -> None:
+    flight.proc.join(poll_interval_s)
+    try:
+        flight.recv.close()
+    except OSError:
+        pass
+    _release_process(flight.proc)
+
+
+_STILL_RUNNING = object()
+
+
+@dataclass
+class _PendingPost:
+    """A finished review whose post has not succeeded. Signed once, in the parent."""
+
+    assignment: Mapping[str, Any]
+    digest: str
+    decision: str
+    signature_hex: str
+
+
+def _log_gateway_failure(action: str, exc: BaseException) -> None:
+    """Class and one line. No assignment body and no credential."""
+    text = str(exc)
+    detail = text.splitlines()[0] if text else ""
+    logging.getLogger(__name__).warning("%s failed: %s: %s", action, type(exc).__name__, detail)
+
+
+def _child_result(flight: _ReviewFlight, poll_interval_s: float) -> Any:
+    """Decision string, None if the child died without one, or still running."""
+    if flight.recv.poll():
+        try:
+            message = flight.recv.recv()
+        except (EOFError, OSError):
+            return None
+        return message if isinstance(message, str) else None
+    if not flight.proc.is_alive():
+        flight.proc.join(poll_interval_s)
+        if flight.recv.poll():
+            try:
+                message = flight.recv.recv()
+            except (EOFError, OSError):
+                return None
+            return message if isinstance(message, str) else None
+        return None
+    return _STILL_RUNNING
+
+
+def _remember_post(
+    daemon: ValidatorDaemon,
+    pending: dict[Any, _PendingPost],
+    assignment: Mapping[str, Any],
+    digest: str,
+    decision: str,
+) -> None:
+    aid = assignment["assignment_id"]
+    if aid in pending:
+        return
+    pending[aid] = _PendingPost(
+        assignment=assignment,
+        digest=digest,
+        decision=decision,
+        signature_hex=daemon.sign_fn(digest),
+    )
+
+
+def _retry_pending_posts(
+    daemon: ValidatorDaemon,
+    pending: dict[Any, _PendingPost],
+    posted: set[Any],
+) -> bool:
+    """Retry stored signatures. A failure stays pending and does not raise."""
+    progressed = False
+    for aid, item in list(pending.items()):
+        try:
+            daemon.client.post_decision(
+                aid, decision=item.decision, signature_hex=item.signature_hex,
+            )
+        except Exception as exc:
+            _log_gateway_failure("post_decision", exc)
+            continue
+        posted.add(aid)
+        del pending[aid]
+        progressed = True
+    return progressed
+
+
+def _reap_reviews(
+    daemon: ValidatorDaemon,
+    in_flight: dict[Any, _ReviewFlight],
+    pending: dict[Any, _PendingPost],
+    crashed: set[Any],
+    deferred: set[Any],
+    poll_interval_s: float,
+) -> bool:
+    """Collect finished children. A dead child is not posted and not restarted here."""
+    done: list[Any] = []
+    for aid, flight in in_flight.items():
+        decision = _child_result(flight, poll_interval_s)
+        if decision is _STILL_RUNNING:
+            continue
+        if isinstance(decision, str):
+            _remember_post(daemon, pending, flight.assignment, flight.digest, decision)
+        else:
+            crashed.add(aid)
+            deferred.add(aid)
+        _finish_flight(flight, poll_interval_s)
+        done.append(aid)
+    for aid in done:
+        del in_flight[aid]
+    return bool(done)
+
+
+def _dispatch_reviews(
+    daemon: ValidatorDaemon,
+    ctx: Any,
+    in_flight: dict[Any, _ReviewFlight],
+    pending: dict[Any, _PendingPost],
+    posted: set[Any],
+    crashed: set[Any],
+    deferred: set[Any],
+    assignments: list[Any],
+    slots: int,
+) -> int:
+    """Start reviews while a slot is free. Never-attempted rows go first."""
+    fresh: list[Any] = []
+    again: list[Any] = []
+    for assignment in assignments:
+        aid = assignment["assignment_id"]
+        if aid in in_flight or aid in posted or aid in pending or aid in deferred:
+            continue
+        if aid in crashed:
+            again.append(assignment)
+        else:
+            fresh.append(assignment)
+    started = 0
+    for assignment in [*fresh, *again]:
+        if len(in_flight) >= slots:
+            break
+        aid = assignment["assignment_id"]
+        kind, digest = daemon._preface(assignment)
+        if kind == "skip" or digest is None:
+            continue
+        if kind == "error":
+            _remember_post(daemon, pending, assignment, digest, "error")
+            started += 1
+            continue
+        # The child has no client or bearer; hand it a usable read credential.
+        try:
+            readable = _with_usable_read_credential(daemon.client, assignment)
+        except GitError:
+            continue  # nothing posted; a later poll may try this assignment again
+        payload = copy.deepcopy(dict(readable))
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        # Look up the entry here so a test can substitute a picklable fake.
+        # The signing key is not an argument.
+        proc = ctx.Process(
+            target=_child_process_main,
+            args=(send_conn, str(daemon.config.workdir_root), payload, review_assignment),
+            name=f"ormas-validator-{aid}",
+            daemon=True,
+        )
+        try:
+            proc.start()
+        except Exception:
+            send_conn.close()
+            recv_conn.close()
+            raise
+        send_conn.close()
+        in_flight[aid] = _ReviewFlight(
+            proc=proc, recv=recv_conn, assignment=assignment, digest=digest,
+        )
+        started += 1
+    return started
+
+
+def _fill_slots(
+    daemon: ValidatorDaemon,
+    ctx: Any,
+    in_flight: dict[Any, _ReviewFlight],
+    pending: dict[Any, _PendingPost],
+    posted: set[Any],
+    crashed: set[Any],
+    deferred: set[Any],
+    slots: int,
+) -> int:
+    """List, then start work. A list failure leaves current children alone."""
+    if len(in_flight) >= slots:
+        return 0
+    try:
+        assignments = daemon.client.list_assignments()
+    except Exception as exc:
+        _log_gateway_failure("list_assignments", exc)
+        assignments = []
+    started = _dispatch_reviews(
+        daemon, ctx, in_flight, pending, posted, crashed, deferred, assignments, slots,
+    )
+    # Crashes from this poll wait until this list call has returned.
+    deferred.clear()
+    return started
+
+
+def _stop_reviews(in_flight: dict[Any, _ReviewFlight], poll_interval_s: float) -> None:
+    for flight in in_flight.values():
+        if flight.proc.is_alive():
+            flight.proc.terminate()
+        flight.proc.join(poll_interval_s)
+        if flight.proc.is_alive():
+            flight.proc.kill()
+            flight.proc.join(poll_interval_s)
+        try:
+            flight.recv.close()
+        except OSError:
+            pass
+        _release_process(flight.proc)
+    in_flight.clear()
+
+
 class ValidatorDaemon:
     """Poll -> clone -> re-verify base(non-zero)+result(zero) -> scope check -> sign -> post.
 
@@ -315,12 +713,26 @@ class ValidatorDaemon:
             shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if validate_assignment_execution(assignment):
+                from .outcomes_support import validate_repository_credential, repository_git, public_git
+                visibility = assignment['execution_contract']['execution_requirements']['repository_visibility']
+                repo_url, credential = assignment.get('repo_url'), assignment.get('repo_credential')
+                if visibility == 'private' and _app_read_expired(credential):
+                    credential = _with_usable_read_credential(
+                        self.client, assignment)["repo_credential"]
+                validate_repository_credential(visibility, repo_url, credential)
+                args = ['clone', '--no-checkout', repo_url, str(workdir)]
+                if visibility == 'private':
+                    repository_git(args, cwd=workdir.parent, repo_url=repo_url, credential=credential)
+                else:
+                    public_git(args, cwd=workdir.parent)
+                return workdir
             # The read credential is served by the gateway per assignment and exists on disk only for this clone; later checkout/diff need no credential.
             with _credential_git_env(assignment.get("repo_credential")) as env:
                 _run_git(["clone", str(assignment["repo_url"]), str(workdir)], cwd=workdir.parent, env=env)
-        except GitError:
+        except (GitError, ValueError, OSError, subprocess.SubprocessError):
             shutil.rmtree(workdir, ignore_errors=True)  # drop git's partial clone
-            raise
+            raise GitError('repository clone failed') from None
         return workdir
 
     def _decide(self, assignment: Mapping[str, Any], workdir: Path) -> str:
@@ -330,28 +742,70 @@ class ValidatorDaemon:
         failure); it is excluded from quorum (``outcomes_validators.resolve_quorum``)
         rather than counted against the miner.
         """
-        # The provisioned .venv is untracked, so the scope check (git diff --name-only base..result) is unaffected.
         try:
-            prefix = provision_toolchain(assignment.get("toolchain"), workdir)
-        except ToolchainUnavailable:
+            public_execution = validate_assignment_execution(assignment)
+            prefix = None if public_execution else provision_toolchain(assignment.get("toolchain"), workdir)
+        except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError):
             return "error"
         base_commit = str(assignment["base_commit"])
         result_commit = str(assignment["result_commit"])
         verify_command = str(assignment["verify_command"])
         allowed = list(assignment.get("allowed_paths") or [])
         immutable = list(assignment.get("immutable_paths") or [])
+        validation_run_id = uuid.uuid4().hex
+
+        def scope_valid():
+            diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
+            changed = [p for p in diff_out.splitlines() if p]
+            return not any(_path_covered_by_allowed(p, immutable) for p in changed) and (
+                not allowed or all(_path_covered_by_allowed(p, allowed) for p in changed))
+
+        if public_execution:
+            try:
+                if not scope_valid():
+                    return "reject"
+            except GitError:
+                return "error"
 
         try:
             _run_git(["checkout", base_commit], cwd=workdir)
         except GitError:
             return "error"
-        base_exit = _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix)
+        def verify(phase):
+            if evidence_root(verify_command) is None:
+                return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
+                                           raise_setup_errors=True)
+            return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
+                                       raise_setup_errors=True, evidence_identity={
+                "job_id": assignment.get("job_id"), "role": "validator",
+                "assignment_id": assignment.get("assignment_id"), "phase": phase,
+                "validation_run_id": validation_run_id,
+                "evidence_digest_sha256": assignment.get("evidence_digest_sha256"),
+            })
+
+        try:
+            base_exit = verify("base")
+        except (ValueError, OSError):
+            return "error"
+        if public_execution and base_exit != 86:
+            # The frozen preflight could not be reproduced. An already-green
+            # or broken base is no evidence of a miner's implementation quality.
+            return "error"
+        if evidence_root(verify_command) is not None and base_exit in (74, 127):
+            return "error"  # A capture/setup refusal is not an intended red base.
 
         try:
             _run_git(["checkout", result_commit], cwd=workdir)
         except GitError:
             return "error"
-        result_exit = _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix)
+        try:
+            result_exit = verify("result")
+        except (ValueError, OSError):
+            return "error"
+        if public_execution:
+            return {0: "accept", 86: "reject"}.get(result_exit, "error")
+        if evidence_root(verify_command) is not None and result_exit in (74, 127):
+            return "error"
 
         try:
             diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
@@ -374,37 +828,214 @@ class ValidatorDaemon:
             return "reject"
         return "accept"
 
+    def _preface(self, assignment: Mapping[str, Any]) -> tuple[str, str | None]:
+        """Parent-only gate: digest check before any clone.
+
+        ``skip`` — no digest to sign (same as today's early return). ``error`` —
+        sign and post ``error`` without a repository. ``review`` — clone and decide.
+        """
+        expected_digest = assignment.get("evidence_digest_sha256")
+        if not isinstance(expected_digest, str) or _SHA256_HEX_RE.fullmatch(expected_digest) is None:
+            # There is no valid assignment identity to acknowledge. Never sign
+            # an invented empty digest or access a repository for this row.
+            return ("skip", None)
+        try:
+            fields = canonical_evidence_fields(
+                job_id=str(assignment["job_id"]),
+                miner_id=str(assignment["miner_id"]),
+                base_commit=str(assignment["base_commit"]),
+                result_commit=str(assignment["result_commit"]),
+                repo_url=assignment.get("repo_url"),
+                verify_command=str(assignment["verify_command"]),
+                allowed_paths=list(assignment.get("allowed_paths") or []),
+                immutable_paths=list(assignment.get("immutable_paths") or []),
+                toolchain=(
+                    assignment.get("toolchain") if isinstance(assignment.get("toolchain"), dict) else None
+                ),
+                execution_contract=assignment.get("execution_contract"),
+                acceptance_contract=assignment.get("acceptance_contract"),
+            )
+            digest = evidence_digest_hex(fields)
+            if digest != expected_digest:
+                raise ValueError("assignment_evidence_mismatch")
+            validate_assignment_execution(assignment)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return ("error", expected_digest)
+        return ("review", expected_digest)
+
+    def _sign_and_post(self, assignment: Mapping[str, Any], digest: str, decision: str) -> None:
+        # An error acknowledges the original assignment identity, including a
+        # malformed contract. It cannot enter the acceptance quorum, and avoids
+        # retrying a deterministic invalid assignment through an empty signature.
+        signature_hex = self.sign_fn(digest)
+        self.client.post_decision(
+            assignment["assignment_id"], decision=decision, signature_hex=signature_hex,
+        )
+
     def run_once(self) -> bool:
         """Review one pending assignment if any. False when idle."""
         assignments = self.client.list_assignments()
         if not assignments:
             return False
         assignment = assignments[0]
-        try:
-            workdir = self._clone(assignment)
-        except GitError:
-            # The validator could not obtain the repo — its own review failed,
-            # so this is an "error" decision (see _decide), never a crash.
-            decision = "error"
-        else:
-            decision = self._decide(assignment, workdir)
-
-        fields = canonical_evidence_fields(
-            job_id=str(assignment["job_id"]),
-            miner_id=str(assignment["miner_id"]),
-            base_commit=str(assignment["base_commit"]),
-            result_commit=str(assignment["result_commit"]),
-            repo_url=assignment.get("repo_url"),
-            verify_command=str(assignment["verify_command"]),
-            allowed_paths=list(assignment.get("allowed_paths") or []),
-            immutable_paths=list(assignment.get("immutable_paths") or []),
-            toolchain=assignment.get("toolchain") if isinstance(assignment.get("toolchain"), dict) else None,
-        )
-        digest = evidence_digest_hex(fields)
-        if digest != assignment.get("evidence_digest_sha256"):
-            # The assignment we reviewed doesn't match what the gateway signed
-            # over — never sign a decision on evidence we can't reproduce.
-            decision = "error"
-        signature_hex = self.sign_fn(digest)
-        self.client.post_decision(assignment["assignment_id"], decision=decision, signature_hex=signature_hex)
+        kind, digest = self._preface(assignment)
+        if kind == "skip" or digest is None:
+            return True
+        decision = "error"
+        if kind == "review":
+            try:
+                workdir = self._clone(assignment)
+            except GitError:
+                pass
+            else:
+                decision = self._decide(assignment, workdir)
+        self._sign_and_post(assignment, digest, decision)
         return True
+
+    def serve(
+        self,
+        slots: int,
+        poll_interval_s: float,
+        *,
+        until: Callable[[], bool] | None = None,
+    ) -> None:
+        """Review until stopped. One slot stays inline; more slots use child processes."""
+        import time
+
+        if slots == 1:
+            while True:
+                if until is not None and until():
+                    return
+                worked = self.run_once()
+                if until is not None and until():
+                    return
+                if not worked:
+                    time.sleep(poll_interval_s)
+            return
+        self._serve_parallel(slots, poll_interval_s, until=until)
+
+    def _serve_parallel(
+        self,
+        slots: int,
+        poll_interval_s: float,
+        *,
+        until: Callable[[], bool] | None,
+    ) -> None:
+        """Up to ``slots`` reviews at once. Each review is its own process."""
+        import multiprocessing
+        import time
+
+        ctx = multiprocessing.get_context("spawn")
+        in_flight: dict[Any, _ReviewFlight] = {}
+        pending: dict[Any, _PendingPost] = {}
+        posted: set[Any] = set()
+        crashed: set[Any] = set()
+        deferred: set[Any] = set()
+        try:
+            while True:
+                finished = _reap_reviews(
+                    self, in_flight, pending, crashed, deferred, poll_interval_s,
+                )
+                posted_now = _retry_pending_posts(self, pending, posted)
+                dispatched = _fill_slots(
+                    self, ctx, in_flight, pending, posted, crashed, deferred, slots,
+                )
+                posted_now = posted_now or _retry_pending_posts(self, pending, posted)
+                if until is not None and until():
+                    return
+                if finished or posted_now or dispatched:
+                    continue
+                if in_flight:
+                    multiprocessing.connection.wait(
+                        [flight.recv for flight in in_flight.values()],
+                        timeout=poll_interval_s,
+                    )
+                else:
+                    time.sleep(poll_interval_s)
+        finally:
+            _stop_reviews(in_flight, poll_interval_s)
+
+
+def _load_cli_secret(*, token_env: str | None, token_path: str | None) -> str:
+    """Read a service credential without following links or exposing its bytes."""
+    import os
+    import stat
+
+    from .client import load_token
+
+    if token_path is None:
+        return load_token(token_env=token_env)
+    error = "validator credential must be a private regular file owned by the service user"
+    if not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError(error)
+    try:
+        fd = os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) not in (0o400, 0o600) or info.st_size > 8192):
+                raise ValueError(error)
+            value = os.read(fd, 8193).decode("utf-8").strip()
+            if not value or len(value) > 8192:
+                raise ValueError(error)
+            return value
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeError):
+        raise ValueError(error) from None
+
+
+def _positive_slot_count(value: str) -> int:
+    import argparse
+
+    if not re.fullmatch(r"[0-9]+", value):
+        raise argparse.ArgumentTypeError("--slots must be a positive integer")
+    slots = int(value, 10)
+    if slots < 1:
+        raise argparse.ArgumentTypeError("--slots must be a positive integer")
+    return slots
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the installed task-checker component of the SN76 validator."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ormas SN76 task validator")
+    parser.add_argument("--gateway", required=True, help="Gateway base URL")
+    token_args = parser.add_mutually_exclusive_group(required=True)
+    token_args.add_argument("--token-env", help="Env var holding the validator bearer token")
+    token_args.add_argument("--token-file", help="Private file holding the validator bearer token")
+    key_args = parser.add_mutually_exclusive_group(required=True)
+    key_args.add_argument("--private-key-env", help="Env var holding the hex Ed25519 decision key")
+    key_args.add_argument("--private-key-file", help="Private file holding the hex Ed25519 decision key")
+    parser.add_argument("--workdir-root", default=str(Path.cwd() / "ormas-validator-work"))
+    parser.add_argument("--once", action="store_true", help="Review one assignment, exit 3 if idle")
+    parser.add_argument(
+        "--slots", type=_positive_slot_count, default=1,
+        help="assignment reviews at once (default: 1)",
+    )
+    parser.add_argument("--poll-interval-s", type=float, default=15.0)
+    args = parser.parse_args(argv)
+    if not 0 < args.poll_interval_s < float("inf"):
+        parser.error("--poll-interval-s must be finite and positive")
+    token = _load_cli_secret(token_env=args.token_env, token_path=args.token_file)
+    if args.token_env:
+        os.environ.pop(args.token_env, None)
+    private_key = _load_cli_secret(token_env=args.private_key_env, token_path=args.private_key_file)
+    if args.private_key_env:
+        os.environ.pop(args.private_key_env, None)
+    sign_fn, pubkey = make_ed25519_signer(private_key)
+    client = OrmasValidatorClient(base_url=args.gateway, token=token)
+    try:
+        daemon = ValidatorDaemon(client, ValidatorConfig(workdir_root=Path(args.workdir_root)), sign_fn)
+        daemon.register(pubkey_hex=pubkey)
+        if args.once:
+            return 0 if daemon.run_once() else 3
+        daemon.serve(args.slots, args.poll_interval_s)
+        return 0
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

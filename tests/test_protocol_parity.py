@@ -9,6 +9,8 @@ private module is ground truth, since it's what the server enforces).
 from __future__ import annotations
 
 from dataclasses import fields
+from pathlib import Path
+import sys
 
 import pytest
 
@@ -16,6 +18,9 @@ from ormas_subnet import protocol as public
 
 # Ground truth lives in the private monorepo; standalone checkouts of the public
 # repo skip this guard, the monorepo runs it on every change.
+monorepo = Path(__file__).resolve().parents[2]
+if (monorepo / "tensorbox_spec/mcp_server/ormas_http_client.py").is_file():
+    sys.path.insert(0, str(monorepo))
 private = pytest.importorskip("tensorbox_spec.mcp_server.ormas_http_client")
 
 DTO_NAMES = [
@@ -63,6 +68,19 @@ def test_to_wire_round_trips_identically(name: str) -> None:
     pub_wire = pub_cls(**sample).to_wire()
     priv_wire = priv_cls(**sample).to_wire()
     assert pub_wire == priv_wire
+    if name == "TaskLease":
+        legacy = {k: v for k, v in priv_wire.items()
+                  if k not in {"bid_id", "offer_kind", "estimate_usd", "limit_usd"}}
+        assert pub_cls.from_wire(legacy).to_wire() == priv_cls.from_wire(legacy).to_wire()
+        limit = {**sample, "bid_id": "bid1", "offer_kind": "limit",
+                 "estimate_usd": 0.04, "limit_usd": 0.05}
+        assert pub_cls(**limit).to_wire() == priv_cls(**limit).to_wire()
+        assert pub_cls.from_wire(priv_cls(**limit).to_wire()).to_wire() == priv_cls(**limit).to_wire()
+    if name == "TaskTerminal":
+        assert "settled_price_usd" not in pub_wire
+        zero = {**sample, "settled_price_usd": 0.0}
+        assert pub_cls(**zero).to_wire() == priv_cls(**zero).to_wire()
+        assert pub_cls.from_wire(priv_wire).to_wire() == priv_wire
 
 
 def _sample_for(name: str) -> dict:
@@ -112,3 +130,26 @@ def _sample_for(name: str) -> dict:
             rating=None, result_commit="c" * 40,
         )
     raise AssertionError(f"no sample for {name}")
+
+
+_TOKEN = "ghs_parity-repr-SECRET-token"
+
+
+@pytest.mark.parametrize("module", [public, private], ids=["public", "private"])
+def test_task_draft_repr_never_shows_repo_credential_token(module) -> None:
+    credential = {"kind": "github_app_read_token", "scope": "read",
+                  "repository_url": "https://github.com/acme/demo.git", "repository_id": 42,
+                  "token": _TOKEN, "expires_at": "2026-09-29T01:00:00+00:00"}
+    draft = module.TaskDraft(**{**_sample_for("TaskDraft"), "repo_credential": credential})
+    assert _TOKEN not in repr(draft) and _TOKEN not in str(draft)
+    # Equality and serialization still carry the credential unchanged.
+    assert draft.to_wire()["repo_credential"] == credential
+    assert draft == module.TaskDraft(**{**_sample_for("TaskDraft"), "repo_credential": credential})
+    assert draft != module.TaskDraft(**{**_sample_for("TaskDraft"),
+                                        "repo_credential": {**credential, "token": "other"}})
+
+
+def test_task_draft_repr_and_compare_flags_match() -> None:
+    pub = {f.name: (f.repr, f.compare) for f in fields(public.TaskDraft)}
+    priv = {f.name: (f.repr, f.compare) for f in fields(private.TaskDraft)}
+    assert pub == priv

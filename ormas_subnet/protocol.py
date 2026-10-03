@@ -17,9 +17,11 @@ logic itself.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
+
+from .public_acceptance import validate_acceptance_contract
 
 RUNNER_PROTOCOL_V1 = "ormas-runner-v1"
 RUNNER_DEVICE_HEADER = "X-Ormas-Runner-Device"
@@ -214,8 +216,12 @@ class TaskDraft(_RunnerWireDTO):
     # never a token); empty when a bound repo_id already covers it.
     repo_url: str = ""
     # Served once on the claim response over the authenticated runner channel;
-    # never persisted or logged; mirrors the gateway's TaskDraft.
-    repo_credential: Mapping[str, Any] | None = None
+    # never persisted or logged; mirrors the gateway's TaskDraft. Excluded
+    # from repr so a logged draft never shows the token.
+    repo_credential: Mapping[str, Any] | None = field(default=None, repr=False)
+    # Frozen server-owned public acceptance policy and claim plan. Legacy jobs
+    # omit this field entirely; public jobs require the qualified extension.
+    acceptance_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "allowed_paths", tuple(self.allowed_paths))
@@ -223,6 +229,13 @@ class TaskDraft(_RunnerWireDTO):
         object.__setattr__(self, "repair_findings", tuple(self.repair_findings))
         if self.repo_credential is not None:
             object.__setattr__(self, "repo_credential", MappingProxyType(dict(self.repo_credential)))
+        contract = self.acceptance_contract
+        if contract is not None:
+            object.__setattr__(
+                self,
+                "acceptance_contract",
+                MappingProxyType(validate_acceptance_contract(dict(contract))),
+            )
         evidence = self.repair_evidence
         if evidence is None:
             object.__setattr__(self, "repair_evidence", None)
@@ -243,6 +256,12 @@ class TaskDraft(_RunnerWireDTO):
             payload.pop("repo_credential", None)
         else:
             payload["repo_credential"] = dict(self.repo_credential)
+        if self.acceptance_contract is None:
+            payload.pop("acceptance_contract", None)
+        else:
+            payload["acceptance_contract"] = validate_acceptance_contract(
+                dict(self.acceptance_contract)
+            )
         return payload
 
     @classmethod
@@ -253,6 +272,7 @@ class TaskDraft(_RunnerWireDTO):
         data.setdefault("repair_evidence", None)
         data.setdefault("repo_url", "")
         data.setdefault("repo_credential", None)
+        data.setdefault("acceptance_contract", None)
         return super().from_wire(data)
 
 
@@ -267,6 +287,32 @@ class TaskLease(_RunnerWireDTO):
     hold_ref: str
     now: str
     outcome_price_usd: float
+    # Opaque id the miner sent on the claim that created this lease.
+    # Omitted on the wire when the claim did not send one.
+    claim_request_id: str | None = None
+    bid_id: str | None = None
+    offer_kind: str = "firm"
+    # Limit offers: the miner's expected charge, at or below ``limit_usd``.
+    estimate_usd: float | None = None
+    limit_usd: float | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        payload = super().to_wire()
+        if self.claim_request_id is None:
+            payload.pop("claim_request_id", None)
+        return payload
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> TaskLease:
+        if not isinstance(payload, Mapping):
+            raise ValueError("payload must be a mapping")
+        data = dict(payload)
+        data.setdefault("claim_request_id", None)
+        data.setdefault("bid_id", None)
+        data.setdefault("offer_kind", "firm")
+        data.setdefault("estimate_usd", None)
+        data.setdefault("limit_usd", None)
+        return super().from_wire(data)
 
 
 @dataclass(frozen=True)
@@ -282,7 +328,7 @@ class TaskReceipt(_RunnerWireDTO):
     lease_id: str
     generation_ids: tuple[str, ...] | list[str]
     actual_provider: str
-    model: str
+    model: str | None
     prompt_tokens: int
     completion_tokens: int
     cache_read_input_tokens: int
@@ -291,9 +337,27 @@ class TaskReceipt(_RunnerWireDTO):
     upstream_cost_usd: float | None
     finish_reason: str | None
     metering_complete: bool
+    # Optional diagnostics for an operator that elects to report child models.
+    # Network acceptance never requires disclosure of a miner's model routing.
+    child_model_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "generation_ids", tuple(self.generation_ids))
+        object.__setattr__(self, "child_model_ids", tuple(self.child_model_ids))
+
+    def to_wire(self) -> dict[str, Any]:
+        payload = super().to_wire()
+        if payload.get("model") is None:
+            payload.pop("model", None)
+        return payload
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> TaskReceipt:
+        if not isinstance(payload, Mapping):
+            raise ValueError("payload must be a mapping")
+        data = dict(payload)
+        data.setdefault("model", None)
+        return super().from_wire(data)
 
 
 @dataclass(frozen=True)
@@ -304,3 +368,19 @@ class TaskTerminal(_RunnerWireDTO):
     settlement_state: str
     rating: str | None
     result_commit: str
+    # Limit offers only: omitted on the wire when None.
+    settled_price_usd: float | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        payload = super().to_wire()
+        if payload.get("settled_price_usd") is None:
+            payload.pop("settled_price_usd", None)
+        return payload
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> TaskTerminal:
+        if not isinstance(payload, Mapping):
+            raise ValueError("payload must be a mapping")
+        data = dict(payload)
+        data.setdefault("settled_price_usd", None)
+        return super().from_wire(data)
