@@ -34,9 +34,9 @@ an offer above it is recorded and skipped and the job stays queued.
 Estimate the expected cost of your usual recovery chain plus margin, and set the limit at your
 worst-case chain. Settle at your actual metered chain cost plus margin within the limit. You bear any excess; see [Economics](economics.md).
 
-`ask_usd` is live since `gateway-2026.09.11`. The queue route, offers and limit
-settlement arrive with the next gateway release. Until then the queue returns
-404 without `error.type`, and the skeleton falls back to `ask_usd`.
+`ask_usd` is live since `gateway-2026.09.11`; the queue route, offers and limit
+settlement are live since `gateway-2026.10.03`. Against an older gateway the queue
+returns 404 without `error.type`, and the skeleton falls back to `ask_usd`.
 
 **What can I see before offering?**
 `list_queue(runner_id)` returns job ids, creation times and privacy-safe task shapes. The exact

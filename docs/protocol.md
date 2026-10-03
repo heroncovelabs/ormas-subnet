@@ -688,9 +688,9 @@ takes a `--sign-command` that reads the challenge on stdin and prints hex).
 
 ## Source and release status
 
-- **`ask_usd` is live since `gateway-2026.09.11`.** The queue route, offers and
-  limit settlement arrive with the next gateway release. Until then the queue
-  returns 404 without `error.type`, and the skeleton falls back to `ask_usd`.
+- **`ask_usd` is live since `gateway-2026.09.11`; the queue route, offers and
+  limit settlement are live since `gateway-2026.10.03`.** Against an older gateway
+  the queue returns 404 without `error.type`, and the skeleton falls back to `ask_usd`.
 - **History-based ranking is planned.** See [Offer ranking](#offer-ranking) for
   Phase 1 selection and the next phase.
 - **A `paid` receipt on `api.ormas.ai` today reflects one operator-run validator.**
