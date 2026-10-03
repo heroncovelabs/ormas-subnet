@@ -23,14 +23,14 @@ contacted anywhere in this page.
 
 ## What this does NOT prove
 
-- **No validators.** `LocalGateway` derives settlement the way the production
-  gateway does *today*, for our own trusted miner: from the miner's own
-  reported `verification_state` plus the scope check. It does not run the
-  reference validator's independent re-check, and it does not implement
-  validator-quorum settlement (see `README.md` "Known gaps" and
-  `docs/DECISIONS.md` §8 for that path).
-- **No pricing.** `LocalGateway`'s `outcome_price_usd` / `customer_billed_usd`
-  are fixed demo numbers. Nothing here reflects real firm-ask pricing.
+- **Validator acceptance.** `LocalGateway` settles from the miner's reported
+  `verification_state` and scope check. Bounded-packet (public-profile) gateway jobs require their
+  frozen validator policy. This demo exercises neither validator assignment
+  nor quorum settlement; see [release gaps](../README.md#release-gaps).
+- **No firm/limit pricing.** `LocalGateway`'s `outcome_price_usd` and
+  `customer_billed_usd` are fixed demo numbers. It has no queue or offers
+  route. Use [protocol.md](protocol.md) for real firm/limit offers and
+  settlement. [History-based ranking](protocol.md#offer-ranking) is planned.
 - **No real gateway.** `LocalGateway` has no auth, no persistence beyond one
   process, and hands out exactly one seeded job. It is a protocol-shape
   double, not a reimplementation of the gateway.

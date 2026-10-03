@@ -32,6 +32,51 @@ from .protocol import (
 
 __all__ = ["OrmasMinerClient", "OrmasGatewayError", "load_token"]
 
+# Mirrors the gateway's ``runner_api.CLAIM_PAGE_LIMIT``: the most offers one claim may carry.
+CLAIM_PAGE_LIMIT = 20
+
+
+def _positive_usd(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value)) and value > 0
+    except OverflowError:
+        return False
+
+
+def _validate_offers(offers: Any) -> None:
+    """Raise ``ValueError`` unless ``offers`` is a wire body the gateway accepts.
+
+    Mirrors ``runner_api._parse_offers``: a firm offer is exactly
+    ``{job_id, kind, price_usd}``; a limit offer is exactly
+    ``{job_id, kind, estimate_usd, limit_usd}`` with ``0 < estimate_usd <= limit_usd``.
+    """
+    if not isinstance(offers, list) or len(offers) > CLAIM_PAGE_LIMIT:
+        raise ValueError(f"offers must be a list of at most {CLAIM_PAGE_LIMIT} entries")
+    seen: set[str] = set()
+    for offer in offers:
+        if not isinstance(offer, dict):
+            raise ValueError("each offer must be a dict")
+        job_id, kind = offer.get("job_id"), offer.get("kind")
+        if not isinstance(job_id, str) or not job_id or job_id in seen:
+            raise ValueError("each offer needs a unique non-empty string job_id")
+        seen.add(job_id)
+        if kind == "firm":
+            fields: tuple[str, ...] = ("price_usd",)
+        elif kind == "limit":
+            fields = ("estimate_usd", "limit_usd")
+        else:
+            raise ValueError("offer kind must be 'firm' or 'limit'")
+        if set(offer) != {"job_id", "kind", *fields}:
+            raise ValueError(f"a {kind} offer has exactly job_id, kind and {' and '.join(fields)}")
+        for field in fields:
+            if not _positive_usd(offer[field]):
+                raise ValueError(f"{field} must be a finite, positive number")
+        # The gateway compares float-normalized amounts.
+        if kind == "limit" and float(offer["estimate_usd"]) > float(offer["limit_usd"]):
+            raise ValueError("estimate_usd must be at most limit_usd")
+
 
 class OrmasGatewayError(RuntimeError):
     """An HTTP error from the gateway, carrying its structured error body.
@@ -191,20 +236,50 @@ class OrmasMinerClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def list_queue(self, runner_id: str) -> dict[str, Any]:
+        """GET /api/runner/v1/queue — privacy-safe entries with job_id and envelope.
+
+        Non-2xx responses raise ``OrmasGatewayError``. Only a 404 without
+        ``error.type`` signals an older gateway without this route; a typed 404
+        such as ``not_found_error`` (unknown runner, or no priced binding) is an
+        ordinary error.
+        """
+        from urllib.parse import quote
+
+        path = f"/api/runner/v1/queue?runner_id={quote(str(runner_id), safe='')}"
+        headers = self._headers()
+        resp = self._client.get(path) if headers is None else self._client.get(path, headers=headers)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("invalid queue payload")
+        return payload
+
     def claim_task(
         self, runner_id: str, *, ask_usd: float | None = None,
+        offers: list[dict[str, Any]] | None = None,
+        claim_request_id: str | None = None,
     ) -> tuple[TaskLease, TaskDraft] | None:
         """POST /api/runner/v1/leases — typed lease+draft, or None when idle (HTTP 204).
 
-        ``ask_usd`` is the miner's optional firm bid for any job leased on this
-        call (mirrors the private ``OrmAsGatewayClient.claim_task``); omitted keeps
-        the server's own derived-ask pricing and a byte-identical wire body.
-        An ask at or under the client's reserve is leased and becomes the price;
-        an ask above it is recorded and the job is skipped (see
-        ``docs/protocol.md``). A bad value (non-numeric, a bool, non-finite, or
-        negative) raises ``ValueError`` here before any request is sent — the
-        server rejects the same values (``runner_api.claim_lease``).
+        ``ask_usd`` is an optional legacy firm bid. Omitting it keeps the
+        byte-identical claim body. Non-numeric, bool, non-finite or negative
+        asks raise ``ValueError`` before any request.
+
+        ``offers`` contains per-job ``{job_id, kind: "firm", price_usd}`` or
+        ``{job_id, kind: "limit", estimate_usd, limit_usd}`` dicts
+        (``0 < estimate_usd <= limit_usd``) and cannot be combined with
+        ``ask_usd``. Malformed
+        offers, more than ``CLAIM_PAGE_LIMIT`` entries or a duplicate ``job_id``
+        raise ``ValueError`` before any request. An empty list declines new jobs
+        but can resume a live lease.
+
+        ``claim_request_id`` is an optional opaque id for this claim request.
+        It is sent only when provided. The returned lease exposes the gateway's
+        echo when present.
         """
+        if offers is not None and ask_usd is not None:
+            raise ValueError("offers cannot be combined with ask_usd")
         if ask_usd is not None and (
             not isinstance(ask_usd, (int, float))
             or isinstance(ask_usd, bool)
@@ -212,9 +287,15 @@ class OrmasMinerClient:
             or ask_usd < 0
         ):
             raise ValueError("ask_usd must be a finite, non-negative number")
+        if offers is not None:
+            _validate_offers(offers)
         body: dict[str, Any] = {"schema_version": RUNNER_PROTOCOL_V1, "runner_id": runner_id}
-        if ask_usd is not None:
+        if offers is not None:
+            body["offers"] = [dict(offer) for offer in offers]
+        elif ask_usd is not None:
             body["ask_usd"] = float(ask_usd)
+        if claim_request_id is not None:
+            body["claim_request_id"] = claim_request_id
         resp = self._post("/api/runner/v1/leases", body)
         self._raise_for_status(resp)
         if getattr(resp, "status_code", None) == 204:
@@ -249,6 +330,33 @@ class OrmasMinerClient:
         resp = self._post(f"/api/runner/v1/leases/{task_id}/heartbeat", body)
         self._raise_for_status(resp)
         return resp.json()
+
+    def read_repository_credential(
+        self, task_id: str, runner_id: str, lease_token: str,
+    ) -> dict[str, Any]:
+        """POST /api/runner/v1/leases/{task_id}/repo-credential — ``{repo_credential}``
+        for the live lease. It does not renew the lease."""
+        task_id = require_task_id(task_id)
+        body: dict[str, Any] = {
+            "schema_version": RUNNER_PROTOCOL_V1,
+            "runner_id": runner_id,
+            "lease_token": lease_token,
+        }
+        resp = self._post(f"/api/runner/v1/leases/{task_id}/repo-credential", body)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def publish_result(self, task_id: str, runner_id: str, lease_token: str, *, source, length: int) -> dict[str, Any]:
+        """Upload the bounded public artifact automatically, without repository keys."""
+        task_id = require_task_id(task_id)
+        headers = dict(self._headers() or {})
+        headers.update({'X-Ormas-Runner-Id': runner_id, 'X-Ormas-Lease-Token': lease_token,
+            'Content-Type': 'application/vnd.ormas.public-artifact.v1', 'Content-Length': str(length)})
+        source.seek(0)
+        response = self._client.post(f'/api/runner/v1/leases/{task_id}/publication',
+            content=iter(lambda: source.read(65536), b''), headers=headers, timeout=180.0)
+        self._raise_for_status(response)
+        return response.json()
 
     def complete_task(
         self,

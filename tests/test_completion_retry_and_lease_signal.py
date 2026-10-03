@@ -34,12 +34,9 @@ import threading
 import time
 from pathlib import Path
 
-import pytest
 
 from ormas_subnet import MinerConfig, MinerSkeleton, OrmasMinerClient
-from ormas_subnet.client import OrmasGatewayError
 from ormas_subnet.localnet import LocalGateway, LocalResponse
-from ormas_subnet.skeleton import SolveResult
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from neurons.localnet_demo import (  # noqa: E402
