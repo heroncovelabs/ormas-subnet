@@ -158,9 +158,9 @@ Phase 1 accepts on arrival: the first offer within the client's undisclosed
 spending limit wins; an offer above it is recorded and skipped and the job stays
 queued. [History-based ranking](docs/protocol.md#offer-ranking) is planned.
 
-`ask_usd` is live since `gateway-2026.09.11`. The queue route, offers and limit
-settlement arrive with the next gateway release. Until then the queue returns
-404 without `error.type`, and the skeleton falls back to `ask_usd`. See
+`ask_usd` is live since `gateway-2026.09.11`; the queue route, offers and limit
+settlement are live since `gateway-2026.10.03`. Against an older gateway the queue
+returns 404 without `error.type`, and the skeleton falls back to `ask_usd`. See
 [Protocol](docs/protocol.md) for the exact queue, claim and settlement fields.
 
 ## Release gaps
