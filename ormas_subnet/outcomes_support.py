@@ -552,6 +552,28 @@ def _app_read_git(args, *, cwd, repo_url, token, expiry):
             os.close(woken)
 
 
+def protected_repository_git(args, *, cwd, repo_url, token, expires_at):
+    """Read one frozen repository with an attested token, never a wire credential."""
+    validate_repository_credential('public', repo_url, None)  # canonical URL only
+    if not isinstance(token, str) or not re.fullmatch(r'[\x21-\x7e]+', token):
+        raise ValueError('private_repository_read_access_required')
+    try:
+        if not isinstance(expires_at, str):
+            raise ValueError()
+        expiry = datetime.fromisoformat(expires_at.removesuffix('Z') +
+                                       ('+00:00' if expires_at.endswith('Z') else ''))
+    except (TypeError, ValueError):
+        raise ValueError('private_repository_read_access_required') from None
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        raise ValueError('private_repository_read_access_required')
+    if expiry <= datetime.now(timezone.utc):
+        raise ValueError('private_repository_read_access_expired')
+    if (not isinstance(args, (list, tuple)) or not args or not isinstance(args[0], str)
+            or args[0] not in {'clone', 'fetch'} or args.count(repo_url) != 1):
+        raise ValueError('private_repository_read_operation_required')
+    return _app_read_git(args, cwd=cwd, repo_url=repo_url, token=token, expiry=expiry)
+
+
 def repository_git(args, *, cwd, repo_url, credential):
     """A private network read with one temporary credential and no ambient authority."""
     validate_repository_credential('private', repo_url, credential)
