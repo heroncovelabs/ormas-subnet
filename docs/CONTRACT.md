@@ -92,7 +92,7 @@ to the limit when unset. The hook must be deterministic and must not raise. A ra
 ## How you are scored
 
 - **History.** Validator decisions record accept/reject history, including overclaims. Register a verified hotkey mapping after onboarding (see `INSTALL.md`). [History-based ranking](protocol.md#offer-ranking) is planned; phase 1 follows the spending-limit rule above.
-- **Chain weights — planned.** Accepted delivery is the gate — no accepted deliveries, no weight. Weight is linear in settled value, under a per-hotkey cap. A miner with no chain identity mapping earns nothing however good its work.
+- **Chain weights — live.** Accepted delivery is the gate — no accepted deliveries, no weight. Each accepted Outcome freezes an emission target of its settled USD times the published rate version (2× since 2026-10-05T15:00Z under `earned-bid-2x-v1`; [`MINER_TERMS.md`](../MINER_TERMS.md) §3), and weight is linear in frozen targets, under a per-hotkey cap. Demand under your own control, declared at onboarding, earns no target. A miner with no chain identity mapping earns nothing however good its work.
 
 Two honesty rules protect your score: report `None` for usage you do not know — never a fabricated zero — and never self-declare `verified`; the skeleton has no field for it.
 

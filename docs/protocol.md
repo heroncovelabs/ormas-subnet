@@ -475,7 +475,36 @@ Report the outcome.
 
 **Body**: `schema_version`, `runner_id`, `lease_token`, `receipt`
 (`TaskReceipt` wire), `terminal` (`TaskTerminal` wire), and optionally
-`capture`, `failure_evidence`, `pr_url`, `pr_error`, `evidence`.
+`capture`, `failure_evidence`, `pr_url`, `pr_error`, `evidence`, `effort`.
+
+**`effort`** is voluntary disclosure of counts only, with no model names or
+model/provider/vendor identity. When present, it must be an object containing
+exactly these five required keys:
+
+```json
+{"attempts": 2, "model_turns": 8, "models_used": 2, "output_tokens": 40, "total_tokens": 100}
+```
+
+Every value must be a nonnegative integer; booleans are rejected. Unknown keys
+are rejected, including the existing forbidden/capture field vocabulary and
+`model`, `model_id`, `provider`, `vendor`, `models`. Omit the block to leave
+`effort: null` on the receipt and job status: **not disclosed**. Explicit `null`
+is invalid. The SDK's `complete_task(..., effort=...)` validates the block locally
+(`ValueError` before any request) and sends it only when its argument is supplied.
+The first accepted completion fixes the stored effort; a later replay of the same
+lease (`410`) never changes it, and a replay carrying an invalid block answers `400`.
+
+Invalid effort returns HTTP 400 before any state change, including completion
+auditing. Correct the block and resend. The response is
+`{"error": {"type": "invalid_request_error", "message": "effort:<reason>"}}`:
+
+| Message | When |
+|---|---|
+| `effort:object_required` | The block is not an object |
+| `effort:forbidden_field:<key>` | A key belongs to the forbidden/capture vocabulary or names model/provider/vendor identity |
+| `effort:unknown_field:<key>` | Any other extra key is supplied |
+| `effort:missing_field:<key>` | A required count is absent |
+| `effort:non_negative_integer_required:<key>` | A count is boolean, non-integer or negative |
 
 **`TaskReceipt`**: `lease_id`, `generation_ids` (≤16 entries, each
 `^[A-Za-z0-9_-]{1,64}$`), `actual_provider`, `model` (must match
@@ -550,7 +579,8 @@ diff, prompt, or model output over this route — only its hash and metadata.**
 **Response**:
 - `200 {"status": "done"|"failed", "receipt": {...projection...}}` — the
   projected receipt excludes `pricing` and forbidden fields. It includes
-  `settlement`, `customer_billed_usd`, `debit_status`, `upstream_cost_usd`.
+  `settlement`, `customer_billed_usd`, `debit_status`, `upstream_cost_usd`,
+  and `effort` (the disclosed counts, or `null` for not disclosed).
   Only limit-job receipts also show `offer_kind`, `estimate_usd`, `limit_usd`
   and `settled_usd`. A paid limit receipt's fields for the terminal above include
   `{"offer_kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30, "settled_usd": 0.05}`.

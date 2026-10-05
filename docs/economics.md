@@ -35,11 +35,13 @@ Phase 1 accepts on arrival: the first offer within the client's undisclosed
 spending limit wins; an offer above it is recorded and skipped and the job stays
 queued. [History-based ranking](protocol.md#offer-ranking) is planned.
 
-## Chain compensation (planned)
+## Chain compensation (targets and weights live; treasury top-ups planned)
 
-The sections below describe the planned compensation model the validator and
-gateway will implement (requirements: SN76 compensation model v1, 2026-09-13). Where a number is an
-owner or CPA decision it is marked **OPEN** and has not been chosen. Nothing here is an offer,
+The validator and gateway implement the target → weight → carry-forward rule below
+(requirements: SN76 compensation model v1, 2026-09-13). Since 2026-10-05T15:00Z the target is
+settled USD × 2 under rate version `earned-bid-2x-v1` ([`MINER_TERMS.md`](../MINER_TERMS.md) §3);
+targets frozen earlier keep their 1× value. The treasury top-up and payout schedule are still
+planned. Where a number is an owner or CPA decision it is marked **OPEN** and has not been chosen. Nothing here is an offer,
 forecast, or promise of return. Authority order: [`DECISIONS.md`](DECISIONS.md) → [`CONTRACT.md`](CONTRACT.md) → this page.
 
 ## Two quantities that do not match
@@ -55,8 +57,9 @@ variable dollar demand without anyone converting a customer's dollars for a mine
 
 ## The rule, step by step
 
-**Settlement → target.** The accepted firm price or settled limit price on an Outcome becomes its
-**emission target**: the USD value the miner is owed for that Outcome. Only Outcomes accepted through the validator-gated path
+**Settlement → target.** The accepted firm price or settled limit price on an Outcome, times the
+rate version in force at settlement, becomes its **emission target**: the USD value the miner is
+owed for that Outcome. Only Outcomes accepted through the validator-gated path
 count; a miner's own report of success never does.
 
 **Target → weight.** Each epoch, validators sum what every miner is owed — this epoch’s accepted settlements
