@@ -1,0 +1,317 @@
+{
+  "schema_version": "outcomes.support-catalog.v1",
+  "revision": "2026-09-25.2",
+  "repository_visibility": [
+    "public",
+    "private"
+  ],
+  "profiles": [
+    {
+      "profile_id": "linux-python-stdlib-v1",
+      "status": "planned",
+      "image": "python@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e",
+      "platform": "linux/amd64",
+      "os": "linux",
+      "arch": "x86_64",
+      "runtime": {
+        "kind": "python",
+        "version": "3.12.14"
+      },
+      "package_manager": null,
+      "browser": null,
+      "lock_format": "none",
+      "network": {
+        "install": "none",
+        "verify": "none"
+      },
+      "workspace_mode": "oci-v1",
+      "system_packages": [],
+      "services": [],
+      "limits": {
+        "timeout_s": 600,
+        "cpus": 2,
+        "memory_mib": 4096,
+        "disk_mib": 4096,
+        "output_bytes": 1048576,
+        "max_files": 10000,
+        "max_bytes": 67108864
+      },
+      "verifier_class": "python-assertion-v1",
+      "build_system": "python-module",
+      "installer_argv": [],
+      "acceptance_mode": "external-driver-v1",
+      "supported_interfaces": [],
+      "publication": {
+        "protocol": "github-artifact-v1",
+        "max_changed_files": 100,
+        "timeout_s": 120,
+        "max_attempts": 2,
+        "max_api_calls": 220,
+        "body_receive_timeout_s": 30,
+        "max_recovery_api_calls": 4
+      },
+      "repository_features": {
+        "symlinks": false,
+        "submodules": false
+      }
+    },
+    {
+      "profile_id": "linux-python-pytest-v1",
+      "status": "development",
+      "image": "python@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e",
+      "platform": "linux/amd64",
+      "os": "linux",
+      "arch": "x86_64",
+      "runtime": {
+        "kind": "python",
+        "version": "3.12.14"
+      },
+      "package_manager": {
+        "kind": "pip",
+        "version": "25.0.1"
+      },
+      "browser": null,
+      "lock_format": "pip-hashes-v1",
+      "network": {
+        "install": "public-internet",
+        "verify": "none"
+      },
+      "workspace_mode": "oci-v1",
+      "system_packages": [],
+      "services": [],
+      "limits": {
+        "timeout_s": 600,
+        "cpus": 2,
+        "memory_mib": 4096,
+        "disk_mib": 4096,
+        "output_bytes": 1048576,
+        "max_files": 10000,
+        "max_bytes": 67108864,
+        "source_max_bytes": 134217728
+      },
+      "verifier_class": "pytest-behavioral-v1",
+      "build_system": "pytest",
+      "installer_argv": [
+        "/bin/sh",
+        "-c",
+        "python3 -m venv /work/.venv && /work/.venv/bin/python -m pip --isolated install --disable-pip-version-check --no-index --no-deps --find-links=/artifacts --require-hashes --only-binary=:all: -r requirements.lock"
+      ],
+      "acceptance_mode": "external-driver-v1",
+      "supported_interfaces": [
+        "command-output"
+      ],
+      "publication": {
+        "protocol": "github-artifact-v1",
+        "max_changed_files": 100,
+        "timeout_s": 120,
+        "max_attempts": 2,
+        "max_api_calls": 220,
+        "body_receive_timeout_s": 30,
+        "max_recovery_api_calls": 4
+      },
+      "repository_features": {
+        "symlinks": false,
+        "submodules": "uninitialized-pointers-v1"
+      }
+    },
+    {
+      "profile_id": "linux-node-test-v1",
+      "status": "development",
+      "image": "node@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9",
+      "platform": "linux/amd64",
+      "os": "linux",
+      "arch": "x86_64",
+      "runtime": {
+        "kind": "node",
+        "version": "22.23.2"
+      },
+      "package_manager": {
+        "kind": "npm",
+        "version": "10.9.8"
+      },
+      "browser": null,
+      "lock_format": "npm-lock-v3",
+      "network": {
+        "install": "public-internet",
+        "verify": "none"
+      },
+      "workspace_mode": "oci-v1",
+      "system_packages": [],
+      "services": [],
+      "limits": {
+        "timeout_s": 600,
+        "cpus": 2,
+        "memory_mib": 4096,
+        "disk_mib": 4096,
+        "output_bytes": 1048576,
+        "max_files": 10000,
+        "max_bytes": 67108864
+      },
+      "verifier_class": "node-behavioral-v1",
+      "build_system": "npm",
+      "installer_argv": [
+        "/bin/sh",
+        "-c",
+        "mkdir /work/.ormas-install && cp /artifacts/package*.json /work/.ormas-install/ && cd /work/.ormas-install && for artifact in /artifacts/*.tgz; do [ ! -f \"$artifact\" ] || npm cache add \"$artifact\" --cache /work/.ormas-cache --offline --ignore-scripts --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global; done && npm ci --offline --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org --cache=/work/.ormas-cache --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global && if [ -d node_modules ]; then mv node_modules /work/node_modules; fi"
+      ],
+      "acceptance_mode": "external-driver-v1",
+      "supported_interfaces": [
+        "command-output"
+      ],
+      "publication": {
+        "protocol": "github-artifact-v1",
+        "max_changed_files": 100,
+        "timeout_s": 120,
+        "max_attempts": 2,
+        "max_api_calls": 220,
+        "body_receive_timeout_s": 30,
+        "max_recovery_api_calls": 4
+      },
+      "repository_features": {
+        "symlinks": false,
+        "submodules": false
+      }
+    },
+    {
+      "profile_id": "linux-node-browser-v1",
+      "status": "development",
+      "image": "mcr.microsoft.com/playwright@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27",
+      "platform": "linux/amd64",
+      "os": "linux",
+      "arch": "x86_64",
+      "runtime": {
+        "kind": "node",
+        "version": "24.20.0"
+      },
+      "package_manager": {
+        "kind": "npm",
+        "version": "11.19.0"
+      },
+      "browser": {
+        "name": "chromium",
+        "version": "153.0.8010.12",
+        "driver_version": "1.63.0"
+      },
+      "lock_format": "npm-lock-v3",
+      "network": {
+        "install": "public-internet",
+        "verify": "none"
+      },
+      "workspace_mode": "oci-v1",
+      "system_packages": [],
+      "services": [],
+      "limits": {
+        "timeout_s": 600,
+        "cpus": 2,
+        "memory_mib": 4096,
+        "disk_mib": 4096,
+        "output_bytes": 1048576,
+        "max_files": 10000,
+        "max_bytes": 67108864
+      },
+      "verifier_class": "node-browser-behavioral-v1",
+      "build_system": "npm",
+      "installer_argv": [
+        "/bin/sh",
+        "-c",
+        "mkdir /work/.ormas-install && cp /artifacts/package*.json /work/.ormas-install/ && cd /work/.ormas-install && for artifact in /artifacts/*.tgz; do [ ! -f \"$artifact\" ] || npm cache add \"$artifact\" --cache /work/.ormas-cache --offline --ignore-scripts --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global; done && npm ci --offline --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org --cache=/work/.ormas-cache --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global && if [ -d node_modules ]; then mv node_modules /work/node_modules; fi"
+      ],
+      "acceptance_mode": "external-driver-v1",
+      "supported_interfaces": [
+        "command-output"
+      ],
+      "publication": {
+        "protocol": "github-artifact-v1",
+        "max_changed_files": 100,
+        "timeout_s": 120,
+        "max_attempts": 2,
+        "max_api_calls": 220,
+        "body_receive_timeout_s": 30,
+        "max_recovery_api_calls": 4
+      },
+      "repository_features": {
+        "symlinks": false,
+        "submodules": false
+      }
+    },
+    {
+      "profile_id": "linux-node-browser-http-v1",
+      "status": "development",
+      "image": "mcr.microsoft.com/playwright@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27",
+      "platform": "linux/amd64",
+      "os": "linux",
+      "arch": "x86_64",
+      "runtime": {
+        "kind": "node",
+        "version": "24.20.0"
+      },
+      "package_manager": {
+        "kind": "npm",
+        "version": "11.19.0"
+      },
+      "browser": {
+        "name": "chromium",
+        "version": "153.0.8010.12",
+        "driver_version": "1.63.0"
+      },
+      "lock_format": "npm-lock-v3",
+      "network": {
+        "install": "public-internet",
+        "verify": "none"
+      },
+      "workspace_mode": "oci-v1",
+      "system_packages": [],
+      "services": [
+        "http-loopback-v1"
+      ],
+      "limits": {
+        "timeout_s": 600,
+        "cpus": 2,
+        "memory_mib": 4096,
+        "disk_mib": 4096,
+        "output_bytes": 1048576,
+        "max_files": 10000,
+        "max_bytes": 67108864
+      },
+      "verifier_class": "node-browser-http-behavioral-v1",
+      "build_system": "npm",
+      "installer_argv": [
+        "/bin/sh",
+        "-c",
+        "mkdir /work/.ormas-install && cp /artifacts/package*.json /work/.ormas-install/ && cd /work/.ormas-install && for artifact in /artifacts/*.tgz; do [ ! -f \"$artifact\" ] || npm cache add \"$artifact\" --cache /work/.ormas-cache --offline --ignore-scripts --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global; done && npm ci --offline --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org --cache=/work/.ormas-cache --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global && if [ -d node_modules ]; then mv node_modules /work/node_modules; fi"
+      ],
+      "acceptance_mode": "external-driver-v1",
+      "supported_interfaces": [
+        "http-browser-v1"
+      ],
+      "publication": {
+        "protocol": "github-artifact-v1",
+        "max_changed_files": 100,
+        "timeout_s": 120,
+        "max_attempts": 2,
+        "max_api_calls": 220,
+        "body_receive_timeout_s": 30,
+        "max_recovery_api_calls": 4
+      },
+      "repository_features": {
+        "symlinks": false,
+        "submodules": false
+      },
+      "http": {
+        "origin": "http://ormas-app.invalid",
+        "protocol": "HTTP/1.1",
+        "startup_timeout_s": 20,
+        "max_requests": 128,
+        "request_body_bytes": 32768,
+        "header_bytes": 16384,
+        "service_log_bytes": 65536,
+        "probe_runtime": "/usr/bin/node",
+        "tls": false,
+        "websockets": false,
+        "downloads": false,
+        "streaming": false
+      }
+    }
+  ],
+  "verifier_compiler_sha256": "9b34b86855f65c83b414337706b1a3b5e58218ee958ba4fe5f924e7d84888f7e"
+}
