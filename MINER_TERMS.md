@@ -36,6 +36,13 @@ the chain.** The alpha you actually receive for a given target varies with those
 **Carry-forward.** If an epoch's emission does not cover your target, the unpaid USD balance carries
 forward and is published in the validators' per-epoch artifacts.
 
+**Rate version.** Targets are set by a published rate version. From **2026-10-05T15:00Z** (policy
+`earned-bid-2x-v1`) each accepted Outcome's emission target is **2× its settled USD** at the reference
+price; targets frozen under the earlier `earned-bid-1x-v1` keep their 1× value. The rate applies to
+every miner, including operator-run miners. Any later rate is a new version with its own effective
+time, applied to Outcomes settled after it; nothing is recomputed retroactively. Demand under your own
+control (your tenants, declared at onboarding) earns no target, under one rule for every miner.
+
 **Treasury top-ups (not yet in force).** Balances that remain open past the published aging threshold
 are netted daily and paid in alpha from Heron Cove's treasury to the payout coldkey you registered,
 T+N after the published cutoff, at one price reference per batch, subject to §4. Until counsel clears
