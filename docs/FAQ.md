@@ -38,6 +38,13 @@ worst-case chain. Settle at your actual metered chain cost plus margin within th
 settlement are live since `gateway-2026.10.03`. Against an older gateway the queue
 returns 404 without `error.type`, and the skeleton falls back to `ask_usd`.
 
+**What do I have to disclose about effort?**
+The optional completion `effort` block is voluntary disclosure of five counts: `attempts`,
+`model_turns`, `models_used`, `output_tokens`, and `total_tokens`. Supply all five as nonnegative
+integers, with counts only and no model names or provider/vendor identity. Omission appears as
+`effort: null` (“not disclosed”) on the receipt and job status. An invalid block returns HTTP 400
+before any state change; correct it and resend. See [Protocol](protocol.md#post-apirunnerv1leasestask_idcomplete).
+
 **What can I see before offering?**
 `list_queue(runner_id)` returns job ids, creation times and privacy-safe task shapes. The exact
 envelope keys are in [Protocol](protocol.md). `offer_fn` returns an offer for a job or `None` to
@@ -76,12 +83,15 @@ a credential-free environment (`PATH`, scratch `HOME`, `LANG`, plus the packet's
 explicit `NAME=value` assignments).
 
 **How many claims can I make?**
-Your token carries a daily claim cap (10 at onboarding; raised on request). Lease TTL and heartbeat cadence
+Your runner key carries a daily claim cap: 0 when you mint it at ormas.ai (register-only), 1 for the supervised first job once your qualification is approved, then raised. Claims over the cap answer `429`. Lease TTL and heartbeat cadence
 come from the register response and are authoritative.
 
 **Is there a chain emission?**
-Chain compensation is planned. Accepted tasks settle in USD credit at the firm price or the
-settled limit price. The alpha model in [Economics](economics.md) remains planned.
+Yes. The client is charged the firm price or the settled limit price in USD; for you, each accepted
+delivery freezes an emission target of that settled USD times the published rate (2× since
+2026-10-05T15:00Z, `earned-bid-2x-v1`), and validators convert targets into SN76 weights each epoch
+with carry-forward of any shortfall. Treasury top-ups remain planned. See [Economics](economics.md)
+and [`MINER_TERMS.md`](../MINER_TERMS.md).
 
 **GitHub sign-in on ormas.ai says my email is already linked.**
 That account already exists via Google (same email); sign in with Google. If GitHub "returned an error",

@@ -45,6 +45,28 @@ def _positive_usd(value: Any) -> bool:
         return False
 
 
+EFFORT_FIELDS: tuple[str, ...] = (
+    "attempts", "model_turns", "models_used", "output_tokens", "total_tokens",
+)
+
+
+def _validate_effort(effort: Any) -> dict[str, int]:
+    """Return the wire effort block or raise ``ValueError``.
+
+    Mirrors ``runner_api._parse_effort``: exactly the five count fields, each a
+    non-negative ``int`` (bools rejected). Counts only — no model identity.
+    """
+    if not isinstance(effort, Mapping):
+        raise ValueError("effort must be a mapping of the five count fields")
+    if set(effort) != set(EFFORT_FIELDS):
+        raise ValueError(f"effort has exactly the fields {', '.join(EFFORT_FIELDS)}")
+    for field in EFFORT_FIELDS:
+        value = effort[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"effort.{field} must be a non-negative integer")
+    return {field: int(effort[field]) for field in EFFORT_FIELDS}
+
+
 def _validate_offers(offers: Any) -> None:
     """Raise ``ValueError`` unless ``offers`` is a wire body the gateway accepts.
 
@@ -367,12 +389,19 @@ class OrmasMinerClient:
         receipt: TaskReceipt,
         terminal: TaskTerminal,
         capture: Mapping[str, Any] | None = None,
+        effort: Mapping[str, int] | None = None,
         failure_evidence: Mapping[str, Any] | None = None,
         pr_url: str | None = None,
         pr_error: str | None = None,
     ) -> dict[str, Any]:
-        """POST /api/runner/v1/leases/{task_id}/complete — 200 done, 202 settling, 410 replay."""
+        """POST /api/runner/v1/leases/{task_id}/complete — 200 done, 202 settling, 410 replay.
+
+        ``effort`` is the optional counts-only disclosure (``attempts``,
+        ``model_turns``, ``models_used``, ``output_tokens``, ``total_tokens``);
+        it is validated locally and sent only when supplied.
+        """
         task_id = require_task_id(task_id)
+        wire_effort = _validate_effort(effort) if effort is not None else None
         body: dict[str, Any] = {
             "schema_version": RUNNER_PROTOCOL_V1,
             "runner_id": runner_id,
@@ -382,6 +411,8 @@ class OrmasMinerClient:
         }
         if capture is not None:
             body["capture"] = snapshot_evidence(capture)
+        if wire_effort is not None:
+            body["effort"] = wire_effort
         if failure_evidence is not None:
             body["failure_evidence"] = snapshot_evidence(failure_evidence)
         if pr_url is not None:
