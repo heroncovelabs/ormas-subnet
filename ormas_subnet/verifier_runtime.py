@@ -291,6 +291,23 @@ if os.path.isdir(scratch):
     shutil.rmtree(scratch,ignore_errors=True)
 '''
 
+# A candidate call whose process spawn failed (a program the image does not
+# provide, or an OS refusal) shows pytest's failing frame inside the standard
+# library's subprocess.py raising the OSError. The error type is tied to that
+# frame: in the long/auto/line tracebacks it follows the frame on the same
+# line, in the short traceback its ``E`` line follows the frame's source. A
+# test that itself raises FileNotFoundError on a data file, or a
+# CalledProcessError beside another test's unrelated OSError, is a plain red.
+_SPAWN_TYPES = rb'(?:FileNotFoundError|PermissionError|BlockingIOError|ProcessLookupError|OSError)\b'
+_SPAWN = re.compile(
+    rb'^\S*/python3\.\d+/subprocess\.py:\d+: (?:' + _SPAWN_TYPES
+    + rb'|in \w+\n(?:[ \t].*\n|\n)*?E\s+' + _SPAWN_TYPES + rb')', re.M)
+
+
+def candidate_spawn_failure(output):
+    """True when a failed candidate call's output shows a process spawn that failed."""
+    return bool(_SPAWN.search(output))
+
 
 class CandidateBridge:
     """A bounded, serial, candidate-only command channel for the trusted driver."""
@@ -299,6 +316,7 @@ class CandidateBridge:
         self.calls = self.used = 0
         self.http_observations = 0
         self.http_execute = None
+        self.spawn_failure = False
         self.error = None
         self.stopping = threading.Event()
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -369,6 +387,8 @@ class CandidateBridge:
                     else:
                         code, output = self.execute(argv, call_deadline, self.cap - self.used)
                         self.used += len(output)
+                        if code and candidate_spawn_failure(output):
+                            self.spawn_failure = True
                         result = {'returncode': code, 'output': base64.b64encode(output).decode()}
                 except Exception as exc:
                     self.error = self.error or (str(exc) if isinstance(exc, RuntimeRefusal) else 'candidate_bridge_failed')
@@ -1253,6 +1273,11 @@ def run_verifier(cfg, *, cwd=None):
         outcome = structured_result(report_kind, report)
         if bridge.error or not bridge.calls:
             raise RuntimeRefusal(bridge.error or 'external_candidate_observation_required')
+        if outcome == 'assertion' and bridge.spawn_failure:
+            # The red came from a program the candidate could not start, not
+            # from the behaviour under test; on the base this refuses before
+            # any miner spend.
+            raise RuntimeRefusal('candidate_subprocess_unavailable')
         if service is not None:
             service.check()
             if not bridge.http_observations:
