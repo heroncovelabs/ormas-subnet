@@ -124,10 +124,13 @@ validator reproduces base failure, checks candidate scope and reruns the frozen
 verifier. Losing it cannot reduce the required count; deadline and no-charge rules
 still apply.
 
-V2 needs separately approved protocol qualifications. A miner must explicitly add
-`task:acceptance/operator-run-v2` to its cells (`--cell` on the reference miner,
-`--task-cell` on the operator miner). The SDK does not opt miners into these terms
-automatically. Standing asks and per-job offers convey policy-class consent; the
+V2 and v3 need separately approved protocol qualifications. A miner must explicitly add
+the cell for the policy the gateway runs (`--cell` on the reference miner, `--task-cell`
+on the operator miner): `task:acceptance/operator-run-v2` for v2, or
+`task:acceptance/operator-run-v3` for v3, where checker capacity is an operator-wide slot
+total on the qualification (`ormas.public-acceptance-contract.v3`). `api.ormas.ai` runs
+`operator-run-v3`; a miner advertising only the v2 cell is excluded before bidding. The
+SDK does not opt miners into these terms automatically. Standing asks and per-job offers convey policy-class consent; the
 full per-job owner and timeout arrive in the draft. The queue envelope omits the
 exact acceptance policy. The controlled operator pilot can use its known terms.
 General third-party bidding still needs pre-bid disclosure of that policy before

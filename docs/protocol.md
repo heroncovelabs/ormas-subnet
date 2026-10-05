@@ -342,7 +342,12 @@ exception or these extra keys. The complete v2 contract is signed with the rest
 of the assignment evidence.
 
 V2 requires explicit `task:acceptance/operator-run-v2` miner opt-in and separately
-approved v2 qualifications. The gateway checks the capability before any bid,
+approved v2 qualifications. V3 (`ormas.public-acceptance-policy.v3` /
+`ormas.public-acceptance-contract.v3`) keeps the same operator-run terms, moves checker
+capacity to an operator-wide slot total on the qualification, and uses its own cells,
+`task:acceptance/operator-run-v3` and `task:acceptance/independent-v3`, so a miner that
+cannot read a v3 contract is never matched to one. `api.ormas.ai` runs
+`OUTCOMES_PUBLIC_ACCEPTANCE_POLICY=operator-run-v3`. The gateway checks the capability before any bid,
 at atomic claim and when resuming a lease. Alpha configuration is explicit:
 `OUTCOMES_PUBLIC_ACCEPTANCE_POLICY=operator-run-v2` and
 `OUTCOMES_PUBLIC_VALIDATOR_OPERATOR_ID=<qualified operator id>`. The default is

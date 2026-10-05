@@ -63,7 +63,8 @@ is a separate envelope field. Offer kinds are `firm` and `limit`.
 Bounded-packet (public-profile) jobs and cross-tenant legacy jobs require
 assigned-validator acceptance of the result, scope and tests. `independent-v1`
 uses separate owners; the explicit
-`operator-run-v2` alpha uses operator-controlled acceptance under the frozen policy. Same-tenant
+`operator-run-v2`/`operator-run-v3` alpha uses operator-controlled acceptance under the frozen
+policy (`api.ormas.ai` runs v3; advertise `task:acceptance/operator-run-v3`). Same-tenant
 legacy jobs use the miner's report plus scope and commit checks. Legacy environments may be declared
 in `toolchain`. A self-reported failure settles unpaid. Live validator qualification requires
 separate onboarding. A `paid` receipt on `api.ormas.ai` today reflects one
