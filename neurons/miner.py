@@ -35,7 +35,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
+
 from ormas_subnet import MinerConfig, MinerSkeleton, OrmasMinerClient, load_token
+from ormas_subnet.client import OrmasGatewayError
 from ormas_subnet.reference_solver import make_shell_solver
 
 _TOKEN_HELP_ENV = "Env var holding the miner token (conventionally ORMAS_MINER_TOKEN)"
@@ -46,16 +49,22 @@ _TOKEN_HELP_FILE = "File holding the runner token"
 _RUN_REQUIRED = ("gateway", "repo_id", "repo_url", "cell", "solve_command")
 
 
-def _add_token_group(ap: argparse.ArgumentParser, *, required: bool) -> None:
+def _add_token_group(
+    ap: argparse.ArgumentParser, *, required: bool, credential_defaults: bool = False,
+) -> None:
     tok = ap.add_mutually_exclusive_group(required=required)
-    tok.add_argument("--token-env", help=_TOKEN_HELP_ENV)
-    tok.add_argument("--token-file", help=_TOKEN_HELP_FILE)
+    default = " (default: ORMAS_MINER_TOKEN or saved key)" if credential_defaults else ""
+    tok.add_argument("--token-env", help=_TOKEN_HELP_ENV + default)
+    tok.add_argument("--token-file", help=_TOKEN_HELP_FILE + default)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, credential_defaults: bool = False) -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Ormas subnet reference miner")
-    ap.add_argument("--gateway", help="Gateway base URL, e.g. https://api.ormas.ai")
-    _add_token_group(ap, required=False)
+    gateway_help = "Gateway base URL, e.g. https://api.ormas.ai"
+    if credential_defaults:
+        gateway_help += " (default: saved gateway or https://api.ormas.ai)"
+    ap.add_argument("--gateway", help=gateway_help)
+    _add_token_group(ap, required=False, credential_defaults=credential_defaults)
     ap.add_argument(
         "--runner-id", default="",
         help="This miner's gateway-assigned id (runr_<12hex>); omit on first run — "
@@ -95,8 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
         "on stdout — the key stays in your own tooling), and the gateway verifies and "
         "records the mapping.",
     )
-    hk.add_argument("--gateway", required=True, help="Gateway base URL, e.g. https://api.ormas.ai")
-    _add_token_group(hk, required=True)
+    hk.add_argument("--gateway", required=not credential_defaults, help=gateway_help)
+    _add_token_group(hk, required=not credential_defaults, credential_defaults=credential_defaults)
     hk.add_argument("--runner-id", required=True)
     hk.add_argument("--hotkey-ss58", required=True, help="SS58 address of the hotkey to register")
     hk.add_argument(
@@ -108,20 +117,23 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def _parse(argv: list[str] | None = None) -> argparse.Namespace:
-    ap = build_parser()
+def _parse(
+    argv: list[str] | None = None, *, credential_defaults: bool = False,
+) -> argparse.Namespace:
+    ap = build_parser(credential_defaults=credential_defaults)
     ns = ap.parse_args(argv)
     if ns.command is None:
         missing = [f"--{name.replace('_', '-')}" for name in _RUN_REQUIRED if not getattr(ns, name)]
         if missing:
             ap.error("the following arguments are required: " + ", ".join(missing))
-        if not (ns.token_env or ns.token_file):
+        if not credential_defaults and not (ns.token_env or ns.token_file):
             ap.error("one of the arguments --token-env --token-file is required")
     return ns
 
 
-def _run_register_hotkey(args: argparse.Namespace) -> int:
-    token = load_token(token_env=args.token_env, token_path=args.token_file)
+def _run_register_hotkey(args: argparse.Namespace, *, token: str | None = None) -> int:
+    if token is None:
+        token = load_token(token_env=args.token_env, token_path=args.token_file)
 
     def sign_fn(challenge_bytes: bytes) -> str:
         proc = subprocess.run(
@@ -140,15 +152,18 @@ def _run_register_hotkey(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse(argv)
+def main(argv: list[str] | None = None, *, token: str | None = None) -> int:
+    args = _parse(argv, credential_defaults=token is not None)
     if args.command == "register-hotkey":
         try:
-            return _run_register_hotkey(args)
+            return _run_register_hotkey(args, token=token)
         except Exception as exc:  # noqa: BLE001 - surface any failure with its message
+            if token is not None and isinstance(exc, (OrmasGatewayError, httpx.HTTPError)):
+                raise
             print(f"register-hotkey: {exc}", file=sys.stderr)
             return 1
-    token = load_token(token_env=args.token_env, token_path=args.token_file)
+    if token is None:
+        token = load_token(token_env=args.token_env, token_path=args.token_file)
     client = OrmasMinerClient(base_url=args.gateway, token=token)
     config = MinerConfig(
         runner_id=args.runner_id,
