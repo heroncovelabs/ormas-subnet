@@ -72,11 +72,11 @@ main() {
                     printf '%s\n' "export PATH=\"\$HOME/.local/bin:\$PATH\""
                     ;;
                 *)
-                    bash_profile='~/.bashrc'
+                    bash_profile='.bashrc'
                     if [[ "$platform" == Darwin ]]; then
-                        bash_profile='~/.bash_profile'
+                        bash_profile='.bash_profile'
                     fi
-                    printf 'Add this to %s and run it in your shell:\n' "$bash_profile"
+                    printf 'Add this to ~/%s and run it in your shell:\n' "$bash_profile"
                     printf '%s\n' "export PATH=\"\$HOME/.local/bin:\$PATH\""
                     ;;
             esac
