@@ -7,6 +7,7 @@ optimization dimension lives inside the miner").
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -34,7 +35,11 @@ def make_shell_solver(command: str, *, commit_message: str = "ormas-subnet: refe
     """
 
     def solve(draft, workdir: Path) -> SolveResult:  # noqa: ANN001 - draft is TaskDraft, kept loose to avoid a cycle
-        proc = subprocess.run(command, shell=True, cwd=str(workdir), capture_output=True, text=True)
+        env = os.environ.copy()
+        env.pop("ORMAS_MINER_TOKEN", None)
+        proc = subprocess.run(
+            command, shell=True, cwd=str(workdir), env=env, capture_output=True, text=True,
+        )
         ok = proc.returncode == 0
         changed = _changed_paths(workdir)
         allowed = tuple(getattr(draft, "allowed_paths", None) or ())

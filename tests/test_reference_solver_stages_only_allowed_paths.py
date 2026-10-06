@@ -11,6 +11,7 @@ draft, keep today's ``add -A`` (legacy drafts).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -75,3 +76,21 @@ def test_no_allowed_paths_keeps_add_all(tmp_path: Path) -> None:
     workdir = skeleton.config.workdir_root / "task_1"
     result_commit = gateway.completed["terminal"]["result_commit"]
     assert _changed(workdir, base_commit, result_commit) == ["extra.txt", "out.txt"]
+
+
+@requires_git
+def test_solve_subprocess_excludes_miner_key(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ORMAS_MINER_TOKEN", "ormr_private_test_key")
+    monkeypatch.setenv("SOLVE_SETTING", "kept")
+    repo, base_commit = _init_repo(tmp_path)
+    solver = make_shell_solver(
+        'test "${ORMAS_MINER_TOKEN+x}" != x && test "$SOLVE_SETTING" = kept '
+        "&& echo mined >> out.txt"
+    )
+    gateway, _ = _run_one_task(
+        tmp_path, repo=repo, base_commit=base_commit, verify_command="grep -q mined out.txt",
+        solve_fn=solver, allowed_paths=["out.txt"],
+    )
+    assert gateway.completed["terminal"]["verification_state"] == "verified"
+    assert gateway.completed["terminal"].get("failure_class") is None
+    assert os.environ["ORMAS_MINER_TOKEN"] == "ormr_private_test_key"
