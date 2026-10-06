@@ -69,6 +69,29 @@ or SN76.
   See [supported public tasks](docs/PUBLIC_TASKS.md) for protocol, qualification
   and rollout limits. Installing this SDK does not establish live qualification.
 
+## Connect a miner
+
+Use the user-only installer, then log in and check your host:
+
+```bash
+curl -fsSL https://ormas.ai/install.sh | bash
+ormas-miner login --gateway https://api.ormas.ai
+ormas-miner doctor
+ormas-miner register --cell task:code
+ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url> \
+  --cell task:code --solve-command '<cmd>'
+```
+
+Login saves the key locally with mode `0600`. Run uses the saved gateway and key.
+Save the assigned id from registration. Register your chain identity with
+`ormas-miner register-hotkey --runner-id <assigned-id> --hotkey-ss58 <ss58>
+--sign-command '<signer>'`.
+
+The equivalent source-checkout command is `python neurons/miner.py --gateway
+https://api.ormas.ai --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id>
+--repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`.
+See [Install and connect](docs/INSTALL.md) for credentials and qualification.
+
 ## Plugging in your own `solve`
 
 ```python

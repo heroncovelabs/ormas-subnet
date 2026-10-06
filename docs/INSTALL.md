@@ -18,15 +18,88 @@ Installing this candidate does not activate it in production.
 
 - Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). A **legacy validator** host additionally needs every Python minor a client may declare in a packet `toolchain` installed as `python3.X` on `PATH` (today: `python3.12`); a declared interpreter that is missing makes the validator post `error` for that assignment, which is excluded from quorum. Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
 - `git` on `PATH`; the legacy credential route also needs an `ssh` client. Bounded-packet (public-profile) jobs publish through the gateway: public-repository jobs clone anonymously; private-repository jobs use a per-job read credential for both miners and validators. A legacy unbound claim carries `repo_credential`; the bind fallback uses access you already hold.
-- A runner key (starts `ormr_`). Mint it yourself: sign in at [ormas.ai](https://ormas.ai), open **Miner → Runner keys**, and create a key. It is shown once; save it to `~/.ormas/miner-token` with mode `0600`. A new key is **register-only** (daily claim cap 0): it can register your runner and hotkey and submit qualification evidence against `https://api.ormas.ai`, but job claims return 429 until the operator approves your qualification and raises the cap (see [`CONTRACT.md`](CONTRACT.md)). Keys expire after 30 days; mint a new one on the same page. A project id and base commit are needed only for the bind fallback.
+- A runner key (starts `ormr_`). Mint it yourself: sign in at [ormas.ai](https://ormas.ai), open **Miner → Runner keys**, and create a key. It is shown once; save it with `ormas-miner login`. A new key is **register-only** (daily claim cap 0): it can register your miner and hotkey and submit qualification evidence against `https://api.ormas.ai`, but job claims return 429 until the operator approves your qualification and raises the cap (see [`CONTRACT.md`](CONTRACT.md)). Keys expire after 30 days; mint a new one on the same page. A project id and base commit are needed only for the bind fallback.
 
-## Install
-
-From the repository root (package name `ormas-subnet`, dependencies `httpx` and `cryptography`):
+## Install (recommended)
 
 ```bash
-pip install -e .
-python -c "import ormas_subnet; print(ormas_subnet.__version__)"
+curl -fsSL https://ormas.ai/install.sh | bash
+```
+
+The installer creates `~/.ormas-miner/venv` and links `ormas-miner` into
+`~/.local/bin`. It uses `uv` to create Python 3.12 when available, otherwise an
+installed Python ≥ 3.10. It runs as your user. Re-running upgrades the package
+in the same virtual environment. `ORMAS_MINER_REF` selects a Git tag or commit;
+the default is `main`.
+
+If `~/.local/bin` is missing from `PATH`, run the printed shell command and save
+it in your shell's configuration file. The installer prints the installed version
+and Git commit, followed by the login and doctor commands.
+
+### Manual install
+
+Clone the repository and install from its root (package name `ormas-subnet`,
+dependencies `httpx` and `cryptography`):
+
+```bash
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+ormas-miner --help
+```
+
+## Log in and check the host
+
+```bash
+ormas-miner login --gateway https://api.ormas.ai
+ormas-miner doctor
+```
+
+Login prompts for your miner key and saves it with the gateway URL in
+`~/.ormas-miner/credentials.json`, mode `0600`. It prints the URL and the key's
+last four characters. To read an existing environment variable, use
+`ormas-miner login --token-env ORMAS_MINER_TOKEN`.
+
+Doctor checks Python, Git, gateway health, credentials and key acceptance.
+It uses `GET /health`, then the existing read-only
+`GET /api/runner/v1/queue?runner_id=runr_000000000000` with bearer authentication.
+A successful JSON response or a typed `404 not_found_error` establishes that
+key authentication passed. The result reads "key accepted (account enablement
+not confirmed)": a disabled account can return the same typed `404`.
+A `401`, an untyped `404` or another error fails the check. The key probe has a
+10-second timeout and creates no registration or lease. A missing `~/.local/bin`
+on `PATH` is a warning. Account enablement and qualification remain separate checks.
+
+## Register and run
+
+Register without polling:
+
+```bash
+ormas-miner register --cell task:code
+```
+
+Save the assigned `runner_id` from the response. Run the reference loop with your
+solve command:
+
+```bash
+ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url> \
+  --cell task:code --solve-command '<cmd>'
+```
+
+`run` and `register-hotkey` use the existing reference miner parser and functions.
+The saved gateway and key are defaults. The saved key is bound to that gateway.
+For another `--gateway`, supply `--token-env`, `--token-file` or `ORMAS_MINER_TOKEN`.
+Gateway URLs use HTTPS; HTTP is supported for `localhost`, `127.0.0.1` and `::1`.
+An explicit key overrides the saved key. With an unusable saved file and no
+`--gateway`, an explicit key uses `https://api.ormas.ai`.
+`--token-file` reads a plain key file. The reference solve subprocess receives an
+environment with `ORMAS_MINER_TOKEN` removed. All existing run flags remain available.
+The equivalent source-checkout command is:
+
+```bash
+python neurons/miner.py --gateway https://api.ormas.ai \
+  --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id> --repo-id <id> \
+  --repo-url <url> --cell task:code --solve-command '<cmd>'
 ```
 
 ## Token and URL — never on argv
@@ -199,7 +272,7 @@ Four fields a newcomer cannot guess:
 
 The reference solver runs `true` — a no-op that commits an empty result. It exists so the loop runs end to end with no model call, and against a task whose verify expects a change it completes with `failed`, which is the honest outcome of doing nothing.
 
-The same loop is available as a CLI: `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`. It reads the token from `--token-env` / `--token-file`, never from argv, and prints the assigned `runner_id=…` on stderr after the first registration.
+The same loop is available as `ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`. It uses your saved credentials or an explicit `--token-env` / `--token-file`, and prints the assigned `runner_id=…` on stderr after registration. The equivalent source-checkout form is `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN` followed by the same run flags.
 
 ## Fallback: bind a repository you already hold locally
 
@@ -280,11 +353,13 @@ Three rules the skeleton enforces with you:
 Record your chain hotkey↔miner mapping on the gateway once, after onboarding. The gateway mints a one-time challenge; your `--sign-command` — your own program, holding your own key — reads the challenge bytes on stdin and prints the sr25519 signature hex on stdout; the CLI posts it for verification. The key (and the hotkey) never enter this package; with `bittensor` installed a signer is a couple of lines around `wallet.hotkey.sign(challenge_bytes).hex()`.
 
 ```bash
-python -m neurons.miner register-hotkey \
-  --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
+ormas-miner register-hotkey \
   --runner-id runr_0123456789ab --hotkey-ss58 <your-ss58> \
   --sign-command 'my-signer --hotkey alice'
 ```
+
+The equivalent source-checkout command is `python neurons/miner.py register-hotkey`
+with the same flags plus `--gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN`.
 
 Here `--runner-id` is the assigned `runr_<12hex>` id from your first registration — never a self-chosen one: the gateway refuses an id it has not issued to your token (404). The third-party skeleton registers with `runner_id=""` and adopts the assigned id automatically (see the example above).
 
