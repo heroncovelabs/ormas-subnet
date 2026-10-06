@@ -266,6 +266,14 @@ Four fields a newcomer cannot guess:
   `outcomes-…` strings are the operator's own model-bound cells; they are not yours to
   register and, since gateway `2026.09.12`+1, a third-party miner registering only those never
   leases work. Registration accepts any string; a cell no queued job carries simply never leases.
+  A job reaches your miner only when your advertised cells cover every cell it requires. For
+  Standard Python jobs that is `task:code`, `task:code/<size>`, `task:lang/python`,
+  `task:publication/github-artifact-v1`, `task:acceptance/operator-run-v3` and
+  `task:preflight/deferred-v1`. The reference miner adds the publication, independent-acceptance
+  and preflight cells whenever you pass a `task:lang/` cell (`skeleton.py`); pass the size,
+  language and `operator-run-v3` cells yourself. A hand-built worker must advertise all of them.
+  Only an online runner is matched: register or heartbeat within the gateway's liveness window
+  (about a minute) before you expect a job.
 - **`workdir_root`** — client clones land here, one directory per `task_id`; keep it private and persistent (`mkdir -p -m 700 ~/.ormas/work`). Public-profile jobs retain their checkout and journal for recovery after a crash. The legacy route retains its fresh-checkout behavior. Do not delete a public-profile recovery directory to force a new claim.
 - **`repo_url`** — `MinerConfig` requires it, but on the legacy credential path it is only the fallback: `_clone_and_checkout` clones `draft.repo_url` whenever the draft carries a `repo_credential` and a non-empty `repo_url`, and clones `config.repo_url` only when it does not. Point it at a repository you actually hold, or at the bound repository if you use the fallback below.
 - **`repo_id`** — `MinerConfig` requires it; it is the id sent in a bind request (`RepoRegistration.repo_id`). On the credential path the draft's own `repo_id` describes the job, and this field is not used to choose the clone source.
