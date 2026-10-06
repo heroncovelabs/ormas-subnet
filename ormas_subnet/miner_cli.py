@@ -116,7 +116,7 @@ def _login(args: argparse.Namespace) -> int:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    print(f"{gateway} …{token[-4:]}")
+    print(f"Saved miner key for {gateway} at {path}")
     return 0
 
 

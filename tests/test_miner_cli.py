@@ -71,7 +71,7 @@ def test_login_private_and_redacted(cli, monkeypatch, capsys):
     assert prompts
     output = capsys.readouterr()
     assert TOKEN not in output.out + output.err
-    assert GATEWAY in output.out and TOKEN[-4:] in output.out
+    assert GATEWAY in output.out and TOKEN not in output.out and TOKEN[-4:] not in output.out
     path.chmod(0o644)
     assert cli.main(["login"]) == 0
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
