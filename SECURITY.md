@@ -1,8 +1,8 @@
 # Security
 
 Report vulnerabilities in this repository, the `ormas-runner-v1` protocol, or the Ormas gateway
-(`api.ormas.ai`) to **operations@heroncove.us** — the same monitored address as the SN76 subnet
-identity. Please do not open a public issue for a security report.
+(`api.ormas.ai`) to **ops@ormas.ai**, the monitored Ormas operations mailbox (the SN76 subnet identity on chain
+lists the operating company's address, operations@heroncove.us; either reaches the same team). Please do not open a public issue for a security report.
 
 Include what you found, how to reproduce it, and the version or commit you tested. We acknowledge
 reports within three business days and tell you what we intend to do; we will credit you in the fix

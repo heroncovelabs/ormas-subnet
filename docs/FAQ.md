@@ -100,4 +100,4 @@ your GitHub email is private — use Google or the email link. Neither affects m
 
 **Something in the docs is wrong.**
 Open an issue on this repository — your run is the next rehearsal. Security-sensitive:
-operations@heroncove.us.
+ops@ormas.ai (see SECURITY.md).
