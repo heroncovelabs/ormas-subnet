@@ -77,13 +77,16 @@ Use the user-only installer, then log in and check your host:
 curl -fsSL https://ormas.ai/install.sh | bash
 ormas-miner login --gateway https://api.ormas.ai
 ormas-miner doctor
-ormas-miner register --cell task:code
-ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url> \
-  --cell task:code --solve-command '<cmd>'
+ormas-miner register --cell task:code --miner-id <your-miner-name>
+ormas-miner run --runner-id <assigned-id> --miner-id <your-miner-name> \
+  --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'
 ```
 
 Login saves the key locally with mode `0600`. Run uses the saved gateway and key.
-Save the assigned id from registration. Register your chain identity with
+Save the assigned id from registration. Keep the same `--miner-id` on every run: it
+is your public identity, and once your miner slot is approved under that name the
+gateway reserves your qualification proof job on registration (the `qualification`
+line on stderr tells you whether it was enqueued or which cells are missing). Register your chain identity with
 `ormas-miner register-hotkey --runner-id <assigned-id> --hotkey-ss58 <ss58>
 --sign-command '<signer>'`.
 

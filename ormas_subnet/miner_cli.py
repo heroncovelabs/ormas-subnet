@@ -120,6 +120,48 @@ def _login(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_registration(registration: dict) -> bool:
+    raw_cells = registration.get("cells")
+    cells = (
+        {cell for cell in raw_cells if isinstance(cell, str)}
+        if isinstance(raw_cells, list) else set()
+    )
+    required = (
+        "task:code", "task:lang/python", "task:publication/github-artifact-v1",
+        "task:acceptance/operator-run-v3", "task:preflight/deferred-v1",
+    )
+    missing = [cell for cell in required if cell not in cells]
+    sizes = [size for size in ("small", "medium", "large") if f"task:code/{size}" in cells]
+    if not sizes:
+        missing.append("task:code/small|task:code/medium|task:code/large")
+    coverage = "MISSING " + " ".join(missing) if missing else "ok"
+    print(f"cells: {coverage} (sizes: {', '.join(sizes) or 'none'})")
+
+    hotkey = registration.get("hotkey")
+    if isinstance(hotkey, dict) and hotkey.get("bound") is True:
+        print("hotkey: bound" + ("" if hotkey.get("verified") is True else " (unverified)"))
+    else:
+        print("hotkey: none")
+        print("warn hotkey: run ormas-miner register-hotkey")
+
+    cap = registration.get("claim_cap")
+    cap = cap if type(cap) is int and cap >= 0 else "unknown"
+    qualification = registration.get("qualification")
+    status = None
+    if isinstance(qualification, dict):
+        job = qualification.get("job")
+        status = qualification.get("job_status") or qualification.get("status")
+        if status is None and isinstance(job, dict):
+            status = job.get("status")
+    # Job statuses are protocol values; arbitrary response text stays out of diagnostics.
+    known_status = isinstance(status, str) and status in (
+        "queued", "running", "done", "failed", "cancelled", "outcome_unknown",
+    )
+    suffix = f" (job: {status})" if known_status else ""
+    print(f"qualification: cap {cap}{suffix}")
+    return not missing
+
+
 def _doctor(args: argparse.Namespace) -> int:
     passed = True
 
@@ -156,15 +198,40 @@ def _doctor(args: argparse.Namespace) -> int:
         try:
             with httpx.Client(base_url=gateway, headers={"Authorization": f"Bearer {token}"},
                               timeout=10.0) as transport:
-                with OrmasMinerClient(gateway, token, http_client=transport) as client:
-                    client.list_queue(_AUTH_PROBE_ID)
-            check("token", True, "key accepted (account enablement not confirmed)")
+                with OrmasMinerClient(gateway, token, http_client=transport,
+                                      device_nonce=args.device_nonce) as client:
+                    try:
+                        queue = client.list_queue(args.runner_id or _AUTH_PROBE_ID)
+                    except OrmasGatewayError as exc:
+                        # A typed lookup miss follows authentication in the queue protocol.
+                        if exc.status_code != 404 or exc.error_type != "not_found_error":
+                            raise
+                        queue = {}
+                    check("token", True, "key accepted (account enablement not confirmed)")
+                    for entry in queue.get("excluded", []):
+                        job_id = entry.get("job_id")
+                        excluded_by = entry.get("excluded_by")
+                        if job_id is None or excluded_by is None:
+                            continue
+                        detail = (json.dumps(entry["detail"], sort_keys=True)
+                                  if entry.get("detail") else "")
+                        print(f"reserved job {job_id} hidden: {excluded_by} {detail}".rstrip())
+                    try:
+                        registration = client.get_registration(args.runner_id)
+                        coverage_ok = _doctor_registration(registration)
+                        passed = passed and coverage_ok
+                    except OrmasGatewayError as exc:
+                        # A gateway older than the /runners/me route answers a plain 404
+                        # with no typed error; that is a missing feature, not a refusal.
+                        if exc.status_code == 404 and not exc.error_type:
+                            print("WARN registration: gateway does not expose /runners/me")
+                        else:
+                            check("registration", False,
+                                  f"gateway rejected lookup (HTTP {exc.status_code})")
+                    except (httpx.HTTPError, OSError, ValueError):
+                        check("registration", False, "lookup failed or invalid registration response")
         except OrmasGatewayError as exc:
-            # A typed lookup miss follows authentication in the queue protocol.
-            authenticated = exc.status_code == 404 and exc.error_type == "not_found_error"
-            reason = ("key accepted (account enablement not confirmed)" if authenticated
-                      else f"gateway rejected probe (HTTP {exc.status_code})")
-            check("token", authenticated, reason)
+            check("token", False, f"gateway rejected probe (HTTP {exc.status_code})")
         except (httpx.HTTPError, OSError, ValueError):
             check("token", False, "authentication probe failed")
     else:
@@ -216,11 +283,13 @@ def _reference_command(command: str, argv: list[str]) -> int:
         workdir_root=Path(args.workdir_root),
         repo_id=args.repo_id or "",
         repo_url=args.repo_url or "",
+        miner_id=args.miner_id,
     )
     with OrmasMinerClient(args.gateway, token) as client:
         miner = reference.MinerSkeleton(client, config, reference.make_shell_solver("true"))
         response = miner.register()
     print(json.dumps(response))
+    print(reference.qualification_line(response), file=sys.stderr)
     return 0
 
 
@@ -236,6 +305,12 @@ def main(argv: list[str] | None = None) -> int:
         if command in ("login", "doctor"):
             sub = argparse.ArgumentParser(prog=f"ormas-miner {command}")
             sub.add_argument("--gateway", help=f"Gateway URL (default: {DEFAULT_GATEWAY})")
+            if command == "doctor":
+                sub.add_argument("--runner-id", help=(
+                    "Registered miner ID for queue diagnostics; this queue read refreshes last_seen "
+                    "and marks a stopped miner live for the liveness window."
+                ))
+                sub.add_argument("--device-nonce", help="Registered device nonce, when bound")
             group = sub.add_mutually_exclusive_group()
             group.add_argument("--token-env", help="Environment variable holding the miner key")
             group.add_argument("--token-file", help="File holding the miner key")

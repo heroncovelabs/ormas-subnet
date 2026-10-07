@@ -241,6 +241,21 @@ class OrmasMinerClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def get_registration(self, runner_id: str | None = None) -> dict[str, Any]:
+        """GET /api/runner/v1/runners/me — this token's active registration."""
+        from urllib.parse import quote
+
+        path = "/api/runner/v1/runners/me"
+        if runner_id is not None:
+            path += f"?runner_id={quote(str(runner_id), safe='')}"
+        headers = self._headers()
+        resp = self._client.get(path) if headers is None else self._client.get(path, headers=headers)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("invalid registration payload")
+        return payload
+
     def register_repository(
         self,
         runner_id: str,
