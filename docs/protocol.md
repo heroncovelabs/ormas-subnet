@@ -14,7 +14,7 @@ mining logic.
 
 ## Transport
 
-- The queue route is `GET`; the other routes below are `POST`.
+- The queue and own-registration routes are `GET`; the other routes below are `POST`.
 - Base path: `/api/runner/v1`.
 - Auth: `Authorization: Bearer <token>` where `<token>` is a runner token issued
   out of band (starts with `ormr_`). A missing/invalid/rate-limited token
@@ -24,8 +24,8 @@ mining logic.
   what the gateway stored, or the request is rejected as unauthorized. First
   registration may omit it (the gateway can fall back to the header value).
 - Every JSON request body must include `"schema_version": "ormas-runner-v1"`. A
-  missing/wrong value is rejected as `400 unknown_field:schema_version`. The queue
-  GET has no body; binary publication uses its own schema below.
+  missing/wrong value is rejected as `400 unknown_field:schema_version`. The GET
+  routes have no body; binary publication uses its own schema below.
 - **Strict allowlists.** Every route rejects any field not on its allowlist
   (`400 unknown_field:<field>`), and separately rejects a small set of
   universally forbidden fields even before the allowlist check
@@ -106,12 +106,43 @@ Register (or re-register) this miner.
 | `health` | object | Must include non-empty `cells: [str, ...]` — the task-type cells this miner serves: `task:code`, `task:code/<small|medium|large>`, `task:lang/<language>` (see INSTALL.md); may include `device_nonce` |
 | `miner_id` | str, optional | Chosen public miner identity. Lowercase, 3–40 chars, `[a-z0-9][a-z0-9-]*`. Globally unique (409 if another runner holds it); the same runner may re-register with its own id. When set, claims, receipts (`worker_id`) and the hotkey identity become `miner:<miner_id>` instead of `miner:<tenant>`. Omit for a byte-identical-to-today body |
 
-**Response**: `{"runner_id": str, "poll_interval_s": int, "lease_ttl_s": int, "heartbeat_s": int, "protocol": "ormas-runner-v1", "miner_id"?: str}`. `miner_id` is echoed only when the runner registered one.
+**Response**: `{"runner_id": str, "poll_interval_s": int, "lease_ttl_s": int, "heartbeat_s": int, "protocol": "ormas-runner-v1", "miner_id"?: str, "qualification"?: object}`. `miner_id` is echoed only when the runner registered one.
+
+`qualification` appears only when this token's daily claim cap is 0 and the operator has
+approved a miner slot for `miner:<miner_id>`. The gateway then reserves one qualification
+proof job for this miner (an `award_policy` only it can claim) and reports one of:
+`{"status": "enqueued", "job_id": str}` (new proof job; keep the miner running and it will
+appear on your queue read), `{"status": "pending", "job_id": str}` (a proof job already
+exists or was paid), `{"status": "cells_missing", "missing": [str, ...]}` (register again
+with those cells added), or `{"status": "error", "error": str}`. Re-registering is the
+retry path. A paid proof job raises the token's daily claim cap, which opens the general
+queue. The key is absent for every other registration.
 Today's server values: `poll_interval_s=15`, `lease_ttl_s=300`, `heartbeat_s=90`
 (`runner_api.py` module constants `POLL_INTERVAL_S` / `LEASE_TTL_S` /
 `HEARTBEAT_S`). **Treat these as authoritative and read them from the response**
 — do not hardcode them; this package's defaults exist only for use before the
 first registration response arrives.
+
+### `GET /api/runner/v1/runners/me`
+
+Read this token's latest active miner registration. Optional query parameter
+`runner_id` selects a specific active registration belonging to the same token.
+The read leaves registration health and liveness unchanged. A missing registration,
+a retired registration, or an id belonging to another token returns `404`.
+Device-bound registrations require `X-Ormas-Runner-Device` as above.
+
+**Response**: `{"runner_id": str, "cells": [str, ...], "hotkey": {"bound": bool, "verified": bool}, "claim_cap": int}`.
+`cells` contains the registered task cells. `hotkey` reports binding and verification
+state for the miner's chosen identity, or its tenant identity when none is chosen.
+`claim_cap` is the token's configured daily claim cap. The response contains no
+hotkey address, proof material, device nonce or credential.
+
+`ormas-miner doctor` uses this read to check Standard Python cells, hotkey binding
+and the claim cap. `--runner-id` selects the registration; `--device-nonce` supplies
+a bound device's nonce. Missing required cells produce a failing exit status.
+An absent hotkey produces a warning pointing to `ormas-miner register-hotkey`.
+Optional future `qualification` metadata may carry the qualification job status;
+its absence leaves the cap diagnostic available.
 
 ### `POST /api/runner/v1/repositories`
 
