@@ -14,6 +14,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "ormr_test_private_abcd"
 GATEWAY = "https://api.ormas.ai"
+STANDARD_CELLS = [
+    "task:code", "task:code/small", "task:lang/python",
+    "task:publication/github-artifact-v1", "task:acceptance/operator-run-v3",
+    "task:preflight/deferred-v1",
+]
 
 
 @pytest.fixture
@@ -30,6 +35,10 @@ def gateway(monkeypatch):
         "/health": (200, {"status": "ok"}),
         "/api/runner/v1/queue": (200, {"jobs": []}),
         "/api/runner/v1/registrations": (200, {"runner_id": "runr_test"}),
+        "/api/runner/v1/runners/me": (200, {
+            "runner_id": "runr_test", "cells": list(STANDARD_CELLS), "claim_cap": 1,
+            "hotkey": {"bound": True, "verified": True},
+        }),
     }
     client_class = httpx.Client
 
@@ -102,9 +111,128 @@ def test_doctor_success(cli, gateway, capsys, monkeypatch):
     assert TOKEN not in output
     assert "key accepted (account enablement not confirmed)" in output
     requests, _ = gateway
-    assert [request.url.path for request in requests] == ["/health", "/api/runner/v1/queue"]
+    assert [request.url.path for request in requests] == [
+        "/health", "/api/runner/v1/queue", "/api/runner/v1/runners/me",
+    ]
     assert requests[1].headers["Authorization"] == f"Bearer {TOKEN}"
     assert requests[1].method == "GET"
+    assert requests[2].headers["Authorization"] == f"Bearer {TOKEN}"
+    assert requests[2].method == "GET"
+    assert "cells: ok (sizes: small)" in output
+    assert "hotkey: bound" in output
+    assert "qualification: cap 1" in output
+
+
+def test_doctor_missing_preflight(cli, gateway, capsys):
+    credentials()
+    registration = gateway[1]["/api/runner/v1/runners/me"][1]
+    registration["cells"].remove("task:preflight/deferred-v1")
+    assert cli.main(["doctor"]) == 1
+    output = capsys.readouterr().out
+    assert "cells: MISSING task:preflight/deferred-v1" in output
+    assert "sizes: small" in output
+
+
+@pytest.mark.parametrize("size", ["small", "medium", "large"])
+def test_doctor_accepts_any_code_size(cli, gateway, capsys, size):
+    credentials()
+    registration = gateway[1]["/api/runner/v1/runners/me"][1]
+    registration["cells"][1] = "task:code/" + size
+    assert cli.main(["doctor"]) == 0
+    assert f"cells: ok (sizes: {size})" in capsys.readouterr().out
+
+
+def test_doctor_requires_code_size(cli, gateway, capsys):
+    credentials()
+    registration = gateway[1]["/api/runner/v1/runners/me"][1]
+    registration["cells"].remove("task:code/small")
+    assert cli.main(["doctor"]) == 1
+    output = capsys.readouterr().out
+    assert "cells: MISSING" in output
+    for size in ("small", "medium", "large"):
+        assert "task:code/" + size in output
+
+
+@pytest.mark.parametrize("hotkey,expected,warning", [
+    ({"bound": False, "verified": False}, "hotkey: none", True),
+    ({"bound": True, "verified": True}, "hotkey: bound\n", False),
+    ({"bound": True, "verified": False}, "hotkey: bound (unverified)", False),
+])
+def test_doctor_hotkey(cli, gateway, capsys, hotkey, expected, warning):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"][1]["hotkey"] = hotkey
+    assert cli.main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert expected in output
+    assert ("warn hotkey: run ormas-miner register-hotkey" in output) is warning
+
+
+@pytest.mark.parametrize("qualification", [
+    {"status": "queued"}, {"job_status": "queued"}, {"job": {"status": "queued"}},
+])
+def test_doctor_optional_qualification_status(cli, gateway, capsys, qualification):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"][1]["qualification"] = qualification
+    assert cli.main(["doctor"]) == 0
+    assert "qualification: cap 1 (job: queued)" in capsys.readouterr().out
+
+
+def test_doctor_unknown_qualification_outcome(cli, gateway, capsys):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"][1]["qualification"] = {"status": "outcome_unknown"}
+    assert cli.main(["doctor"]) == 0
+    assert "qualification: cap 1 (job: outcome_unknown)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("payload", [None, [], "invalid", {}, {"cells": "task:code"}])
+def test_doctor_malformed_registration(cli, gateway, capsys, payload):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"] = 200, payload
+    assert cli.main(["doctor"]) == 1
+    output = capsys.readouterr()
+    assert "Traceback" not in output.out + output.err
+    assert TOKEN not in output.out + output.err
+
+
+def test_doctor_malformed_optional_registration_fields(cli, gateway, capsys):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"][1].update({
+        "hotkey": {"bound": "false", "verified": "false"},
+        "claim_cap": True, "qualification": [],
+    })
+    assert cli.main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert "hotkey: none" in output
+    assert "qualification: cap unknown" in output
+
+
+@pytest.mark.parametrize("status", [401, 404, 500])
+def test_doctor_registration_refusal_redacted(cli, gateway, capsys, status):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"] = status, {
+        "error": {"type": "not_found_error", "message": TOKEN},
+    }
+    assert cli.main(["doctor"]) == 1
+    output = capsys.readouterr().out
+    assert f"FAIL registration: gateway rejected lookup (HTTP {status})" in output
+    assert TOKEN not in output
+
+
+def test_doctor_old_gateway_without_runners_me_route_warns(cli, gateway, capsys):
+    credentials()
+    gateway[1]["/api/runner/v1/runners/me"] = 404, {"detail": "Not Found"}
+    assert cli.main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert "WARN registration: gateway does not expose /runners/me" in output
+    assert "FAIL registration" not in output
+
+
+def test_doctor_registration_selection_and_device(cli, gateway):
+    credentials()
+    assert cli.main(["doctor", "--runner-id", "runr_test", "--device-nonce", "device"]) == 0
+    for request in gateway[0][1:]:
+        assert request.headers["X-Ormas-Runner-Device"] == "device"
+        assert request.url.params["runner_id"] == "runr_test"
 
 
 def test_doctor_old_python(cli, gateway, monkeypatch, capsys):
@@ -195,6 +323,65 @@ def test_register_uses_existing_registration(cli, gateway, capsys):
     assert payload["health"]["cells"] == ["task:code"]
     assert "runr_test" in capsys.readouterr().out
     assert len(gateway[0]) == 1
+
+
+def test_register_sends_miner_id_and_reports_qualification(cli, gateway, capsys):
+    credentials()
+    gateway[1]["/api/runner/v1/registrations"] = (200, {
+        "runner_id": "runr_test", "miner_id": "acme-miner",
+        "qualification": {"status": "enqueued", "job_id": "job_proof1"},
+    })
+    assert cli.main(["register", "--cell", "task:code", "--miner-id", "acme-miner"]) == 0
+    payload = json.loads(gateway[0][0].content)
+    assert payload["miner_id"] == "acme-miner"
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.strip())["qualification"]["job_id"] == "job_proof1"
+    assert "qualification: proof job job_proof1 reserved for you" in captured.err
+
+
+def test_register_without_miner_id_omits_it(cli, gateway, capsys):
+    credentials()
+    assert cli.main(["register", "--cell", "task:code"]) == 0
+    assert "miner_id" not in json.loads(gateway[0][0].content)
+    assert "qualification: none" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("qualification", "expected"),
+    [
+        (None, "qualification: none"),
+        ({"status": "pending", "job_id": "job_1"}, "job_1 already in progress"),
+        ({"status": "cells_missing", "missing": ["task:lang/python", "task:code/small"]},
+         "add cells and re-register: task:lang/python task:code/small"),
+        ({"status": "error", "error": "public_miner_outside_working_set"},
+         "gateway refused (public_miner_outside_working_set)"),
+    ],
+)
+def test_qualification_line_shapes(qualification, expected):
+    from neurons import miner
+
+    response = {"runner_id": "runr_test"}
+    if qualification is not None:
+        response["qualification"] = qualification
+    assert expected in miner.qualification_line(response)
+
+
+def test_run_passes_miner_id_and_prints_qualification(cli, gateway, monkeypatch, capsys):
+    from neurons import miner
+
+    credentials()
+    gateway[1]["/api/runner/v1/registrations"] = (200, {
+        "runner_id": "runr_test", "miner_id": "acme-miner",
+        "qualification": {"status": "cells_missing", "missing": ["task:lang/python"]},
+    })
+    monkeypatch.setattr(miner.MinerSkeleton, "run_once", lambda _self: True)
+    assert cli.main(["run", "--repo-id", "repo", "--repo-url", "https://example.test/repo.git",
+                     "--cell", "task:code", "--solve-command", "true", "--once",
+                     "--miner-id", "acme-miner"]) == 0
+    assert json.loads(gateway[0][0].content)["miner_id"] == "acme-miner"
+    err = capsys.readouterr().err
+    assert "miner_id=acme-miner" in err
+    assert "qualification: add cells and re-register: task:lang/python" in err
 
 
 @pytest.mark.parametrize("command", ["run", "register-hotkey"])
@@ -463,3 +650,39 @@ def test_install_run_example_uses_assigned_id():
     paragraph = text.split("The same loop is available as ", 1)[1].split("\n\n", 1)[0]
     example = "ormas-miner run --runner-id <assigned-id> --repo-id <id>"
     assert example in paragraph
+
+
+def test_doctor_prints_reserved_job_exclusions(cli, gateway, capsys):
+    credentials()
+    gateway[1]["/api/runner/v1/queue"] = 200, {
+        "schema_version": "ormas.runner-queue.v1", "jobs": [],
+        "excluded": [
+            {"job_id": "job_reserved", "excluded_by": "required_cells_missing",
+             "detail": {"cells": ["task:code"]}},
+            {"job_id": "job_stale", "excluded_by": "validator_liveness"},
+        ],
+    }
+    assert cli.main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert 'reserved job job_reserved hidden: required_cells_missing {"cells": ["task:code"]}' in output
+    assert "reserved job job_stale hidden: validator_liveness" in output
+    assert TOKEN not in output
+
+
+def test_doctor_skips_malformed_exclusions(cli, gateway, capsys):
+    credentials()
+    gateway[1]["/api/runner/v1/queue"] = 200, {
+        "schema_version": "ormas.runner-queue.v1", "jobs": [],
+        "excluded": [
+            {"job_id": "job_missing_reason"},
+            {"excluded_by": "required_cells_missing"},
+        ],
+    }
+    assert cli.main(["doctor"]) == 0
+    assert "reserved job" not in capsys.readouterr().out
+
+
+def test_doctor_queries_requested_runner(cli, gateway):
+    credentials()
+    assert cli.main(["doctor", "--runner-id", "runr_mine"]) == 0
+    assert gateway[0][1].url.params["runner_id"] == "runr_mine"

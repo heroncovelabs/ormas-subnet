@@ -34,6 +34,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -69,6 +70,11 @@ def build_parser(*, credential_defaults: bool = False) -> argparse.ArgumentParse
         "--runner-id", default="",
         help="This miner's gateway-assigned id (runr_<12hex>); omit on first run — "
         "the gateway assigns it and it is printed; pass it on later runs",
+    )
+    ap.add_argument(
+        "--miner-id", default=None,
+        help="Public miner identity (lowercase [a-z0-9-], 3-40 chars); must match your "
+        "approved miner slot for the self-serve qualification job",
     )
     ap.add_argument("--repo-id", help="Repo id the gateway bound for this project")
     ap.add_argument("--repo-url", help="Credential-free clone URL (https or ssh)")
@@ -115,6 +121,28 @@ def build_parser(*, credential_defaults: bool = False) -> argparse.ArgumentParse
         "Keypair.sign); the key never enters this package",
     )
     return ap
+
+
+def qualification_line(response: Any) -> str:
+    """One line a miner can act on, from the registration's ``qualification`` key.
+
+    The gateway adds the key only on a slot-approved cap-0 token with the
+    self-serve proof configured; its absence is reported as such.
+    """
+    qual = response.get("qualification") if isinstance(response, dict) else None
+    if not isinstance(qual, dict):
+        return "qualification: none (no reserved proof job for this registration)"
+    status = qual.get("status")
+    if status == "enqueued":
+        return f"qualification: proof job {qual.get('job_id')} reserved for you; keep running"
+    if status == "pending":
+        return f"qualification: proof job {qual.get('job_id')} already in progress"
+    if status == "cells_missing":
+        missing = " ".join(str(c) for c in qual.get("missing") or [])
+        return f"qualification: add cells and re-register: {missing}".rstrip()
+    if status == "error":
+        return f"qualification: gateway refused ({qual.get('error')}); contact ops@ormas.ai"
+    return f"qualification: {status}"
 
 
 def _parse(
@@ -176,6 +204,7 @@ def main(argv: list[str] | None = None, *, token: str | None = None) -> int:
         repo_url=args.repo_url,
         push_remote=None if args.no_push else "origin",
         ask_usd=args.ask_usd,
+        miner_id=args.miner_id,
     )
     miner = MinerSkeleton(client, config, make_shell_solver(args.solve_command))
     response = miner.register()
@@ -187,6 +216,7 @@ def main(argv: list[str] | None = None, *, token: str | None = None) -> int:
     if echoed:
         line += f" miner_id={echoed}"
     print(line, file=sys.stderr)
+    print(qualification_line(response), file=sys.stderr)
     if args.bind_project:
         if not args.bind_base_commit:
             ap_err = "--bind-base-commit is required with --bind-project"

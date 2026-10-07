@@ -75,15 +75,20 @@ on `PATH` is a warning. Account enablement and qualification remain separate che
 Register without polling:
 
 ```bash
-ormas-miner register --cell task:code
+ormas-miner register --cell task:code --miner-id <your-miner-name>
 ```
 
-Save the assigned `runner_id` from the response. Run the reference loop with your
-solve command:
+Save the assigned `runner_id` from the response. `--miner-id` is your public miner
+identity (lowercase `[a-z0-9-]`, 3–40 characters). Use the same name on every run:
+once the operator approves your miner slot under that name, a registration with the
+required cells reserves your qualification proof job automatically. The response's
+`qualification` key reports `enqueued`, `pending`, or `cells_missing` with the cells to
+add; the CLI prints the same as one `qualification:` line on stderr. Run the reference
+loop with your solve command:
 
 ```bash
-ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url> \
-  --cell task:code --solve-command '<cmd>'
+ormas-miner run --runner-id <assigned-id> --miner-id <your-miner-name> \
+  --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'
 ```
 
 `run` and `register-hotkey` use the existing reference miner parser and functions.
