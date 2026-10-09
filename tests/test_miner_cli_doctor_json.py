@@ -4,7 +4,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from pathlib import Path
 
 import httpx
 import pytest
