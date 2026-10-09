@@ -120,7 +120,7 @@ def _login(args: argparse.Namespace) -> int:
     return 0
 
 
-def _doctor_registration(registration: dict) -> bool:
+def _doctor_registration(registration: dict, say=print) -> bool:
     raw_cells = registration.get("cells")
     cells = (
         {cell for cell in raw_cells if isinstance(cell, str)}
@@ -135,14 +135,14 @@ def _doctor_registration(registration: dict) -> bool:
     if not sizes:
         missing.append("task:code/small|task:code/medium|task:code/large")
     coverage = "MISSING " + " ".join(missing) if missing else "ok"
-    print(f"cells: {coverage} (sizes: {', '.join(sizes) or 'none'})")
+    say(f"cells: {coverage} (sizes: {', '.join(sizes) or 'none'})")
 
     hotkey = registration.get("hotkey")
     if isinstance(hotkey, dict) and hotkey.get("bound") is True:
-        print("hotkey: bound" + ("" if hotkey.get("verified") is True else " (unverified)"))
+        say("hotkey: bound" + ("" if hotkey.get("verified") is True else " (unverified)"))
     else:
-        print("hotkey: none")
-        print("warn hotkey: run ormas-miner register-hotkey")
+        say("hotkey: none")
+        say("warn hotkey: run ormas-miner register-hotkey")
 
     cap = registration.get("claim_cap")
     cap = cap if type(cap) is int and cap >= 0 else "unknown"
@@ -158,17 +158,86 @@ def _doctor_registration(registration: dict) -> bool:
         "queued", "offering", "running", "done", "failed", "cancelled", "outcome_unknown",
     )
     suffix = f" (job: {status})" if known_status else ""
-    print(f"qualification: cap {cap}{suffix}")
+    say(f"qualification: cap {cap}{suffix}")
     return not missing
+
+
+def _doctor_facts(facts: dict, registration: dict) -> None:
+    """Record the registration facts `--json` reports; the human lines stay as they are."""
+    raw_cells = registration.get("cells")
+    cells = (
+        {cell for cell in raw_cells if isinstance(cell, str)}
+        if isinstance(raw_cells, list) else set()
+    )
+    required = (
+        "task:code", "task:lang/python", "task:publication/github-artifact-v1",
+        "task:acceptance/operator-run-v3", "task:preflight/deferred-v1",
+    )
+    missing = [cell for cell in required if cell not in cells]
+    sizes = [size for size in ("small", "medium", "large") if f"task:code/{size}" in cells]
+    if not sizes:
+        missing.append("task:code/small|task:code/medium|task:code/large")
+    facts["cells"] = {"ok": not missing, "sizes": sizes, "missing": missing}
+    runner_id = registration.get("runner_id")
+    facts["runner_id"] = runner_id if isinstance(runner_id, str) else None
+    cap = registration.get("claim_cap")
+    qualification = registration.get("qualification")
+    status = None
+    if isinstance(qualification, dict):
+        job = qualification.get("job")
+        status = qualification.get("job_status") or qualification.get("status")
+        if status is None and isinstance(job, dict):
+            status = job.get("status")
+    facts["qualification"] = {
+        "cap": cap if type(cap) is int and cap >= 0 else None,
+        "status": status if isinstance(status, str) and status in (
+            "queued", "offering", "running", "done", "failed", "cancelled",
+            "outcome_unknown",
+        ) else None,
+    }
+
+
+class _Reporter:
+    """Prints the human doctor report, or buffers it so ``--json`` stays one object.
+
+    Under ``--json`` the human lines are held for stderr instead of stdout, so the
+    JSON object is the only thing ``doctor --json`` writes to stdout while the
+    diagnostics remain observable.
+    """
+
+    def __init__(self, json_mode: bool) -> None:
+        self.json_mode = json_mode
+        self.lines: list[str] = []
+
+    def write(self, text: str) -> None:
+        if self.json_mode:
+            self.lines.append(text)
+        else:
+            print(text)
+
+    def flush(self) -> None:
+        if not self.lines:
+            return
+        print("\n".join(self.lines), file=sys.stderr)
+        self.lines.clear()
 
 
 def _doctor(args: argparse.Namespace) -> int:
     passed = True
+    report = _Reporter(bool(getattr(args, "json", False)))
+    say = report.write
+    facts = {
+        "gateway": {"url": _gateway(args.gateway or DEFAULT_GATEWAY), "reachable": False},
+        "runner_id": None,
+        "qualification": {"cap": None, "status": None},
+        "cells": {"ok": False, "sizes": [], "missing": []},
+        "queue": {"visible": None},
+    }
 
     def check(label: str, good: bool, reason: str) -> None:
         nonlocal passed
         passed = passed and good
-        print(f"{'ok' if good else 'FAIL'} {label}: {reason}")
+        say(f"{'ok' if good else 'FAIL'} {label}: {reason}")
 
     python_ok = sys.version_info[:2] >= (3, 10)
     check("python", python_ok, "Python >= 3.10" if python_ok else "Python >= 3.10 required")
@@ -190,6 +259,7 @@ def _doctor(args: argparse.Namespace) -> int:
             if not isinstance(response.json(), dict):
                 raise ValueError("health response must be a JSON object")
         health_ok = True
+        facts["gateway"] = {"url": gateway, "reachable": True}
         check("gateway", True, f"{gateway}/health reachable")
     except (httpx.HTTPError, OSError, ValueError):
         check("gateway", False, "unreachable or invalid /health response")
@@ -207,6 +277,8 @@ def _doctor(args: argparse.Namespace) -> int:
                         if exc.status_code != 404 or exc.error_type != "not_found_error":
                             raise
                         queue = {}
+                    jobs = queue.get("jobs")
+                    facts["queue"] = {"visible": len(jobs) if isinstance(jobs, list) else None}
                     check("token", True, "key accepted (account enablement not confirmed)")
                     for entry in queue.get("excluded", []):
                         job_id = entry.get("job_id")
@@ -215,16 +287,17 @@ def _doctor(args: argparse.Namespace) -> int:
                             continue
                         detail = (json.dumps(entry["detail"], sort_keys=True)
                                   if entry.get("detail") else "")
-                        print(f"reserved job {job_id} hidden: {excluded_by} {detail}".rstrip())
+                        say(f"reserved job {job_id} hidden: {excluded_by} {detail}".rstrip())
                     try:
                         registration = client.get_registration(args.runner_id)
-                        coverage_ok = _doctor_registration(registration)
+                        _doctor_facts(facts, registration)
+                        coverage_ok = _doctor_registration(registration, say)
                         passed = passed and coverage_ok
                     except OrmasGatewayError as exc:
                         # A gateway older than the /runners/me route answers a plain 404
                         # with no typed error; that is a missing feature, not a refusal.
                         if exc.status_code == 404 and not exc.error_type:
-                            print("WARN registration: gateway does not expose /runners/me")
+                            say("WARN registration: gateway does not expose /runners/me")
                         else:
                             check("registration", False,
                                   f"gateway rejected lookup (HTTP {exc.status_code})")
@@ -238,8 +311,12 @@ def _doctor(args: argparse.Namespace) -> int:
         check("token", False, "authentication probe requires credentials and gateway health")
     local_bin = str(Path.home() / ".local" / "bin")
     on_path = local_bin in os.environ.get("PATH", "").split(os.pathsep)
-    print(f"{'ok' if on_path else 'warn'} PATH: {local_bin} "
-          f"{'is on PATH' if on_path else 'is missing from PATH'}")
+    say(f"{'ok' if on_path else 'warn'} PATH: {local_bin} "
+        f"{'is on PATH' if on_path else 'is missing from PATH'}")
+    if report.json_mode:
+        report.flush()
+        facts["ok"] = passed
+        print(json.dumps(facts))
     return 0 if passed else 1
 
 
@@ -311,6 +388,10 @@ def main(argv: list[str] | None = None) -> int:
                     "and marks a stopped miner live for the liveness window."
                 ))
                 sub.add_argument("--device-nonce", help="Registered device nonce, when bound")
+                sub.add_argument("--json", action="store_true", help=(
+                    "Write one JSON object with the doctor's facts to stdout instead of the "
+                    "human report"
+                ))
             group = sub.add_mutually_exclusive_group()
             group.add_argument("--token-env", help="Environment variable holding the miner key")
             group.add_argument("--token-file", help="File holding the miner key")
