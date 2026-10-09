@@ -10,6 +10,7 @@ from actually running `verify_command` (never a solver self-declaration).
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -93,7 +94,7 @@ def _run_one_task(
     return gateway, skeleton
 
 
-_GIT_AVAILABLE = subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+_GIT_AVAILABLE = shutil.which("git") is not None
 requires_git = pytest.mark.skipif(not _GIT_AVAILABLE, reason="git binary not available")
 
 

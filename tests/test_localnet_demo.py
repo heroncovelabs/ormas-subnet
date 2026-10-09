@@ -9,7 +9,7 @@ gives an outside miner operator.
 from __future__ import annotations
 
 import importlib.util
-import subprocess
+import shutil
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -18,7 +18,7 @@ import pytest
 
 _DEMO_PATH = Path(__file__).resolve().parent.parent / "neurons" / "localnet_demo.py"
 
-_GIT_AVAILABLE = subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+_GIT_AVAILABLE = shutil.which("git") is not None
 requires_git = pytest.mark.skipif(not _GIT_AVAILABLE, reason="git binary not available")
 
 
