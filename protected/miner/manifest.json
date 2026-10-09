@@ -31,8 +31,7 @@
       }
     ],
     "allowed_compose_hashes_hex": [
-      "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805",
-      "4ec5b887fc277b1a157cba04d36426508c3fbab057fc2e4a2c55981c96917853"
+      "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805"
     ],
     "allowed_tcb_statuses": [
       "UpToDate",
@@ -50,7 +49,6 @@
     "Rotate via PR: add the new image_id with supersedes set to the previous image_id, so",
     "git log on tensorbox_spec/privacy/manifests/ is the audit trail.",
     "expected_vmpl is 1: our measured image runs the Ormas client at VMPL 1 (owner default 2026-10-01, coordination/owner_decisions_2026_10_01_protected_defaults_and_standard_routing.md); the Targon T1 proof report was issued at VMPL 1.",
-    "tdx.allowed_tcb_statuses admits SWHardeningNeeded beside UpToDate (owner decision 2026-10-07, coordination/owner_decisions_2026_10_07_direction_defaults.md item 1); OutOfDate, Revoked and ConfigurationNeeded stay refused.",
-    "Transition 2026-10-08: the previous compose hash 4ec5b887\u2026 (Fly-registry compose, running production CVMs) stays admitted until the pair is redeployed from the GHCR compose; drop it then."
+    "tdx.allowed_tcb_statuses admits SWHardeningNeeded beside UpToDate (owner decision 2026-10-07, coordination/owner_decisions_2026_10_07_direction_defaults.md item 1); OutOfDate, Revoked and ConfigurationNeeded stay refused."
   ]
 }
