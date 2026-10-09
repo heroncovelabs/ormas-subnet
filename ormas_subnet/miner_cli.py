@@ -155,7 +155,7 @@ def _doctor_registration(registration: dict) -> bool:
             status = job.get("status")
     # Job statuses are protocol values; arbitrary response text stays out of diagnostics.
     known_status = isinstance(status, str) and status in (
-        "queued", "running", "done", "failed", "cancelled", "outcome_unknown",
+        "queued", "offering", "running", "done", "failed", "cancelled", "outcome_unknown",
     )
     suffix = f" (job: {status})" if known_status else ""
     print(f"qualification: cap {cap}{suffix}")
