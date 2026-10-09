@@ -89,6 +89,10 @@ def build_parser(*, credential_defaults: bool = False) -> argparse.ArgumentParse
         help="Firm ask sent with every claim; omit to let the gateway derive one",
     )
     ap.add_argument(
+        "--offer-window", action="store_true",
+        help="Opt in to gateway offer windows; requires a positive --ask-usd",
+    )
+    ap.add_argument(
         "--no-push", action="store_true",
         help="Record a local: ref instead of pushing the result branch",
     )
@@ -204,6 +208,7 @@ def main(argv: list[str] | None = None, *, token: str | None = None) -> int:
         repo_url=args.repo_url,
         push_remote=None if args.no_push else "origin",
         ask_usd=args.ask_usd,
+        offer_window=args.offer_window,
         miner_id=args.miner_id,
     )
     miner = MinerSkeleton(client, config, make_shell_solver(args.solve_command))

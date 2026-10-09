@@ -94,6 +94,7 @@ The equivalent source-checkout command is `python neurons/miner.py --gateway
 https://api.ormas.ai --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id>
 --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`.
 See [Install and connect](docs/INSTALL.md) for credentials and qualification.
+For the Protected service level, use [Run a Protected miner on your own confidential VM](docs/PROTECTED.md).
 
 ## Plugging in your own `solve`
 

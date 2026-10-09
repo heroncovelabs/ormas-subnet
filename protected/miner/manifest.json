@@ -1,0 +1,56 @@
+{
+  "schema": "ormas.measured-image.v1",
+  "image_id": "ormas-protected-miner-v1",
+  "image_digest": "748f62f34a772bd979f38f5063da6b3e8bba4cca2a0041818d1c4970185d0734",
+  "provider_allowlist": [
+    "targon",
+    "phala",
+    "gcp-confidential-space"
+  ],
+  "snp": {
+    "allowed_measurements_hex": [],
+    "ark_sha256_pins_hex": [
+      "69d063b45344d26a2e94e1f4210de49ef555308287d4c174445c95639a540bcd"
+    ],
+    "product_lines": [
+      "milan"
+    ],
+    "min_tcb": null,
+    "expected_vmpl": 1,
+    "require_no_debug": true,
+    "require_no_migrate_ma": true
+  },
+  "tdx": {
+    "allowed_os_images": [
+      {
+        "name": "dstack-0.5.9",
+        "mrtd_hex": "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+        "rtmr0_hex": "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+        "rtmr1_hex": "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+        "rtmr2_hex": "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+      }
+    ],
+    "allowed_compose_hashes_hex": [
+      "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805",
+      "4ec5b887fc277b1a157cba04d36426508c3fbab057fc2e4a2c55981c96917853"
+    ],
+    "allowed_tcb_statuses": [
+      "UpToDate",
+      "SWHardeningNeeded"
+    ],
+    "require_no_debug": true
+  },
+  "published_at": "2026-10-01T00:00:00+00:00",
+  "published_by": "tensorbox-spec operator (pending first measured build)",
+  "supersedes": null,
+  "_notes": [
+    "Placeholder manifest for the Protected-tier miner image (card aa54268a, step 3b).",
+    "allowed_measurements_hex is EMPTY by design: the key-release gate refuses every",
+    "report until an operator pins a launch measurement observed from the published image.",
+    "Rotate via PR: add the new image_id with supersedes set to the previous image_id, so",
+    "git log on tensorbox_spec/privacy/manifests/ is the audit trail.",
+    "expected_vmpl is 1: our measured image runs the Ormas client at VMPL 1 (owner default 2026-10-01, coordination/owner_decisions_2026_10_01_protected_defaults_and_standard_routing.md); the Targon T1 proof report was issued at VMPL 1.",
+    "tdx.allowed_tcb_statuses admits SWHardeningNeeded beside UpToDate (owner decision 2026-10-07, coordination/owner_decisions_2026_10_07_direction_defaults.md item 1); OutOfDate, Revoked and ConfigurationNeeded stay refused.",
+    "Transition 2026-10-08: the previous compose hash 4ec5b887\u2026 (Fly-registry compose, running production CVMs) stays admitted until the pair is redeployed from the GHCR compose; drop it then."
+  ]
+}

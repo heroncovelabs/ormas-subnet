@@ -1,5 +1,7 @@
 # Install and connect a miner
 
+For the Protected service level, follow [Run a Protected miner on your own confidential VM](PROTECTED.md).
+
 No token yet? Run the [local quickstart](QUICKSTART_LOCAL.md) first — the whole loop runs offline, with no token and no gateway.
 
 Get the package installed, get a token, run the skeleton with the reference solver, then plug in your own `solve`. What "miner" means here is defined in [`docs/DECISIONS.md`](DECISIONS.md); the commercial and acceptance terms are in [`docs/CONTRACT.md`](CONTRACT.md) (validator acceptance per [`docs/DECISIONS.md`](DECISIONS.md) §6 — the reference validator ships in this package; see [`README.md`](../README.md) "Release gaps" for release status); the wire contract is [`docs/protocol.md`](protocol.md); the code below comes from [`ormas_subnet/skeleton.py`](../ormas_subnet/skeleton.py) and [`ormas_subnet/reference_solver.py`](../ormas_subnet/reference_solver.py).

@@ -1,0 +1,63 @@
+# MEASURED FILE. dstack extends sha256(app-compose) into RTMR3, and app-compose embeds this
+# file byte for byte. Any byte change (including comments and whitespace) changes the
+# compose hash and needs a new manifest entry: run `compose_hash.py pin` and commit the
+# manifest in the same change. Design: coordination/protected_phala_compose_design_2026_10_07.md
+services:
+  # One-shot: gives the guest's verifier scratch directory to uid/gid 1000, mode 0700, then
+  # exits. Root inside this container only, no network, nothing privileged. Compose creates
+  # every container before starting any, so the miner's bind creates the directory (root,
+  # 0755) and the miner starts only after this service has fixed its owner and mode.
+  scratch-init:
+    image: ghcr.io/heroncovelabs/ormas-protected-miner@sha256:748f62f34a772bd979f38f5063da6b3e8bba4cca2a0041818d1c4970185d0734
+    restart: "no"
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["install", "-d", "-o", "1000", "-g", "1000", "-m", "0700", "/var/lib/ormas-verifier-scratch"]
+    volumes:
+      - /var/lib/ormas-verifier-scratch:/var/lib/ormas-verifier-scratch
+  miner:
+    image: ghcr.io/heroncovelabs/ormas-protected-miner@sha256:748f62f34a772bd979f38f5063da6b3e8bba4cca2a0041818d1c4970185d0734
+    restart: unless-stopped
+    depends_on:
+      scratch-init:
+        condition: service_completed_successfully
+    # Only this service sees the dstack agent socket, read-only. Verifier containers the
+    # miner starts through docker.sock get no dstack socket.
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Sibling verifiers need the same guest/container scratch path. Never share /tmp.
+      # scratch-init sets its owner and mode before the miner starts; the worker jail masks it.
+      - type: bind
+        source: /var/lib/ormas-verifier-scratch
+        target: /var/lib/ormas-verifier-scratch
+        bind:
+          create_host_path: true
+      - miner-state:/var/lib/ormas
+    # The dstack 0.5.9 guest's /var/run/docker.sock is root:997 mode 0660; the miner runs as
+    # uid 1000, so it joins gid 997 (the live proof confirms the gid).
+    group_add:
+      - "997"
+    # The miner's worker jail (bubblewrap) needs the mount calls Docker's default
+    # seccomp/AppArmor profiles block. Nothing privileged.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    environment:
+      ORMAS_API_URL: ${ORMAS_API_URL}
+      ORMAS_RUNNER_TOKEN: ${ORMAS_RUNNER_TOKEN}
+      ORMAS_MINER_ID: ${ORMAS_MINER_ID}
+      ORMAS_RUNTIME: ${ORMAS_RUNTIME}
+      ORMAS_AUTHORIZATION_JSON: ${ORMAS_AUTHORIZATION_JSON}
+      ORMAS_CELL_BOUNDS: ${ORMAS_CELL_BOUNDS}
+      ORMAS_APPROVED_BY: ${ORMAS_APPROVED_BY}
+      ORMAS_PRICING_JSON: ${ORMAS_PRICING_JSON}
+      ORMAS_CELLS: ${ORMAS_CELLS}
+      ORMAS_TASK_CELLS: ${ORMAS_TASK_CELLS}
+      ORMAS_BIND_PROJECT_ID: ${ORMAS_BIND_PROJECT_ID}
+      ENGY_API_KEY: ${ENGY_API_KEY}
+      SAYGM_API_KEY: ${SAYGM_API_KEY}
+      XAI_API_KEY: ${XAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+volumes:
+  miner-state: {}

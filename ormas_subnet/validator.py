@@ -24,10 +24,12 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +37,7 @@ from typing import Any, Callable, Mapping
 
 from .public_acceptance import SUPPORTED_ACCEPTANCE_CONTRACTS, validate_acceptance_contract
 from .skeleton import (
+    DEFAULT_POLL_INTERVAL_S,
     GitError,
     _app_read_expired,
     _credential_git_env,
@@ -341,13 +344,40 @@ class OrmasValidatorClient:
             )
             self._owns_client = True
 
-    def register(self, *, pubkey_hex: str) -> dict[str, Any]:
+    def register(self, *, pubkey_hex: str, task_cells: list[str] | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "schema_version": VALIDATOR_PROTOCOL_V1,
+            "pubkey_hex": pubkey_hex,
+            "acceptance_contracts": list(SUPPORTED_ACCEPTANCE_CONTRACTS),
+        }
+        if task_cells is not None:
+            # Only a checker that can attest advertises the Protected cell.
+            body["task_cells"] = list(task_cells)
+        resp = self._client.post("/api/validator/v1/registrations", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def request_attestation_challenge(self, assignment_id: str) -> dict[str, Any]:
+        """One-use nonce plus the ``job_id``/``attempt`` binding for a Protected assignment."""
         resp = self._client.post(
-            "/api/validator/v1/registrations",
+            f"/api/validator/v1/assignments/{assignment_id}/attestation-challenge",
+            json={"schema_version": VALIDATOR_PROTOCOL_V1},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def release_sealed_credential(
+        self, assignment_id: str, *, challenge_nonce: str, evidence: Mapping[str, Any],
+        enclave_pubkey: str,
+    ) -> dict[str, Any]:
+        """The read token sealed to the attested enclave key."""
+        resp = self._client.post(
+            f"/api/validator/v1/assignments/{assignment_id}/repo-credential",
             json={
                 "schema_version": VALIDATOR_PROTOCOL_V1,
-                "pubkey_hex": pubkey_hex,
-                "acceptance_contracts": list(SUPPORTED_ACCEPTANCE_CONTRACTS),
+                "challenge_nonce": challenge_nonce,
+                "evidence": dict(evidence),
+                "enclave_pubkey": enclave_pubkey,
             },
         )
         resp.raise_for_status()
@@ -438,9 +468,8 @@ def review_assignment(workdir_root: str, assignment: Mapping[str, Any]) -> str:
         config=ValidatorConfig(workdir_root=Path(workdir_root)),
         sign_fn=_child_sign_refused,
     )
-    try:
-        workdir = reviewer._clone(assignment)
-    except GitError:
+    workdir = reviewer._clone_with_retry(assignment)
+    if workdir is None:
         return "error"
     return reviewer._decide(assignment, workdir)
 
@@ -698,13 +727,57 @@ class ValidatorDaemon:
     own verify run gets, per decision 8 (validator on the same perimeter).
     """
 
-    def __init__(self, client: OrmasValidatorClient, config: ValidatorConfig, sign_fn: SignFn) -> None:
+    def __init__(
+        self, client: OrmasValidatorClient, config: ValidatorConfig, sign_fn: SignFn,
+        *, protected: Any | None = None,
+    ) -> None:
         self.client = client
         self.config = config
         self.sign_fn = sign_fn
+        # A ProtectedAssignmentAttestor when this checker runs in the attested CVM.
+        self.protected = protected
+        self._protected_tokens: dict[str, Any] = {}
 
     def register(self, *, pubkey_hex: str) -> dict[str, Any]:
-        return self.client.register(pubkey_hex=pubkey_hex)
+        if self.protected is None:
+            return self.client.register(pubkey_hex=pubkey_hex)
+        from .protected_attestation import PROTECTED_SERVICE_CELL
+        return self.client.register(pubkey_hex=pubkey_hex, task_cells=[PROTECTED_SERVICE_CELL])
+
+    def _attest(self, assignment_id: str) -> Any:
+        """Open one sealed read token for this assignment; raises ``GitError`` when refused."""
+        from .protected_attestation import ProtectedAttestationError
+        if self.protected is None:
+            raise GitError("protected attestation unavailable")
+        try:
+            token = self.protected.fetch_read_token(assignment_id)
+        except ProtectedAttestationError as exc:
+            logging.getLogger(__name__).warning("protected attestation refused: %s", exc.reason)
+            raise GitError("protected attestation refused") from None
+        self._protected_tokens[assignment_id] = token
+        return token
+
+    def _token_valid(self, assignment_id: str) -> bool:
+        from datetime import datetime, timezone
+
+        token = self._protected_tokens.get(assignment_id)
+        try:
+            return token is not None and datetime.fromisoformat(
+                token.expires_at.replace("Z", "+00:00")) > datetime.now(timezone.utc)
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+    def _protected_clone(self, assignment: Mapping[str, Any], workdir: Path) -> None:
+        from .outcomes_support import protected_repository_git
+        assignment_id = str(assignment["assignment_id"])
+        if self._token_valid(assignment_id):
+            token = self._protected_tokens[assignment_id]
+        else:
+            token = self._attest(assignment_id)
+        repo_url = assignment.get("repo_url")
+        protected_repository_git(
+            ["clone", "--no-checkout", repo_url, str(workdir)], cwd=workdir.parent,
+            repo_url=repo_url, token=token.token, expires_at=token.expires_at)
 
     def _clone(self, assignment: Mapping[str, Any]) -> Path:
         workdir = self.config.workdir_root / assignment["assignment_id"]
@@ -713,6 +786,10 @@ class ValidatorDaemon:
             shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if assignment.get("service_level") == "protected":
+                # The token arrives only sealed to this CVM's key, never on the assignment.
+                self._protected_clone(assignment, workdir)
+                return workdir
             if validate_assignment_execution(assignment):
                 from .outcomes_support import validate_repository_credential, repository_git, public_git
                 visibility = assignment['execution_contract']['execution_requirements']['repository_visibility']
@@ -730,10 +807,60 @@ class ValidatorDaemon:
             # The read credential is served by the gateway per assignment and exists on disk only for this clone; later checkout/diff need no credential.
             with _credential_git_env(assignment.get("repo_credential")) as env:
                 _run_git(["clone", str(assignment["repo_url"]), str(workdir)], cwd=workdir.parent, env=env)
-        except (GitError, ValueError, OSError, subprocess.SubprocessError):
+        except (GitError, ValueError, OSError, subprocess.SubprocessError) as exc:
             shutil.rmtree(workdir, ignore_errors=True)  # drop git's partial clone
-            raise GitError('repository clone failed') from None
+            raise GitError('repository clone failed') from exc
         return workdir
+
+    def _review_error(
+        self, assignment: Mapping[str, Any], error: BaseException | str, *, action: str = "review",
+    ) -> str:
+        cause = error
+        while isinstance(cause, BaseException) and cause.__cause__ is not None:
+            cause = cause.__cause__
+        stderr = getattr(cause, "stderr", None)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        detail = str(cause) + (f": {stderr}" if stderr else "")
+        credential = assignment.get("repo_credential")
+        if isinstance(credential, Mapping):
+            for field in ("token", "private_key"):
+                value = credential.get(field)
+                if isinstance(value, str) and value:
+                    detail = detail.replace(value, "[redacted]")
+        token = self._protected_tokens.get(str(assignment.get("assignment_id")))
+        if token is not None:
+            detail = detail.replace(token.token, "[redacted]")
+        kind = type(cause).__name__ if isinstance(cause, BaseException) else "verification"
+        logging.getLogger(__name__).warning(
+            "%s failed for assignment %s: %s: %s",
+            action, assignment.get("assignment_id"), kind, " ".join(detail.splitlines()),
+        )
+        return "error"
+
+    def _clone_with_retry(self, assignment: Mapping[str, Any]) -> Path | None:
+        # No remaining deadline is sent. Use one default polling window (15 s),
+        # capped by the assignment's timeout_s; its whole-second unit sets the pause.
+        window_s = float(DEFAULT_POLL_INTERVAL_S)
+        contract = assignment.get("acceptance_contract")
+        policy = contract.get("policy") if isinstance(contract, Mapping) else None
+        timeout_s = policy.get("timeout_s") if isinstance(policy, Mapping) else None
+        if type(timeout_s) is int and timeout_s > 0:
+            window_s = min(window_s, timeout_s)
+        pause_s = 1.0
+        attempts = math.ceil(window_s / pause_s)
+        deadline = time.monotonic() + window_s
+        for attempt in range(attempts):
+            try:
+                return self._clone(assignment)
+            except GitError as exc:
+                self._review_error(assignment, exc, action="repository clone")
+            if attempt + 1 == attempts or time.monotonic() + pause_s >= deadline:
+                break
+            time.sleep(pause_s)
+            if time.monotonic() >= deadline:
+                break
+        return None
 
     def _decide(self, assignment: Mapping[str, Any], workdir: Path) -> str:
         """Independent accept/reject/error — never the miner's self-report.
@@ -745,8 +872,8 @@ class ValidatorDaemon:
         try:
             public_execution = validate_assignment_execution(assignment)
             prefix = None if public_execution else provision_toolchain(assignment.get("toolchain"), workdir)
-        except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError):
-            return "error"
+        except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError) as exc:
+            return self._review_error(assignment, exc)
         base_commit = str(assignment["base_commit"])
         result_commit = str(assignment["result_commit"])
         verify_command = str(assignment["verify_command"])
@@ -764,13 +891,13 @@ class ValidatorDaemon:
             try:
                 if not scope_valid():
                     return "reject"
-            except GitError:
-                return "error"
+            except GitError as exc:
+                return self._review_error(assignment, exc)
 
         try:
             _run_git(["checkout", base_commit], cwd=workdir)
-        except GitError:
-            return "error"
+        except GitError as exc:
+            return self._review_error(assignment, exc)
         def verify(phase):
             if evidence_root(verify_command) is None:
                 return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
@@ -785,32 +912,34 @@ class ValidatorDaemon:
 
         try:
             base_exit = verify("base")
-        except (ValueError, OSError):
-            return "error"
+        except (ValueError, OSError) as exc:
+            return self._review_error(assignment, exc)
         if public_execution and base_exit != 86:
             # The frozen preflight could not be reproduced. An already-green
             # or broken base is no evidence of a miner's implementation quality.
-            return "error"
+            return self._review_error(assignment, f"base verifier returned {base_exit}, expected 86")
         if evidence_root(verify_command) is not None and base_exit in (74, 127):
-            return "error"  # A capture/setup refusal is not an intended red base.
+            return self._review_error(assignment, f"base verifier setup failed: exit {base_exit}")
 
         try:
             _run_git(["checkout", result_commit], cwd=workdir)
-        except GitError:
-            return "error"
+        except GitError as exc:
+            return self._review_error(assignment, exc)
         try:
             result_exit = verify("result")
-        except (ValueError, OSError):
-            return "error"
+        except (ValueError, OSError) as exc:
+            return self._review_error(assignment, exc)
         if public_execution:
-            return {0: "accept", 86: "reject"}.get(result_exit, "error")
+            if result_exit not in (0, 86):
+                return self._review_error(assignment, f"result verifier failed: exit {result_exit}")
+            return {0: "accept", 86: "reject"}[result_exit]
         if evidence_root(verify_command) is not None and result_exit in (74, 127):
-            return "error"
+            return self._review_error(assignment, f"result verifier setup failed: exit {result_exit}")
 
         try:
             diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
-        except GitError:
-            return "error"
+        except GitError as exc:
+            return self._review_error(assignment, exc)
         changed = [p for p in diff_out.splitlines() if p]
 
         touches_immutable = bool(immutable) and any(
@@ -875,21 +1004,40 @@ class ValidatorDaemon:
     def run_once(self) -> bool:
         """Review one pending assignment if any. False when idle."""
         assignments = self.client.list_assignments()
+        if self.protected is None:
+            # Only an attesting checker can act on a Protected stub.
+            assignments = [a for a in assignments if not a.get("attestation_required")]
         if not assignments:
             return False
-        assignment = assignments[0]
+        assignment = None
+        attested = False
+        for row in assignments:
+            if not row.get("attestation_required"):
+                assignment = row
+                break
+            # Phase one: attest for this stub; a later poll lists its evidence. A stub
+            # already attested with a live token waits for that listing, and a refused
+            # stub never blocks the rows after it; both retry on the next poll.
+            assignment_id = str(row.get("assignment_id"))
+            if self._token_valid(assignment_id):
+                continue
+            try:
+                self._attest(assignment_id)
+            except GitError:
+                continue
+            attested = True
+        if assignment is None:
+            return attested
         kind, digest = self._preface(assignment)
         if kind == "skip" or digest is None:
             return True
         decision = "error"
         if kind == "review":
-            try:
-                workdir = self._clone(assignment)
-            except GitError:
-                pass
-            else:
+            workdir = self._clone_with_retry(assignment)
+            if workdir is not None:
                 decision = self._decide(assignment, workdir)
         self._sign_and_post(assignment, digest, decision)
+        self._protected_tokens.pop(str(assignment.get("assignment_id")), None)
         return True
 
     def serve(
@@ -902,6 +1050,9 @@ class ValidatorDaemon:
         """Review until stopped. One slot stays inline; more slots use child processes."""
         import time
 
+        if self.protected is not None and slots != 1:
+            # Review children hold no client, so they cannot attest.
+            raise ValueError("Protected attestation runs with exactly one slot")
         if slots == 1:
             while True:
                 if until is not None and until():
@@ -1024,10 +1175,21 @@ def main(argv: list[str] | None = None) -> int:
     private_key = _load_cli_secret(token_env=args.private_key_env, token_path=args.private_key_file)
     if args.private_key_env:
         os.environ.pop(args.private_key_env, None)
+    from .protected_attestation import ProtectedAssignmentAttestor, evidence_fn_from_env
+    try:
+        evidence_fn = evidence_fn_from_env(os.environ)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if evidence_fn is not None and args.slots != 1:
+        parser.error("--slots must be 1 with ORMAS_PROTECTED_EVIDENCE_SOURCE")
     sign_fn, pubkey = make_ed25519_signer(private_key)
     client = OrmasValidatorClient(base_url=args.gateway, token=token)
     try:
-        daemon = ValidatorDaemon(client, ValidatorConfig(workdir_root=Path(args.workdir_root)), sign_fn)
+        protected = (ProtectedAssignmentAttestor(
+                         client, evidence_fn, signer_pubkey=bytes.fromhex(pubkey))
+                     if evidence_fn is not None else None)
+        daemon = ValidatorDaemon(client, ValidatorConfig(workdir_root=Path(args.workdir_root)),
+                                 sign_fn, protected=protected)
         daemon.register(pubkey_hex=pubkey)
         if args.once:
             return 0 if daemon.run_once() else 3

@@ -14,7 +14,8 @@ mining logic.
 
 ## Transport
 
-- The queue and own-registration routes are `GET`; the other routes below are `POST`.
+- The queue, own-registration and own-offer reads are `GET`. Offer withdrawal
+  uses `DELETE`; the other routes below are `POST`.
 - Base path: `/api/runner/v1`.
 - Auth: `Authorization: Bearer <token>` where `<token>` is a runner token issued
   out of band (starts with `ormr_`). A missing/invalid/rate-limited token
@@ -23,9 +24,11 @@ mining logic.
   every subsequent request must carry `X-Ormas-Runner-Device: <nonce>` matching
   what the gateway stored, or the request is rejected as unauthorized. First
   registration may omit it (the gateway can fall back to the header value).
-- Every JSON request body must include `"schema_version": "ormas-runner-v1"`. A
-  missing/wrong value is rejected as `400 unknown_field:schema_version`. The GET
-  routes have no body; binary publication uses its own schema below.
+- Runner JSON request bodies include `"schema_version": "ormas-runner-v1"`,
+  except `POST /offers`, whose exact allowlist excludes `schema_version`.
+  A missing/wrong version on versioned routes is rejected as
+  `400 unknown_field:schema_version`. GET and DELETE routes have no body;
+  binary publication uses its own schema below.
 - **Strict allowlists.** Every route rejects any field not on its allowlist
   (`400 unknown_field:<field>`), and separately rejects a small set of
   universally forbidden fields even before the allowlist check
@@ -169,8 +172,10 @@ and remembers that fallback for the process. A 404 with
 runner, or no priced binding and no eligible project. Other queue errors also
 surface to the caller.
 
-Each job has exactly `job_id`, `created_at` and `envelope`. The envelope admits
-only these keys; absent or invalid values are omitted:
+Ordinary queue entries have `job_id`, `created_at` and `envelope`, with no
+window marker. A job awarded to this runner adds `awarded_to_you: true`,
+`bid_id` and `award_id`. The envelope admits only these keys; absent or invalid
+values are omitted:
 
 | Key | Shape |
 |---|---|
@@ -224,19 +229,126 @@ A response with a subset of valid envelope keys:
 }
 ```
 
-### Offer ranking
+### Offer windows: explicit opt-in
 
-Phase 1 accepts on arrival: the first offer within the client's undisclosed
-spending limit wins; an offer above it is recorded and skipped and the job stays
-queued. The planned next phase ranks on settled-price history by task shape:
-dollar-weighted settled-to-estimate and settled-to-limit ratios per miner,
-favouring low limits.
+Rollout requires a gateway with offer-window support. The reference miner ships
+with `MinerConfig.offer_window=False`; `--offer-window` enables it explicitly.
+Window mode uses `offer_fn(entry)` for per-job firm or limit terms. With no hook,
+a configured positive finite `ask_usd` supplies a static firm offer. Missing
+pricing is refused. The legacy defaults and bare queue-404 fallback keep their
+existing claim bodies. A miner with saved window bids refuses a route-missing
+fallback so it can preserve its own award binding.
+
+The gateway owns two clocks: `ack_by_s` defaults to 60 seconds and ranges from
+15 to 60; manual `window_s` defaults to 600 seconds and has a maximum of 600.
+Automatic selection may award after eligible miners answer, or at the
+acknowledgement deadline. Manual selection uses its window deadline and the
+configured fallback. Use returned `window_closes_at` and own gateway statuses;
+miners introduce no local bidding deadlines or reserve estimates.
+
+### `POST /api/runner/v1/offers`
+
+`submit_offer(runner_id, offer)` sends exactly one of these bodies, with no
+`schema_version`:
+
+```json
+{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "firm", "price_usd": 0.20}
+```
+
+```json
+{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30}
+```
+
+Firm prices are positive finite numbers. Limit amounts satisfy
+`0 < estimate_usd <= limit_usd` and are finite. Booleans are refused locally.
+The response contains `bid_id` and `window_closes_at`; a gateway may also include
+`job_id` and `ack_by_at`. An over-reserve POST receives the same acknowledgement
+shape, with no reserve feedback. Replacing terms uses a new POST and returns a
+new `bid_id`; the old open bid becomes `replaced`.
+
+### `GET /api/runner/v1/offers/{bid_id}`
+
+`get_offer(bid_id)` reads an own bid only. Encode the id as one URL segment.
+The response is `{"bid_id": str, "status": str, "award_id"?: str}`. Statuses
+include `open`, `awarded`, `not_awarded`, `withdrawn`, `replaced`,
+`no_capacity` and `award_lapsed`. An awarded offer that is never claimed within
+three gateway poll intervals becomes terminal `award_lapsed`. The gateway records
+one failed delivery commitment for that miner and comparable task shape. It creates
+no receipt, customer debit, settled price, calibration or delivery-time sample.
+That commitment survives any later delivery of the job. The job can receive its
+next award or return to the queue. A miner may submit a fresh bid at identical terms
+after observing its own `award_lapsed` status. Saved awards recover through this
+explicit status; other award identity mismatches require recovery. Pending offer
+POSTs and execution start/completion records retain their existing fences.
+Losing offers become `not_awarded`. If the earlier winner
+fails to claim, the gateway may reopen a `not_awarded` bid and award it at its
+frozen terms. The gateway owns these status transitions. This route exposes
+no competitor book, reserve, model identity or provider cost.
+
+### `DELETE /api/runner/v1/offers/{bid_id}`
+
+`withdraw_offer(bid_id)` withdraws an open own bid and returns
+`{"bid_id": str, "status": "withdrawn"}`. Withdrawal is available before
+award. Award commits the miner to its frozen terms; it must then claim and
+execute without repricing or withdrawal. A nonopen withdrawal returns HTTP 409
+with `error.type: "conflict_error"` and `error.message: "not_open"`.
+A submission racing a closed window returns the same error type with
+`error.message: "window_closed"`. Reconcile own status after either race.
+Authentication and transport errors propagate.
+
+Tested submit/read/withdraw example (`tests/test_offer_window.py` exercises these
+calls through a standalone transport, including the device header):
+
+```python
+offer = {"job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30}
+posted = client.submit_offer(runner_id, offer)
+bid = client.get_offer(posted["bid_id"])
+if bid["status"] == "open":
+    client.withdraw_offer(posted["bid_id"])
+```
+
+The reference miner saves immutable terms and the returned bid identity under
+`workdir_root/.ormas-recovery`, namespaced by gateway URL and runner, before
+claiming. Keep this directory across restarts. Unchanged polls retain the same
+bid; changed terms replace an open bid; a hook returning `None` withdraws it.
+Saved public execution recovery always precedes offer reconciliation and new
+claims. Polls refresh current nonlegacy bids for listed queue jobs and verify
+`awarded_to_you` metadata; historical bids outside the queue remain saved.
+After posting and status reads, window claims use `offers: []`. A returned
+own lease is re-read and bound to its saved bid even when its award is absent
+from the queue page. Saved awards can recover without fresh static pricing.
+Before solver execution, the lease's `bid_id`, task/job identity and frozen
+price/estimate/limit must match a saved own awarded bid. Unknown or mismatched
+awards are refused. `award_id` is status/queue metadata; the lease carries
+`bid_id`.
+
+An ordinary queue entry does not identify whether its job uses a window. HTTP
+409 `conflict_error` with message `not_offering` identifies a legacy job; that
+job can use the existing per-job `/leases` offers API after an empty-offer claim
+has reconciled awards. The default legacy route accepts on arrival within the
+client's undisclosed spending limit. Saved window identities remain required
+for every window award returned by either claim path.
+
+Recovery limits: the gateway provides neither an own-offer listing nor a POST
+idempotency key. A lost POST acknowledgement leaves a durable unresolved intent;
+the miner refuses further claims until an operator recovers its own bid identity.
+The queue also omits a window identity for reopened jobs. The reference miner
+retains unchanged bid records and avoids automatic same-price resubmission
+for such a job. It reconciles gateway-owned reopening and awards at the saved
+terms. Explicitly changed terms can submit a new bid through the gateway;
+the miner executes only an own award bound to its saved terms.
+
+Offer windows preserve reserve privacy, task-shape-only queue disclosure,
+Standard/Protected admission, public/private repository boundaries and miner
+control over model routing. They change neither buyer pricing nor acceptance
+and settlement requirements.
 
 ### `POST /api/runner/v1/leases`
 
 Offer and claim through
 `claim_task(runner_id, *, ask_usd=None, offers=None, claim_request_id=None)`.
-Phase 1 follows the [offer-selection rule](#offer-ranking) above.
+Legacy jobs use accept-on-arrival pricing. Window jobs use the saved awarded
+bid described above.
 
 An offers request uses this body:
 
@@ -255,7 +367,8 @@ A firm entry has exactly `job_id`, `kind` and `price_usd`. A limit entry has
 exactly `job_id`, `kind`, `estimate_usd` and `limit_usd`, both required, with
 `0 < estimate_usd <= limit_usd`. Amounts must be positive finite numbers,
 excluding booleans. Omitted jobs are declined.
-`offers: []` claims nothing new and may re-serve an eligible running lease.
+`offers: []` declines new legacy jobs and may re-serve an eligible running
+lease. It can also claim a window job already awarded to this runner.
 `offers` is mutually exclusive with legacy `ask_usd` and `asks`; invalid fields,
 amounts, kind/amount pairs, a missing estimate, an estimate above the limit or
 duplicate jobs return `400 unknown_field:offers`.
