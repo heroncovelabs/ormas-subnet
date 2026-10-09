@@ -436,6 +436,19 @@ class MinerConfig:
     published its artifact, so it is retained for recovery with no completion
     sent, and every later ``run_once`` re-raises from recovery (claiming
     nothing) until the hook returns a valid price.
+
+    ``claim_refusal_backoff_s`` and ``claim_refusal_backoff_max_s`` shape the
+    idle sleep after a *gateway claim refusal* — an :class:`OrmasGatewayError`
+    other than 401/403 — absorbed by :meth:`MinerSkeleton.run_forever`. The
+    n-th consecutive refusal sleeps ``min(base * 2 ** (n - 1), cap)``, where
+    ``base`` is ``claim_refusal_backoff_s`` (or the poll interval in effect
+    when ``None``) and ``cap`` is ``claim_refusal_backoff_max_s`` (or ``base``
+    when ``None``). With both ``None`` the sleep is exactly the poll interval,
+    so the default daemon behaviour is unchanged. Any claim that returns 2xx
+    resets the schedule; transport errors are not refusals and keep idling at
+    the poll interval. The schedule is a local daemon concern only — the lease
+    heartbeat carries no runner health, so nothing here changes the wire
+    protocol.
     """
 
     runner_id: str
@@ -454,6 +467,8 @@ class MinerConfig:
     offer_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     settle_fn: Callable[[TaskLease, SolveResult], float] | None = None
     offer_window: bool = False
+    claim_refusal_backoff_s: float | None = None
+    claim_refusal_backoff_max_s: float | None = None
 
 
 class MinerSkeleton:
@@ -495,6 +510,13 @@ class MinerSkeleton:
         self._queue_unsupported = False
         # Only the exact claim-step exception is retryable by the daemon.
         self._claim_error: BaseException | None = None
+        # Consecutive gateway claim refusals (a non-401/403 OrmasGatewayError)
+        # and the last one seen, for :meth:`claim_health`. The counter drives
+        # the exponential backoff in :meth:`run_forever` and is reset by any
+        # 2xx claim. ``_last_claim_refusal`` is deliberately NOT cleared on a
+        # reset: an operator still wants to see the most recent refusal.
+        self._consecutive_claim_refusals = 0
+        self._last_claim_refusal: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -1487,6 +1509,40 @@ class MinerSkeleton:
                 stacklevel=2,
             )
 
+    def claim_health(self) -> dict[str, Any]:
+        """Local operator health report for the claim step.
+
+        Returns ``{"last_claim_refusal": ... or None, "consecutive_claim_refusals": int}``.
+        A refusal is a gateway :class:`OrmasGatewayError` other than 401/403
+        absorbed by :meth:`run_forever`. ``last_claim_refusal`` is
+        ``{"status": int, "type": error type or None, "at": float epoch seconds}``
+        and is retained after the consecutive counter resets on a 2xx claim.
+        This is a purely local view: it is never sent on the wire — the lease
+        heartbeat carries no runner health.
+        """
+        last = self._last_claim_refusal
+        return {
+            "last_claim_refusal": dict(last) if last is not None else None,
+            "consecutive_claim_refusals": self._consecutive_claim_refusals,
+        }
+
+    def _claim_refusal_backoff_s(self, *, interval: float) -> float:
+        """Sleep for a gateway claim refusal: ``min(base * 2 ** (n - 1), cap)``.
+
+        ``n`` is the 1-based consecutive refusal count just recorded. ``base``
+        is ``config.claim_refusal_backoff_s`` or, when ``None``, the poll
+        interval in effect; ``cap`` is ``config.claim_refusal_backoff_max_s``
+        or, when ``None``, ``base``. With both unset this is exactly
+        ``interval``, so the default daemon cadence is unchanged.
+        """
+        base = self.config.claim_refusal_backoff_s
+        if base is None:
+            base = interval
+        cap = self.config.claim_refusal_backoff_max_s
+        if cap is None:
+            cap = base
+        return float(min(base * (2 ** (self._consecutive_claim_refusals - 1)), cap))
+
     def run_forever(
         self,
         *,
@@ -1501,6 +1557,13 @@ class MinerSkeleton:
         explicit override. Claim refusals and transport errors log one warning
         and idle at that cadence; credential refusals (401/403), recovery
         failures and ``KeyboardInterrupt`` still propagate.
+
+        A gateway claim refusal (an :class:`OrmasGatewayError` other than
+        401/403) additionally backs off: the n-th consecutive refusal sleeps
+        ``min(base * 2 ** (n - 1), cap)`` (see :meth:`_claim_refusal_backoff_s`),
+        and any successful claim — 2xx, whether it returns a lease or an empty
+        idle page — resets the schedule. Transport errors (``HTTPError`` /
+        ``OSError``) are not refusals: they keep the plain poll cadence.
         """
         interval = self.poll_interval_s if poll_interval_s is None else poll_interval_s
         iterations = 0
@@ -1516,5 +1579,20 @@ class MinerSkeleton:
                 self._claim_error = None
                 _LOGGER.warning("claim failed: %s: %s", type(exc).__name__, exc)
                 did_work = False
+                if isinstance(exc, OrmasGatewayError):
+                    # A gateway refusal (not 401/403, already excluded above):
+                    # record it and back off. Transport errors fall through to
+                    # the plain poll cadence and are not refusals.
+                    self._consecutive_claim_refusals += 1
+                    self._last_claim_refusal = {
+                        "status": exc.status_code,
+                        "type": exc.error_type,
+                        "at": time.time(),
+                    }
+                    idle_sleep(self._claim_refusal_backoff_s(interval=interval))
+                    continue
+            else:
+                # A 2xx claim — a lease or an idle page — resets the schedule.
+                self._consecutive_claim_refusals = 0
             if not did_work:
                 idle_sleep(interval)
