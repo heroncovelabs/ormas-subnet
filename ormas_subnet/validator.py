@@ -1147,6 +1147,36 @@ def _positive_slot_count(value: str) -> int:
     return slots
 
 
+def _assignment_timeout_s(assignment: Mapping[str, Any]) -> Any:
+    """The review timeout from ``acceptance_contract.policy.timeout_s``, if any."""
+    contract = assignment.get("acceptance_contract")
+    if not isinstance(contract, Mapping):
+        return None
+    policy = contract.get("policy")
+    if not isinstance(policy, Mapping):
+        return None
+    return policy.get("timeout_s")
+
+
+def _list_only_lines(assignments: Any) -> list[str]:
+    """One stable stdout line per assignment; ``-`` marks a missing field."""
+    rows = list(assignments) if isinstance(assignments, (list, tuple)) else []
+    if not rows:
+        return ["no assignments"]
+    lines = []
+    for assignment in rows:
+        record = assignment if isinstance(assignment, Mapping) else {}
+        assignment_id = record.get("assignment_id")
+        job_id = record.get("job_id")
+        timeout_s = _assignment_timeout_s(record)
+        lines.append(
+            f"{assignment_id if assignment_id else '-'} "
+            f"job={job_id if job_id else '-'} "
+            f"timeout_s={timeout_s if timeout_s else '-'}"
+        )
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the installed task-checker component of the SN76 validator."""
     import argparse
@@ -1161,6 +1191,10 @@ def main(argv: list[str] | None = None) -> int:
     key_args.add_argument("--private-key-file", help="Private file holding the hex Ed25519 decision key")
     parser.add_argument("--workdir-root", default=str(Path.cwd() / "ormas-validator-work"))
     parser.add_argument("--once", action="store_true", help="Review one assignment, exit 3 if idle")
+    parser.add_argument(
+        "--list-only", action="store_true",
+        help="Print current assignments (id, job, review timeout) and exit without reviewing",
+    )
     parser.add_argument(
         "--slots", type=_positive_slot_count, default=1,
         help="assignment reviews at once (default: 1)",
@@ -1188,9 +1222,29 @@ def main(argv: list[str] | None = None) -> int:
         protected = (ProtectedAssignmentAttestor(
                          client, evidence_fn, signer_pubkey=bytes.fromhex(pubkey))
                      if evidence_fn is not None else None)
-        daemon = ValidatorDaemon(client, ValidatorConfig(workdir_root=Path(args.workdir_root)),
-                                 sign_fn, protected=protected)
-        daemon.register(pubkey_hex=pubkey)
+        # List-only never clones, reviews, posts, reads a credential, or creates
+        # the review workdir; it only reports the current assignments.
+        registrar = (ValidatorDaemon(client, ValidatorConfig(workdir_root=Path(args.workdir_root)),
+                                     sign_fn, protected=protected)
+                     if not args.list_only else None)
+
+        def _register() -> None:
+            if registrar is not None:
+                registrar.register(pubkey_hex=pubkey)
+            else:
+                if protected is None:
+                    client.register(pubkey_hex=pubkey)
+                else:
+                    from .protected_attestation import PROTECTED_SERVICE_CELL
+                    client.register(pubkey_hex=pubkey, task_cells=[PROTECTED_SERVICE_CELL])
+
+        _register()
+        if args.list_only:
+            for line in _list_only_lines(client.list_assignments()):
+                print(line)
+            return 0
+        daemon = registrar
+        assert daemon is not None
         if args.once:
             return 0 if daemon.run_once() else 3
         daemon.serve(args.slots, args.poll_interval_s)
