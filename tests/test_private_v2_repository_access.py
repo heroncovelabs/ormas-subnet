@@ -211,6 +211,7 @@ def test_private_v2_refuses_unscoped_or_other_repository_key_before_git(
 def test_private_checker_git_failure_posts_error_and_keeps_polling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """c301aa8d: exhausted scoped-clone retries post only one signed error."""
     contract = {
         "schema_version": "outcomes.validation-contract.v2",
         "work_packet_sha256": "d" * 64,
@@ -243,9 +244,10 @@ def test_private_checker_git_failure_posts_error_and_keeps_polling(
         raise ValueError("private Git read unavailable")
 
     monkeypatch.setattr("ormas_subnet.outcomes_support.repository_git", unavailable)
+    monkeypatch.setattr("ormas_subnet.validator.time.sleep", lambda _: None)
     assert daemon.run_once() is True
     assert daemon.run_once() is False
-    assert attempted == [True]
+    assert attempted == [True] * sk.DEFAULT_POLL_INTERVAL_S
     assert len(gateway.decisions) == 1
     assert gateway.decisions[0]["decision"] == "error"
 

@@ -394,7 +394,8 @@ def _isolated_git(args, *, cwd, env):
         '-c', 'protocol.file.allow=never', *args], cwd=str(cwd), env=env,
         capture_output=True, check=False, timeout=120)
     if proc.returncode != 0:
-        raise ValueError('public Git operation failed')
+        raise ValueError('public Git operation failed') from subprocess.CalledProcessError(
+            proc.returncode, 'git', stderr=proc.stderr)
     return proc.stdout
 
 

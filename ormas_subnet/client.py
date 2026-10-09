@@ -100,6 +100,15 @@ def _validate_offers(offers: Any) -> None:
             raise ValueError("estimate_usd must be at most limit_usd")
 
 
+def _validate_window_offer(offer: Any) -> None:
+    _validate_offers([offer])
+    if not offer["job_id"].strip():
+        raise ValueError("job_id must be a non-empty string")
+    # POST /offers compares original amounts; /leases normalizes to floats.
+    if offer["kind"] == "limit" and offer["estimate_usd"] > offer["limit_usd"]:
+        raise ValueError("estimate_usd must be at most limit_usd")
+
+
 class OrmasGatewayError(RuntimeError):
     """An HTTP error from the gateway, carrying its structured error body.
 
@@ -291,6 +300,46 @@ class OrmasMinerClient:
         if not isinstance(payload, dict):
             raise ValueError("invalid queue payload")
         return payload
+
+    def submit_offer(self, runner_id: str, offer: dict[str, Any]) -> dict[str, Any]:
+        """POST an own offer; a replacement returns a new bid identity.
+
+        The offers route accepts pricing fields and runner_id without a schema
+        version. Its acknowledgement exposes no reserve or ranking feedback.
+        """
+        if not isinstance(runner_id, str) or not runner_id.strip():
+            raise ValueError("runner_id must be a non-empty string")
+        _validate_window_offer(offer)
+        resp = self._post("/api/runner/v1/offers", {"runner_id": runner_id, **offer})
+        self._raise_for_status(resp)
+        return resp.json()
+
+    @staticmethod
+    def _offer_path(bid_id: str) -> str:
+        from urllib.parse import quote
+
+        if not isinstance(bid_id, str) or not bid_id.strip():
+            raise ValueError("bid_id must be a non-empty string")
+        segment = quote(bid_id, safe="")
+        if segment in {".", ".."}:
+            segment = segment.replace(".", "%2E")
+        return f"/api/runner/v1/offers/{segment}"
+
+    def get_offer(self, bid_id: str) -> dict[str, Any]:
+        """GET an own bid's status, including award_id when awarded."""
+        path = self._offer_path(bid_id)
+        headers = self._headers()
+        resp = self._client.get(path) if headers is None else self._client.get(path, headers=headers)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def withdraw_offer(self, bid_id: str) -> dict[str, Any]:
+        """DELETE an open own offer; a nonopen bid raises typed 409 not_open."""
+        path = self._offer_path(bid_id)
+        headers = self._headers()
+        resp = self._client.delete(path) if headers is None else self._client.delete(path, headers=headers)
+        self._raise_for_status(resp)
+        return resp.json()
 
     def claim_task(
         self, runner_id: str, *, ask_usd: float | None = None,

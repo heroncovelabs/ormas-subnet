@@ -12,12 +12,14 @@ No model calls happen anywhere in this package.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -30,7 +32,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .client import OrmasGatewayError, OrmasMinerClient
+from httpx import HTTPError
+
+from .client import OrmasGatewayError, OrmasMinerClient, _positive_usd, _validate_window_offer
 from ._recovery import PublicRecovery, RecoveryRequired
 from .verification_context import verification_call
 from .protocol import (
@@ -334,7 +338,8 @@ def _run_verify_command(
 
     No shell, no ambient secrets: only ``PATH``, a scratch ``HOME`` (so nothing
     reads or writes the real one), and ``LANG`` cross into the child — no
-    provider keys, no tokens, nothing else from this process's environment.
+    provider keys or tokens. The nonsecret ORMAS_VERIFIER_SCRATCH_DIR also crosses
+    so the external driver's Docker bind mounts resolve on a sibling-container host.
     Returns the exit code; a command that can't even be parsed or launched
     fails closed (1 / 127) rather than raising past the caller.
     When ``path_prefix`` is set, it is prepended to the child's ``PATH`` and
@@ -361,6 +366,11 @@ def _run_verify_command(
         lang = os.environ.get("LANG")
         if lang:
             env["LANG"] = lang
+        scratch_root = os.environ.get("ORMAS_VERIFIER_SCRATCH_DIR")
+        if scratch_root:
+            # The verifier runtime's scratch root is tempfile.gettempdir(), steered by TMPDIR.
+            env["ORMAS_VERIFIER_SCRATCH_DIR"] = scratch_root
+            env["TMPDIR"] = scratch_root
         env.update(env_overrides)
         try:
             with verification_call(verify_command, env, cwd=cwd,
@@ -412,6 +422,12 @@ class MinerConfig:
     carrying ``not_found_error`` (unknown runner, or no priced binding) and
     every other queue error are raised.
 
+    ``offer_window`` explicitly opts in to the gateway's offer-window routes.
+    It defaults to False. In window mode, ``offer_fn`` supplies terms or a
+    positive ``ask_usd`` supplies static firm pricing. Own bid identities and
+    immutable terms persist in the existing gateway/runner recovery namespace;
+    an unknown award or ambiguous POST refuses execution.
+
     ``settle_fn(lease, result)`` sets the price for a verified limit delivery,
     capped at the lease's limit. Without it, the price is the limit. It must be
     deterministic and must not raise, and must return a finite non-negative
@@ -437,6 +453,7 @@ class MinerConfig:
     miner_id: str | None = None
     offer_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     settle_fn: Callable[[TaskLease, SolveResult], float] | None = None
+    offer_window: bool = False
 
 
 class MinerSkeleton:
@@ -476,6 +493,8 @@ class MinerSkeleton:
         # Set once the queue answers a bare 404 (an older gateway without the
         # route) so later polls claim with ``ask_usd`` without re-probing.
         self._queue_unsupported = False
+        # Only the exact claim-step exception is retryable by the daemon.
+        self._claim_error: BaseException | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -812,6 +831,7 @@ class MinerSkeleton:
         example once the hook returns a valid price. ``RecoveryRequired``,
         claim failures and ``KeyboardInterrupt`` propagate.
         """
+        self._claim_error = None
         namespace = getattr(self.client, 'base_url', None)
         if namespace and self.config.runner_id:
             store = PublicRecovery(self.config.workdir_root, namespace, self.config.runner_id)
@@ -824,6 +844,8 @@ class MinerSkeleton:
         return self._run_once_locked()
 
     def _claim_task(self) -> tuple[TaskLease, TaskDraft] | None:
+        if self.config.offer_window:
+            return self._claim_offer_window()
         offer_fn = self.config.offer_fn
         if offer_fn is not None and not self._queue_unsupported:
             try:
@@ -841,11 +863,222 @@ class MinerSkeleton:
                 return self.client.claim_task(self.config.runner_id, offers=offers)
         return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
 
+    def _offer_state(self) -> dict[str, Any]:
+        store = self._public_recovery
+        if store is None:
+            raise RecoveryRequired("offer recovery requires gateway and runner identity")
+        path = store.root / "offers.json"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return {"gateway": store.namespace, "runner_id": store.runner_id,
+                    "bids": {}, "current": {}, "pending": None}
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as source:
+                metadata = os.fstat(source.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
+                        or metadata.st_uid != os.getuid()):
+                    raise RecoveryRequired("offer recovery record is unsafe")
+                state = json.load(source)
+            if (state["gateway"] != store.namespace or state["runner_id"] != store.runner_id
+                    or not isinstance(state["bids"], dict) or not isinstance(state["current"], dict)):
+                raise RecoveryRequired("offer recovery identity mismatch")
+            for bid_id, bid in state["bids"].items():
+                if not isinstance(bid_id, str) or not bid_id:
+                    raise ValueError("invalid bid identity")
+                _validate_window_offer(bid["terms"])
+            for job_id, bid_id in state["current"].items():
+                if state["bids"][bid_id]["terms"]["job_id"] != job_id:
+                    raise ValueError("invalid bid job identity")
+            if state["pending"] is not None:
+                raise RecoveryRequired("offer POST outcome unknown; recover own bid identity before claiming")
+            return state
+        except (ValueError, KeyError, TypeError):
+            raise RecoveryRequired("offer recovery record is corrupt") from None
+
+    def _save_offers(self, state: dict[str, Any]) -> None:
+        root = self._public_recovery.root
+        raw = json.dumps(state, allow_nan=False, separators=(",", ":")).encode()
+        fd, name = tempfile.mkstemp(prefix="offers-", dir=root)
+        try:
+            with os.fdopen(fd, "wb") as target:
+                target.write(raw)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(name, root / "offers.json")
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    @staticmethod
+    def _offer_conflict(exc: OrmasGatewayError, message: str) -> bool:
+        return (exc.status_code == 409
+                and (exc.error_type == message
+                     or (exc.error_type == "conflict_error" and exc.message == message)))
+
+    def _read_bid(self, state: dict[str, Any], bid_id: str) -> dict[str, Any]:
+        bid = state["bids"].get(bid_id)
+        if bid is None:
+            raise RecoveryRequired("unknown own award bid")
+        if bid.get("legacy"):
+            return bid
+        response = self.client.get_offer(bid_id)
+        status, award = response.get("status"), response.get("award_id")
+        if (response.get("bid_id") != bid_id or status not in
+                {"open", "awarded", "not_awarded", "withdrawn", "replaced", "no_capacity",
+                 "award_lapsed"}
+                or (status == "awarded" and (not isinstance(award, str) or not award))
+                or (bid["status"] == "awarded" and status != "award_lapsed" and (
+                    status != "awarded" or bid.get("award_id") != award))):
+            raise RecoveryRequired("invalid own bid status or award identity")
+        bid["status"] = status
+        bid["award_id"] = award
+        self._save_offers(state)
+        return bid
+
+    def _check_offer_lease(self, state, claimed, legacy_offers=()):
+        if claimed is None:
+            return None
+        lease, draft = claimed
+        bid = state["bids"].get(lease.bid_id)
+        legacy = False
+        if bid is None:
+            terms = next((offer for offer in legacy_offers if offer["job_id"] == lease.task_id), None)
+            if terms is None:
+                raise RecoveryRequired("lease has unknown own award bid")
+            bid = {"terms": terms, "status": "awarded", "legacy": True}
+            legacy = True
+        else:
+            bid = self._read_bid(state, lease.bid_id)
+        terms = bid["terms"]
+        if (bid["status"] != "awarded" or lease.task_id != terms["job_id"]
+                or draft.task_id != terms["job_id"] or draft.runner_id != self.config.runner_id
+                or lease.offer_kind != terms["kind"]
+                or lease.outcome_price_usd != float(terms.get("price_usd", terms.get("limit_usd")))
+                or lease.estimate_usd != (float(terms["estimate_usd"]) if terms["kind"] == "limit" else None)
+                or lease.limit_usd != (float(terms["limit_usd"]) if terms["kind"] == "limit" else None)):
+            raise RecoveryRequired("lease award bid identity or frozen terms mismatch")
+        if legacy:
+            if not isinstance(lease.bid_id, str) or not lease.bid_id:
+                raise RecoveryRequired("legacy offer lease has no bid identity")
+            state["bids"][lease.bid_id] = bid
+            state["current"][lease.task_id] = lease.bid_id
+            self._save_offers(state)
+        return claimed
+
+    def _claim_offer_window(self) -> tuple[TaskLease, TaskDraft] | None:
+        state = self._offer_state()
+        if self._queue_unsupported:
+            if state["bids"]:
+                raise RecoveryRequired("own offer bids require gateway queue support")
+            return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
+        try:
+            queue = self.client.list_queue(self.config.runner_id)
+        except OrmasGatewayError as exc:
+            if exc.status_code != 404 or exc.error_type is not None:
+                raise
+            if state["bids"]:
+                raise RecoveryRequired("own offer bids require gateway queue support") from exc
+            self._queue_unsupported = True
+            return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
+        missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
+        legacy_offers = []
+        for entry in queue.get("jobs", []):
+            job_id = entry["job_id"]
+            bid_id = state["current"].get(job_id)
+            bid = state["bids"].get(bid_id)
+            if entry.get("awarded_to_you"):
+                awarded = self._read_bid(state, entry.get("bid_id"))
+                if (awarded["terms"]["job_id"] != job_id or awarded["status"] != "awarded"
+                        or awarded.get("award_id") != entry.get("award_id")):
+                    raise RecoveryRequired("queue award bid identity mismatch")
+                continue
+            if bid is not None and not bid.get("legacy"):
+                bid = self._read_bid(state, bid_id)
+                if bid["status"] == "awarded":
+                    continue
+            if self.config.offer_fn is not None:
+                offer = self.config.offer_fn(entry)
+            else:
+                if missing_pricing:
+                    continue
+                offer = {"job_id": job_id, "kind": "firm", "price_usd": self.config.ask_usd}
+            if offer is None:
+                if bid is not None and not bid.get("legacy") and bid["status"] == "open":
+                    try:
+                        response = self.client.withdraw_offer(bid_id)
+                    except OrmasGatewayError as exc:
+                        if not self._offer_conflict(exc, "not_open"):
+                            raise
+                        self._read_bid(state, bid_id)
+                    else:
+                        if response != {"bid_id": bid_id, "status": "withdrawn"}:
+                            raise RecoveryRequired("invalid own bid withdrawal")
+                        bid["status"] = "withdrawn"
+                        self._save_offers(state)
+                continue
+            _validate_window_offer(offer)
+            if offer["job_id"] != job_id:
+                raise ValueError("offer job_id must match its queue entry")
+            offer = dict(offer)
+            if (bid is not None and not bid.get("legacy") and bid["terms"] == offer
+                    and bid["status"] == "open"):
+                continue
+            # Save intent first: a lost POST response cannot be recovered by the
+            # own-status API, which requires the returned bid id.
+            state["pending"] = offer
+            self._save_offers(state)
+            try:
+                response = self.client.submit_offer(self.config.runner_id, offer)
+            except OrmasGatewayError as exc:
+                if exc.status_code is None or exc.status_code >= 500:
+                    raise  # The gateway may have recorded the POST.
+                state["pending"] = None
+                self._save_offers(state)
+                if self._offer_conflict(exc, "not_offering") and (bid is None or bid.get("legacy")):
+                    legacy_offers.append(offer)
+                    continue
+                if self._offer_conflict(exc, "window_closed"):
+                    if bid is not None:
+                        self._read_bid(state, bid_id)
+                    continue
+                raise
+            new_id, closes = response.get("bid_id"), response.get("window_closes_at")
+            if (not isinstance(new_id, str) or not new_id or new_id in state["bids"]
+                    or not isinstance(closes, str) or not closes):
+                raise RecoveryRequired("offer response has no new bid identity or window_closes_at")
+            state["pending"] = None
+            state["bids"][new_id] = {"terms": offer, "status": "open", "window_closes_at": closes}
+            state["current"][job_id] = new_id
+            self._save_offers(state)
+        if missing_pricing and not state["bids"]:
+            raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
+        # An own award can be absent from the queue page; recover its frozen
+        # terms through an empty-offer claim before requiring fresh pricing.
+        claimed = self.client.claim_task(self.config.runner_id, offers=[])
+        if claimed is not None:
+            return self._check_offer_lease(state, claimed)
+        if missing_pricing:
+            raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
+        if legacy_offers:
+            claimed = self.client.claim_task(self.config.runner_id, offers=legacy_offers)
+            return self._check_offer_lease(state, claimed, legacy_offers)
+        return None
+
     def _run_once_locked(self) -> bool:
         store = self._public_recovery
         if store is not None and (pending := store.pending()) is not None:
             return self._recover_public(pending)
-        claimed = self._claim_task()
+        try:
+            claimed = self._claim_task()
+        except (OrmasGatewayError, HTTPError, OSError) as exc:
+            self._claim_error = exc
+            raise
         if claimed is None:
             return False
         lease, draft = claimed
@@ -1265,12 +1498,23 @@ class MinerSkeleton:
 
         The idle sleep between polls is the gateway-adopted
         ``self.poll_interval_s`` unless ``poll_interval_s`` is given as an
-        explicit override.
+        explicit override. Claim refusals and transport errors log one warning
+        and idle at that cadence; credential refusals (401/403), recovery
+        failures and ``KeyboardInterrupt`` still propagate.
         """
         interval = self.poll_interval_s if poll_interval_s is None else poll_interval_s
         iterations = 0
         while max_iterations is None or iterations < max_iterations:
             iterations += 1
-            did_work = self.run_once()
+            try:
+                did_work = self.run_once()
+            except (OrmasGatewayError, HTTPError, OSError) as exc:
+                if self._claim_error is not exc or (
+                    isinstance(exc, OrmasGatewayError) and exc.status_code in (401, 403)
+                ):
+                    raise
+                self._claim_error = None
+                _LOGGER.warning("claim failed: %s: %s", type(exc).__name__, exc)
+                did_work = False
             if not did_work:
                 idle_sleep(interval)

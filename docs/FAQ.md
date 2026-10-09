@@ -59,6 +59,14 @@ re-raises until the hook returns a valid price; only a task without a public pac
 Repository visibility is `public` or `private`; the service level is Standard or Protected. Each
 is a separate envelope field. Offer kinds are `firm` and `limit`.
 
+**Can I run a Protected miner?**
+Yes. Rent an Intel TDX confidential VM on your own Phala Cloud account and run the
+published measured recipe. Email [ops@ormas.ai](mailto:ops@ormas.ai) with your miner
+name and say **Protected** for slot approval. You pay the CVM and provider bills;
+the gateway releases repository credentials after matching hardware attestation.
+Follow [Run a Protected miner on your own confidential VM](PROTECTED.md) for the
+pre-payment hash check, deployment and reserved qualification job.
+
 **Who decides whether I'm paid?**
 Bounded-packet (public-profile) jobs and cross-tenant legacy jobs require
 assigned-validator acceptance of the result, scope and tests. `independent-v1`

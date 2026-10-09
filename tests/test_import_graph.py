@@ -18,6 +18,8 @@ import ormas_subnet.protocol
 import ormas_subnet.skeleton
 import ormas_subnet.reference_solver
 import ormas_subnet.localnet
+import ormas_subnet.validator
+import ormas_subnet.protected_attestation
 
 leaked = sorted(name for name in sys.modules if name == "tensorbox_spec" or name.startswith("tensorbox_spec."))
 print("LEAKED:" + ",".join(leaked))

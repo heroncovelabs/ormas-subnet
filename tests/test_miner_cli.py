@@ -169,12 +169,14 @@ def test_doctor_hotkey(cli, gateway, capsys, hotkey, expected, warning):
 
 @pytest.mark.parametrize("qualification", [
     {"status": "queued"}, {"job_status": "queued"}, {"job": {"status": "queued"}},
+    {"status": "offering"}, {"job_status": "offering"}, {"job": {"status": "offering"}},
 ])
 def test_doctor_optional_qualification_status(cli, gateway, capsys, qualification):
     credentials()
     gateway[1]["/api/runner/v1/runners/me"][1]["qualification"] = qualification
     assert cli.main(["doctor"]) == 0
-    assert "qualification: cap 1 (job: queued)" in capsys.readouterr().out
+    status = qualification.get("status") or qualification.get("job_status") or qualification["job"]["status"]
+    assert f"qualification: cap 1 (job: {status})" in capsys.readouterr().out
 
 
 def test_doctor_unknown_qualification_outcome(cli, gateway, capsys):
