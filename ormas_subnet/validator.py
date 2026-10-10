@@ -61,8 +61,9 @@ __all__ = [
 
 VALIDATOR_PROTOCOL_V1 = "ormas-validator-v1"
 
-# digest_hex -> signature_hex.
-SignFn = Callable[[str], str]
+# Decision digest_hex (UTF-8) or domain-separated re-key bytes -> signature_hex.
+SignFn = Callable[[str | bytes], str]
+REKEY_SIGNATURE_DOMAIN = b"ormas-validator-rekey-v1"
 
 
 # ── execution contract (card 709e2a53) ───────────────────────────────────────
@@ -307,15 +308,17 @@ def make_ed25519_signer(private_key_hex: str) -> tuple[SignFn, str]:
 
     key, hex-encoded. ``sign_fn(digest_hex)`` signs the digest's UTF-8 bytes —
     the exact convention the gateway verifies against
-    (``outcomes_validators.verify_ed25519_signature``).
+    (``outcomes_validators.verify_ed25519_signature``). Bytes are signed directly
+    for the domain-separated re-key proof; decision encoding stays unchanged.
     """
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(private_key_hex))
     pubkey_hex = key.public_key().public_bytes_raw().hex()
 
-    def sign_fn(digest_hex: str) -> str:
-        return key.sign(digest_hex.encode("utf-8")).hex()
+    def sign_fn(message: str | bytes) -> str:
+        raw = message.encode("utf-8") if isinstance(message, str) else message
+        return key.sign(raw).hex()
 
     return sign_fn, pubkey_hex
 
@@ -344,7 +347,15 @@ class OrmasValidatorClient:
             )
             self._owns_client = True
 
-    def register(self, *, pubkey_hex: str, task_cells: list[str] | None = None) -> dict[str, Any]:
+    def register(
+        self, *, pubkey_hex: str, task_cells: list[str] | None = None,
+        current_sign_fn: SignFn | None = None,
+    ) -> dict[str, Any]:
+        """Register; on a re-key refusal, prove the retained CURRENT key once.
+
+        ``current_sign_fn`` signs raw bytes, not the decision digest encoding.
+        With no retained signer, surface the refusal rather than try the new key.
+        """
         body: dict[str, Any] = {
             "schema_version": VALIDATOR_PROTOCOL_V1,
             "pubkey_hex": pubkey_hex,
@@ -354,6 +365,25 @@ class OrmasValidatorClient:
             # Only a checker that can attest advertises the Protected cell.
             body["task_cells"] = list(task_cells)
         resp = self._client.post("/api/validator/v1/registrations", json=body)
+        if resp.status_code == 409 and current_sign_fn is not None:
+            error = resp.json().get("error")
+            if (isinstance(error, Mapping) and error.get("type") == "conflict_error"
+                    and error.get("message") == "validator_rekey_proof_required"):
+                challenge = self.request_rekey_challenge()
+                nonce, new_key = bytes.fromhex(challenge["nonce_hex"]), bytes.fromhex(pubkey_hex)
+                if len(nonce) != 32 or len(new_key) != 32:
+                    raise ValueError("invalid validator re-key nonce or key")
+                body["rekey_proof"] = {
+                    "challenge_id": challenge["challenge_id"],
+                    "signature": current_sign_fn(REKEY_SIGNATURE_DOMAIN + nonce + new_key),
+                }
+                resp = self._client.post("/api/validator/v1/registrations", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def request_rekey_challenge(self) -> dict[str, Any]:
+        resp = self._client.post(
+            "/api/validator/v1/rekey-challenge", json={"schema_version": VALIDATOR_PROTOCOL_V1})
         resp.raise_for_status()
         return resp.json()
 
@@ -738,11 +768,14 @@ class ValidatorDaemon:
         self.protected = protected
         self._protected_tokens: dict[str, Any] = {}
 
-    def register(self, *, pubkey_hex: str) -> dict[str, Any]:
-        if self.protected is None:
-            return self.client.register(pubkey_hex=pubkey_hex)
-        from .protected_attestation import PROTECTED_SERVICE_CELL
-        return self.client.register(pubkey_hex=pubkey_hex, task_cells=[PROTECTED_SERVICE_CELL])
+    def register(self, *, pubkey_hex: str, current_sign_fn: SignFn | None = None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"pubkey_hex": pubkey_hex}
+        if current_sign_fn is not None:
+            kwargs["current_sign_fn"] = current_sign_fn
+        if self.protected is not None:
+            from .protected_attestation import PROTECTED_SERVICE_CELL
+            kwargs["task_cells"] = [PROTECTED_SERVICE_CELL]
+        return self.client.register(**kwargs)
 
     def _attest(self, assignment_id: str) -> Any:
         """Open one sealed read token for this assignment; raises ``GitError`` when refused."""
@@ -1189,6 +1222,9 @@ def main(argv: list[str] | None = None) -> int:
     key_args = parser.add_mutually_exclusive_group(required=True)
     key_args.add_argument("--private-key-env", help="Env var holding the hex Ed25519 decision key")
     key_args.add_argument("--private-key-file", help="Private file holding the hex Ed25519 decision key")
+    current_key_args = parser.add_mutually_exclusive_group()
+    current_key_args.add_argument("--current-private-key-env", help="Env var holding the old key for re-key proof")
+    current_key_args.add_argument("--current-private-key-file", help="Private file holding the old key for re-key proof")
     parser.add_argument("--workdir-root", default=str(Path.cwd() / "ormas-validator-work"))
     parser.add_argument("--once", action="store_true", help="Review one assignment, exit 3 if idle")
     parser.add_argument(
@@ -1209,6 +1245,13 @@ def main(argv: list[str] | None = None) -> int:
     private_key = _load_cli_secret(token_env=args.private_key_env, token_path=args.private_key_file)
     if args.private_key_env:
         os.environ.pop(args.private_key_env, None)
+    current_sign_fn = None
+    if args.current_private_key_env or args.current_private_key_file:
+        current_key = _load_cli_secret(token_env=args.current_private_key_env,
+                                       token_path=args.current_private_key_file)
+        if args.current_private_key_env:
+            os.environ.pop(args.current_private_key_env, None)
+        current_sign_fn, _ = make_ed25519_signer(current_key)
     from .protected_attestation import ProtectedAssignmentAttestor, evidence_fn_from_env
     try:
         evidence_fn = evidence_fn_from_env(os.environ)
@@ -1230,7 +1273,10 @@ def main(argv: list[str] | None = None) -> int:
 
         def _register() -> None:
             if registrar is not None:
-                registrar.register(pubkey_hex=pubkey)
+                if current_sign_fn is None:
+                    registrar.register(pubkey_hex=pubkey)
+                else:
+                    registrar.register(pubkey_hex=pubkey, current_sign_fn=current_sign_fn)
             else:
                 if protected is None:
                     client.register(pubkey_hex=pubkey)
