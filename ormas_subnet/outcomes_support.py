@@ -349,9 +349,10 @@ def validate_public_execution_packet(packet):
             or arguments[5] != encoded or shlex.join(arguments) != expected_command):
         raise ValueError('verifier_compiler_mismatch')
     sha = hashlib.sha256(expected_command.encode()).hexdigest()
+    # int == float in Python, so packets written as 600.0 (pre-2026-10-09 clients) and 600 both pass.
     if vp != {'schema_version': 'outcomes.verifier-profile.v1', 'profile_id': 'external-driver-v1',
               'original_command': vp['original_command'], 'generated_command_sha256': sha,
-              'timeout_s': float(config['limits']['timeout_s']), 'max_files': config['limits']['max_files'],
+              'timeout_s': config['limits']['timeout_s'], 'max_files': config['limits']['max_files'],
               'max_bytes': config['limits']['max_bytes'], 'execution_mode': 'oci-v1', 'assertion_failure_exit_code': 86}:
         raise ValueError('verifier_profile_mismatch')
     expected = execution_requirements(environment, config, languages=req.get('languages'), command_digest='sha256:' + sha)
