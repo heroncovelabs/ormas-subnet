@@ -103,11 +103,11 @@ bounds. The catalog defines the execution aliases and pricing JSON schema.
 Fill `ORMAS_PRICING_JSON` using the template Ormas sends privately with slot
 approval. Compact the completed JSON object or list of objects onto one line.
 
-**Phala parsing rule:** keep `#`, quotes and embedded newlines out of free-text
+**Sealed-env parsing rule:** keep `$`, `#`, quotes and embedded newlines out of free-text
 values, including `ORMAS_APPROVED_BY`. Use `miner-operator`, for example. The
 production value `miner #1` truncated an authorization value and prevented
-registration. Write compact JSON directly after `=` with its required JSON
-syntax quotes; keep its string contents free of `#`, quote characters and
+registration. `$` is also refused to prevent Compose interpolation. Write compact JSON directly after `=` with its required JSON
+syntax quotes; keep its string contents free of `$`, `#`, quote characters and
 newlines, and use a single line without surrounding shell quotes.
 
 With `ORMAS_AUTHORIZATION_JSON` empty, the entrypoint builds the expense record
@@ -179,6 +179,78 @@ job as its claim exception. Once that job settles paid, the gateway raises the
 key's daily claim cap to 50. Ordinary work then uses your advertised task cells,
 qualification and capacity. Follow the [install guide](INSTALL.md) to bind your
 SN76 hotkey for chain rewards; keep chain signing keys outside the CVM.
+
+## Split shell (bring your own worker)
+
+The measured Ormas shell owns credentials, attestation and publication. Your
+worker is a separate OCI image pinned by digest. Start with the
+[worker contract](../protected/worker/CONTRACT.md) and
+[conformance harness](../protected/worker/conformance/README.md). Passing local
+conformance does not prove live confinement or qualify a Protected deployment.
+Get an approved split release from ops before renting; if its split compose,
+wrapper or manifest is not published, stop and request the complete recipe.
+
+Save your key with `ormas-miner login`. Put worker provider keys in a private JSON
+object file; do not put secrets in flags. Generate the complete sealed env:
+
+```sh
+ormas-miner protected-env --miner-id '<approved-miner-name>' --runtime production \
+  --authorization-file /private/authorization.json \
+  --task-cells task:code --task-cells task:service/protected \
+  --bind-project-id '<your-project-id>' \
+  --worker-image '<your-image>@sha256:<digest>' \
+  --worker-env-file /private/worker-env.json \
+  --provider '<provider-host>' --pricing-template --out /private/miner.env
+```
+
+Repeat `--task-cells` for all approved task qualifications and `--provider` for
+each declared provider DNS host. No providers means an empty declaration.
+Production requires the exact `https://api.ormas.ai` URL; development also requires
+HTTPS. `--token-file` uses a private key file instead of saved credentials. Use `--cell-bounds` and `--approved-by` **instead of**
+`--authorization-file` for the CVM-built expense record. Optional
+`--registry-auth-file` supplies registry authentication without exposing it in
+argv. Registry auth and token files may have one terminal newline, which is
+removed; embedded or additional newlines are refused. Every key, including empty values, follows the split compose's measured
+`SPLIT_ALLOWED_ENVS` order. Outputs are private; existing files require `--force`.
+The sealed-env rule above applies to every value and JSON string content.
+
+The split list has **no provider-policy or pricing slot**. Beside the env,
+`declared-providers.list` is the declaration to send to ops for
+`public-qualifications slot-approve --worker-policy-host …`. For a zero-provider
+worker, ops must use `--worker-policy-empty` to approve an empty policy explicitly;
+omitting both options leaves the policy unapproved. Submit your image's digest
+for repeatable `--worker-digest …` approval. The gateway freezes the
+approved provider policy at release; the declaration file is not approval.
+At split startup, the shell fetches its own approved hosts before binding the
+proxy, freezes them in a private 0600 file, and attests that file's canonical
+digest. An approved empty policy denies all providers. A NULL approval keeps
+the measured policy; a failed fetch refuses startup. The running proxy never
+hot-reloads policy. Approval added or changed after boot therefore mismatches
+at credential release until the shell restarts. Doctor shows the gateway's
+approval state, not the policy frozen at boot.
+`--pricing-template` writes `pricing.json` with `estimate_usd`/`limit_usd`
+placeholders: it illustrates the offer field names, not a pricing configuration.
+Your worker emits a **per-task** `offer.json` with estimate/limit values, as specified
+in the worker contract. The template is not injected into the shell env. Never send ops the env or key files.
+
+Use the published **split** recipe for the hash/provision checks above, passing
+`--compose docker-compose.split.yml` to the hash tool. Deploy that exact compose
+with the pinned wrapper and sealed env:
+
+```sh
+phala deploy -n '<your-cvm-name>' -c docker-compose.split.yml -t tdx.small \
+  --image dstack-0.5.9 --no-dev-os --no-public-logs --no-public-sysinfo \
+  --pre-launch-script prelaunch.sh -e /private/miner.env
+ormas-miner doctor --protected
+```
+
+Doctor reads only your gateway registration: slot approval, declared digests,
+worker-policy presence, qualification job, last release refusal and last released
+worker digest. Name-only slot approval is `warn slot: approved, not yet bound`;
+declared digests and policy come only from the bound slot, as at the release gate.
+An approved empty policy is `ok`; no policy approval is `warn`. Pending qualification
+or no release yet also warns. `fail` requires correction. An older gateway without these diagnostics fails explicitly.
+This checks the gateway's view, not your local Docker state.
 
 ## Updating a release or rotating keys
 
