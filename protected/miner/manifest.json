@@ -31,7 +31,8 @@
       }
     ],
     "allowed_compose_hashes_hex": [
-      "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805"
+      "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805",
+      "40f4e967eb72517ea0c792b72361b309670ff30151dba6a365c503a8f461263e"
     ],
     "allowed_tcb_statuses": [
       "UpToDate",
@@ -49,6 +50,11 @@
     "Rotate via PR: add the new image_id with supersedes set to the previous image_id, so",
     "git log on tensorbox_spec/privacy/manifests/ is the audit trail.",
     "expected_vmpl is 1: our measured image runs the Ormas client at VMPL 1 (owner default 2026-10-01, coordination/owner_decisions_2026_10_01_protected_defaults_and_standard_routing.md); the Targon T1 proof report was issued at VMPL 1.",
-    "tdx.allowed_tcb_statuses admits SWHardeningNeeded beside UpToDate (owner decision 2026-10-07, coordination/owner_decisions_2026_10_07_direction_defaults.md item 1); OutOfDate, Revoked and ConfigurationNeeded stay refused."
-  ]
+    "tdx.allowed_tcb_statuses admits SWHardeningNeeded beside UpToDate (owner decision 2026-10-07, coordination/owner_decisions_2026_10_07_direction_defaults.md item 1); OutOfDate, Revoked and ConfigurationNeeded stay refused.",
+    "Transition 2026-10-10: 40f4e967 is the split pluggable-worker recipe (deploy/protected-miner/docker-compose.split.yml, shell image ghcr.io/heroncovelabs/ormas-protected-shell@sha256:e376eaec..., three same-commit builds of 84b3acfda matched), admitted BESIDE the monolith ac40e43d, which stays the rollback recipe. Retire one when the other is withdrawn."
+  ],
+  "image_digests": {
+    "scratch-init": "e376eaec098e635c321077085c37d26d00155389d1d8fc233a36de0ad25253e2",
+    "ormas-shell": "e376eaec098e635c321077085c37d26d00155389d1d8fc233a36de0ad25253e2"
+  }
 }

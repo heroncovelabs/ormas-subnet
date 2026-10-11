@@ -5,7 +5,7 @@
 
 ## Inputs: fresh `/work` per mode
 
-**Solve:** `repo/`, `packet.json`, `.home/`, `.tmp/`; writes `patch.diff`. **Offer:** `offer-request.json`, `.home/`, `.tmp/` only; writes `offer.json`. `repo/` is source at the base, without `.git`; tracked symlinks may exist, but patching them or through them is refused. Inputs are advisory: edits cannot change shell authority.
+**Solve:** `repo/`, `packet.json`, `.home/`, `.tmp/`; writes `metering.json` and `patch.diff`. **Offer:** `offer-request.json`, `.home/`, `.tmp/` only; writes `offer.json`. `repo/` is source at the base, without `.git`; tracked symlinks may exist, but patching them or through them is refused. Inputs are advisory: edits cannot change shell authority.
 
 `packet.json` is flat, with these fields (no nested `work_packet`):
 
@@ -17,9 +17,12 @@
 | `acceptance_criteria` | received JSON acceptance context, normally a string array |
 | `execution_policy` | object: only received `repo_base_sha` (string); `allowed_paths`, `immutable_paths`, `allowed_tools` (string arrays); `max_turns`, `max_attempts`, `continuation_cost_authorization_ticks` (integers) |
 | `work_packet_sha256` | lowercase SHA-256 hex of original packet, not this projection |
+| `accepted_offer` | optional **ADVISORY** object: `kind` is `limit` or `firm`; `estimate_usd` and `limit_usd` are finite numbers or `null`, exactly the known accepted terms for this lease; absent when unknown |
 | `parent_job_id`, `repair_findings`, `repair_evidence` | optional string parent id / JSON repair context; forbidden identity/credential/budget keys curated recursively |
 
 Policy keys absent upstream stay absent. Turns/attempts/continuation preserve authority, not new spend permission; `allowed_tools` does not confine arbitrary programs.
+
+Reading `accepted_offer` is optional. It carries only the accepted kind, estimate and limit, never other lease fields or client identity. A worker may use it to name its delivery price, but editing or ignoring it cannot change the shell's authority: the shell still charges `min(limit_usd, round(settled_usd, 4))` using its accepted lease.
 
 `offer-request.json` has **all-optional** sanitized fields; missing/invalid values are omitted, never defaults:
 
@@ -43,7 +46,11 @@ Tolerate read-only root, only `/work` writable, uid/gid 65534, cap-drop ALL, no-
 
 ## Outputs and shell checks
 
-`MINER_WORKER_MODE` is **solve** or **offer**. Exit **0** means the corresponding nonempty regular artifact was written, not accepted; **2** means no artifact / no patch / declined; other exits fail. Offer may exit 0 with `{"decline": true}`. Otherwise `offer.json` is exactly `{"estimate_usd": p, "limit_usd": q}`: finite non-boolean numbers, `0 < p ≤ q`, no duplicate/extra keys or mixed answers. v1 is limit-only; shell quantization/submission/settlement is outside the worker, with no metering handoff defined here.
+`MINER_WORKER_MODE` is **solve** or **offer**. Exit **0** means the corresponding nonempty regular artifact was written, not accepted; **2** means no artifact / no patch / declined; other exits fail. Offer may exit 0 with `{"decline": true}`. Otherwise `offer.json` is exactly `{"estimate_usd": p, "limit_usd": q}`: finite non-boolean numbers, `0 < p ≤ q`, no duplicate/extra keys or mixed answers. v1 is limit-only; shell quantization/submission/settlement is outside the worker.
+
+In solve mode, alongside `/work/patch.diff`, write `/work/metering.json`: a UTF-8 JSON object with exactly `settled_usd` and optional `cost_usd`. Duplicate or extra keys are refused. Both values must be finite, non-boolean numbers ≥ 0. `settled_usd` is the price the worker names for this delivery; `cost_usd` is private telemetry, never client-visible. The shell applies no margin curve: settled price = `min(limit_usd, round(settled_usd, 4))`. Each artifact must be a regular file bounded by the same operator-supplied artifact cap.
+
+Exit 0 with `patch.diff` but missing or invalid `metering.json` means `metering_unavailable`: no delivery, no charge. Exit semantics otherwise stay unchanged. Write metering before the patch so an interrupted worker cannot leave an unmetered patch. The reference worker reads `REFERENCE_WORKER_PRICE_USD` from its expanded sealed `MINER_WORKER_ENV_JSON`; solve fails with a nonzero exit when that price is absent or invalid, rather than inventing one.
 
 `patch.diff` is UTF-8, NUL-free Git-style unified diff: agreeing `diff --git`, `---`/`+++` paths and counted hunks. Add only `new file mode 100644`; delete `100644`/`100755`; use `/dev/null` on the absent side. Modify preserves mode. **Renames need both from/to paths in scope and hunks; COPY blocks are refused at shell apply** (`apply_scope_mismatch`, unchanged source). Empty-file add/delete and hunkless moves fail. Preserve file bytes: diff line endings must match them; the parser tolerates trailing CR on header lines, but `git apply` is byte-exact. `\ No newline at end of file` marks missing final LF.
 

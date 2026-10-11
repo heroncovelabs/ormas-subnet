@@ -1,5 +1,5 @@
 """MIT. Public source, not a mirror. Python >= 3.10, stdlib only.
-Trivial solve appends a comment; offer declines unless sealed pricing is set.
+Trivial solve appends a comment and reports its sealed price; offer declines unless set.
 Never log input values. This exercises the boundary, not useful mining logic.
 """
 import difflib
@@ -116,7 +116,15 @@ def solve(work):
         new = old + (eol if old and not old.endswith(b"\n") else b"") + b"# reference worker" + eol
         mode = "100755" if info.st_mode & 0o111 else "100644"
         text = render_change(path, old, new, mode, mode)
+        raw = os.environ.get("REFERENCE_WORKER_PRICE_USD")
+        if raw is None:
+            raise ValueError("metering_unavailable")
+        price = float(raw)
+        if not math.isfinite(price) or price < 0:
+            raise ValueError("metering_unavailable")
+        metering = json.dumps({"settled_usd": price}, allow_nan=False).encode("utf-8")
         target.write_bytes(new)
+        write_artifact(work, "metering.json", metering)
         write_artifact(work, "patch.diff", text.encode("utf-8"))
         return 0
     print("no_patch", file=sys.stderr)
