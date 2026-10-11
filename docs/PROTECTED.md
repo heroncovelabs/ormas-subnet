@@ -187,8 +187,9 @@ worker is a separate OCI image pinned by digest. Start with the
 [worker contract](../protected/worker/CONTRACT.md) and
 [conformance harness](../protected/worker/conformance/README.md). Passing local
 conformance does not prove live confinement or qualify a Protected deployment.
-Get an approved split release from ops before renting; if its split compose,
-wrapper or manifest is not published, stop and request the complete recipe.
+The published split recipe is `protected/miner/docker-compose.split.yml` (shell image pinned by digest; the
+manifest admits its compose hash beside the monolith's). Verify it with the hash tool before renting; if the
+compose, wrapper or manifest you hold is not the published one, stop and request the complete recipe.
 
 Save your key with `ormas-miner login`. Put worker provider keys in a private JSON
 object file; do not put secrets in flags. Generate the complete sealed env:

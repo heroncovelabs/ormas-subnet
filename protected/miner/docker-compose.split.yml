@@ -1,0 +1,70 @@
+# MEASURED FILE. dstack extends sha256(app-compose) into RTMR3, and app-compose embeds this
+# file byte for byte. Any byte change (including comments and whitespace) changes the
+# compose hash and needs a new manifest entry: run `compose_hash.py pin` and commit the
+# manifest in the same change. Design: docs/design/protected_pluggable_worker_2026_10_09.md
+# TODO(pin): build/review the shell, then pin its digest and a NEW split compose manifest.
+# Monolith docker-compose.yml stays untouched for rollback. This is NOT deployable yet.
+# No bubblewrap in the split shell: Docker's default seccomp/AppArmor stay enabled.
+# Workers, /work volumes and internal networks are created per invocation by the launcher;
+# none are shared or declared here. Both guest sockets stay in the measured shell only.
+# Split mode is a literal below, measured in compose bytes, NOT a deployer env choice.
+# The allowed_envs list contains only the interpolated startup/authorization inputs below,
+# in this order. The final three names hold worker image/config and shell-only registry auth.
+services:
+  # One-shot: gives the guest's verifier scratch directory to uid/gid 1000, mode 0700, then
+  # exits. Root inside this container only, no network, nothing privileged. Compose creates
+  # every container before starting any, so the miner's bind creates the directory (root,
+  # 0755) and the miner starts only after this service has fixed its owner and mode.
+  scratch-init:
+    image: ghcr.io/heroncovelabs/ormas-protected-shell@sha256:e376eaec098e635c321077085c37d26d00155389d1d8fc233a36de0ad25253e2
+    restart: "no"
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["install", "-d", "-o", "1000", "-g", "1000", "-m", "0700", "/var/lib/ormas-verifier-scratch"]
+    volumes:
+      - /var/lib/ormas-verifier-scratch:/var/lib/ormas-verifier-scratch
+  ormas-shell:
+    image: ghcr.io/heroncovelabs/ormas-protected-shell@sha256:e376eaec098e635c321077085c37d26d00155389d1d8fc233a36de0ad25253e2
+    restart: unless-stopped
+    depends_on:
+      scratch-init:
+        condition: service_completed_successfully
+    # Only this service sees the dstack agent socket, read-only. Verifier containers the
+    # miner starts through docker.sock get no dstack socket.
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Sibling verifiers need the same guest/container scratch path. Never share /tmp.
+      # scratch-init sets its owner and mode before the shell starts; no worker sees it.
+      - type: bind
+        source: /var/lib/ormas-verifier-scratch
+        target: /var/lib/ormas-verifier-scratch
+        bind:
+          create_host_path: true
+      - miner-state:/var/lib/ormas
+    # Customer scratch shadows miner-state; a container restart discards plaintext.
+    # Owner item 3: 2 GiB scratch (owner_decisions_2026_10_10_protected_pluggable_worker.md).
+    # U6 must check the tmpfs cap and noexec behavior before admission.
+    # Explicit owner/mode below; startup wipe remains the code guarantee.
+    tmpfs:
+      - /var/lib/ormas/scratch:uid=1000,gid=1000,mode=0700,size=2g
+    # The dstack 0.5.9 guest's /var/run/docker.sock is root:997 mode 0660; the miner runs as
+    # uid 1000, so it joins gid 997 (the live proof confirms the gid).
+    group_add:
+      - "997"
+    environment:
+      ORMAS_PROTECTED_MODE: split
+      ORMAS_API_URL: ${ORMAS_API_URL}
+      ORMAS_RUNNER_TOKEN: ${ORMAS_RUNNER_TOKEN}
+      ORMAS_MINER_ID: ${ORMAS_MINER_ID}
+      ORMAS_RUNTIME: ${ORMAS_RUNTIME}
+      ORMAS_AUTHORIZATION_JSON: ${ORMAS_AUTHORIZATION_JSON}
+      ORMAS_CELL_BOUNDS: ${ORMAS_CELL_BOUNDS}
+      ORMAS_APPROVED_BY: ${ORMAS_APPROVED_BY}
+      ORMAS_TASK_CELLS: ${ORMAS_TASK_CELLS}
+      ORMAS_BIND_PROJECT_ID: ${ORMAS_BIND_PROJECT_ID}
+      MINER_WORKER_IMAGE: ${MINER_WORKER_IMAGE}
+      MINER_WORKER_ENV_JSON: ${MINER_WORKER_ENV_JSON}
+      MINER_WORKER_REGISTRY_AUTH: ${MINER_WORKER_REGISTRY_AUTH}
+volumes:
+  miner-state: {}

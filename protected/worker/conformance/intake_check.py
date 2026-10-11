@@ -565,3 +565,21 @@ def parse_offer(text) -> dict:
     if prices["estimate_usd"] > prices["limit_usd"]:
         raise OfferError("Offer estimate exceeds limit")
     return prices
+
+
+class MeteringError(ValueError):
+    """Fixed, value-free invalid worker metering."""
+
+
+def parse_metering(text) -> dict:
+    """Worker-named price plus optional private cost; neither is a shell curve."""
+    try:
+        data = _json_object(text)
+        if set(data) not in ({"settled_usd"}, {"settled_usd", "cost_usd"}):
+            raise ValueError()
+        for value in data.values():
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError()
+        return data
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        raise MeteringError("metering_unavailable") from None
