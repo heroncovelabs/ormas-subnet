@@ -48,7 +48,7 @@ mining logic.
 | 400 | `invalid_request_error` | Missing/unknown/forbidden field, bad DTO value, `failure_class_mismatch` |
 | 401 | `authentication_error` | Missing/invalid token, device mismatch, rate-limited by repeated auth failures |
 | 404 | `not_found_error` | Unknown runner/repo/task, or the tenant's runner feature is off |
-| 409 | `conflict_error` | `lease_lost` — the lease no longer belongs to you (message `"lease_lost"`) |
+| 409 | `conflict_error` | `lease_lost` — the lease no longer belongs to you; `validator_rekey_proof_required` — decision-key replacement lacks valid current-key proof |
 | 429 | `rate_limited` | Daily per-token claim cap exceeded (message `"daily_claim_cap"`) |
 | 503 | `service_unavailable` | Pricing/quoting subsystem unavailable (message `"runner_pricing_unavailable"`) |
 | 500 | `internal_error` | Settlement produced no receipt (should not happen; report it) |
@@ -56,6 +56,34 @@ mining logic.
 `complete` also returns non-error status codes `202` (`{"status": "settling", "retry_after_s": N}`,
 retry the same complete call) and `410` (terminal already recorded; body is the
 same shape as a `200`, replay-safe).
+
+## Validator decision-key registration and re-key
+
+`POST /api/validator/v1/registrations` uses the validator bearer token and
+`{"schema_version":"ormas-validator-v1","pubkey_hex":"<Ed25519 key hex>"}`.
+First registration (including a CVM rebind with no current key) and same-key
+registration are unchanged. Replacing an existing key without valid proof returns
+409 `conflict_error`, message `validator_rekey_proof_required`.
+
+To replace a key, keep the current private key. Send the same bearer and
+`{"schema_version":"ormas-validator-v1"}` to `POST /api/validator/v1/rekey-challenge`.
+It returns `{challenge_id, nonce_hex, expires_at}`. Sign the raw bytes
+`b"ormas-validator-rekey-v1" + bytes.fromhex(nonce_hex) + bytes.fromhex(new_pubkey_hex)`
+with the **current**, not the new, Ed25519 key. Retry registration with the new
+`pubkey_hex` and `rekey_proof: {challenge_id, signature}` (signature hex).
+Challenges are validator/current-key-bound, single-use, and expire after 300 seconds;
+expiry, replay, wrong validator, wrong target key, or wrong signer gets the same 409.
+The lifetime reuses the Protected validator gate's existing
+`DEFAULT_FRESHNESS_SECONDS` (`privacy/tee_attestation.py`, used by
+`privacy/key_release.py:KeyReleaseGate`), not a new timeout policy. Challenges live
+in the shared Outcomes table `outcomes_validator_rekey_challenges`; miner hotkey
+nonces have a different identity/key binding and are not reused.
+
+The reference client's `register(current_sign_fn=...)` performs the challenge step
+only on that fixed 409 and retries registration once. The CLI accepts the retained
+key via `--current-private-key-env` or `--current-private-key-file`; the ordinary
+`--private-key-*` input is the new decision key. Never put either key in argv.
+Protected assignment release remains bound to its attested decision key.
 
 ## Lifecycle
 
@@ -748,6 +776,34 @@ can settle directly. `verified` but
 commit → `"no_delivery"`/`publish_failed`; any other `verification_state` →
 `"no_delivery"` with a failure class derived from the state (or your own
 `capture.failure_class`, if it's a recognized value for that state).
+
+**Protected settlement guard (PW-6 S6 gateway candidate; not yet released):**
+Enqueue requires a private GitHub repository for `service_level=protected`.
+A public GitHub repository receives HTTP 400 `invalid_request_error` with the fixed
+message `protected_requires_private_repository`, before a job is created.
+Protected names the service level; private names GitHub repository visibility.
+
+A Protected delivery also requires a successful `protected-miner` credential-release
+audit for the exact job and claim nonce, bound to the completing miner. If the
+slot was restricted in any challenge or successful release on that claim, payment
+requires a restricted release carrying both `worker_image_digest` and
+`worker_policy_digest`; the receipt digest comes from that restricted release.
+Re-challenging after a slot edit or revocation preserves this requirement.
+Restricted challenges require both digests before nonce issuance or credential
+release (`worker_policy_required` on refusal). The gateway uses frozen approval
+evidence. Challenge expiry/pruning preserves restriction evidence until the
+successful-release audit carries it. Legacy unrestricted monolith releases
+still qualify with NULL worker digests; no new wire fields are required.
+
+Missing proof, incomplete restricted bindings, or an unreadable release store
+produce a `no_delivery` receipt with the fixed `failure_class`
+`protected_release_unproven`, zero settlement and no payment. This also gates
+pending receipts before validator acceptance makes them payable. Client copy is
+fixed: “Ormas could not confirm Protected execution; nothing was charged.”
+Standard jobs do not read the release store and keep their existing settlement
+rules. Receipts expose only the successful release's `worker_image_digest`, not
+provider policy contents. `/health` counts these receipt-backed refusals in its
+Protected block when the watch store is available.
 
 ### Pricing callbacks in the reference skeleton
 

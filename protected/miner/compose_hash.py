@@ -15,11 +15,19 @@ The Protected deployment overrides four of them (design decision 3 and 6):
 Subcommands:
   hash          print the compose hash
   app-compose   print the app-compose JSON that is hashed
-  pin           write the image digest into the compose, fill the manifest's tdx tuple
+  pin           write each service's image digest, fill the manifest's tdx tuple;
+                repeat --image-digest SERVICE=sha256:… for split images. A single
+                --image-digest sha256:… retains the legacy same-image monolith form.
   check         exit 1 unless the manifest admits the recomputed hash
-  digests       print the gateway's ORMAS_PROTECTED_PLUGIN_DIGEST / _EGRESS_LIST_DIGEST
-                (plugin = the grok binary's sha256 from pins.env; egress = egress.list);
-                --write-readme refreshes the README block (pin does this too)
+  digests       print the gateway's plugin, egress-list and worker-policy digests;
+                monolith plugin = grok sha256 from pins.env. Split shell plugin =
+                measured entrypoint sha256, never the worker image. Split policy = canonical
+                egress-list sha256, or unset when absent, matching prepare_split.
+                Monolith digests output is unchanged.
+                --write-readme refreshes the README block (monolith pin does this too)
+
+All commands accept --compose FILE (default docker-compose.yml). The selected
+compose's services select the measured env list, not the file's basename.
 
 Stdlib only.
 """
@@ -53,8 +61,15 @@ ALLOWED_ENVS = [
     "ORMAS_BIND_PROJECT_ID",
     "ENGY_API_KEY", "SAYGM_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY",
 ]
+# Only split startup inputs, including _authorization's alternative record inputs.
+# The mode is a literal in measured compose bytes, never an allowed deployer override.
+SPLIT_ALLOWED_ENVS = [
+    "ORMAS_API_URL", "ORMAS_RUNNER_TOKEN", "ORMAS_MINER_ID", "ORMAS_RUNTIME",
+    "ORMAS_AUTHORIZATION_JSON", "ORMAS_CELL_BOUNDS", "ORMAS_APPROVED_BY",
+    "ORMAS_TASK_CELLS", "ORMAS_BIND_PROJECT_ID",
+    "MINER_WORKER_IMAGE", "MINER_WORKER_ENV_JSON", "MINER_WORKER_REGISTRY_AUTH",
+]
 OVERRIDES = {
-    "allowed_envs": ALLOWED_ENVS,
     "public_logs": False,
     "public_sysinfo": False,
     "public_tcbinfo": True,
@@ -63,13 +78,39 @@ OVERRIDES = {
 # Public mirror of the Fly build (design D3, 2026-10-08): CVMs pull anonymously, no registry token.
 IMAGE_REPO = "ghcr.io/heroncovelabs/ormas-protected-miner"
 PLACEHOLDER = "sha256:PLACEHOLDER_IMAGE_DIGEST"
-_IMAGE_LINE = re.compile(r"^(\s*image:\s*)" + re.escape(IMAGE_REPO) + r"@(\S+)\s*$", re.M)
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+# These measured files use block-style services with four-space image scalars.
+# Pin by offsets, not YAML reserialization: comments/whitespace are measured too.
+_SERVICE = re.compile(r"^  ([a-zA-Z0-9_-]+):\s*(?:#.*)?$", re.M)
+_IMAGE_LINE = re.compile(r"^(    image: *)([^\s@]+)@([^\s#]+)( *\n|$)", re.M)
+
+
+# Deliberate duplicate of entrypoint.WORKER_POLICY_FILE, cross-checked by tests.
+# Keep the hash tool stdlib-only without importing/executing startup code.
+WORKER_POLICY_FILE = Path("/opt/ormas/worker-policy.list")
+
+def service_images(compose_text: str) -> dict[str, str]:
+    """Service -> pinned image reference; preserve each service's own repository."""
+    services = compose_text.split("services:\n", 1)[1].split("\nvolumes:", 1)[0]
+    headers = list(_SERVICE.finditer(services))
+    images = {}
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(services)
+        block = services[header.end():end]
+        found = list(_IMAGE_LINE.finditer(block))
+        if len(found) != 1 or header[1] in images:
+            raise SystemExit("compose: expected one digest-pinned image per service")
+        images[header[1]] = found[0][2] + "@" + found[0][3]
+    if not images:
+        raise SystemExit("compose: no service images found")
+    return images
 
 
 def app_compose(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> dict:
     wrapper = json.loads(Path(wrapper_path).read_text())
-    return dict(wrapper, **OVERRIDES, docker_compose_file=Path(compose_path).read_text())
+    text = Path(compose_path).read_text()
+    envs = SPLIT_ALLOWED_ENVS if "ormas-shell" in service_images(text) else ALLOWED_ENVS
+    return dict(wrapper, **OVERRIDES, allowed_envs=envs, docker_compose_file=text)
 
 
 def compose_hash(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> str:
@@ -80,14 +121,19 @@ def compose_hash(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> 
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def image_digests(compose_text: str) -> dict[str, str]:
+    """Service -> content digest, without a one-image/repository assumption."""
+    return {name: image.rsplit("@", 1)[1] for name, image in service_images(compose_text).items()}
+
+
 def image_digest(compose_text: str) -> str:
-    """The one pinned digest: every service image line of our repository must carry it."""
-    found = {m[1] for m in _IMAGE_LINE.findall(compose_text)}
-    if len(found) != 1:
-        raise SystemExit(f"compose: expected one {IMAGE_REPO}@… digest on every image line")
-    images = re.findall(r"^\s*image:\s*(\S+)\s*$", compose_text, re.M)
-    if any(not image.startswith(IMAGE_REPO + "@") for image in images):
+    """Legacy same-image accessor; split callers use image_digests instead."""
+    images = service_images(compose_text)
+    if any(not image.startswith(IMAGE_REPO + "@") for image in images.values()):
         raise SystemExit(f"compose: every image must be {IMAGE_REPO}@…")
+    found = {image.rsplit("@", 1)[1] for image in images.values()}
+    if len(found) != 1:
+        raise SystemExit("compose: multiple image digests; use service-specific pins")
     return found.pop()
 
 
@@ -99,16 +145,29 @@ def _binding():
     return module
 
 
-def gateway_digests(pins: Path = PINS, egress_list: Path = EGRESS_LIST) -> dict[str, str | None]:
+def gateway_digests(pins: Path = PINS, egress_list: Path = EGRESS_LIST,
+                    *, compose_path: Path = COMPOSE) -> dict[str, str | None]:
     """Expected gateway env values; the plugin digest is None until pins.env exists."""
+    split = "ormas-shell" in service_images(Path(compose_path).read_text())
+    entrypoint = HERE / "entrypoint.py"
+    if split and not entrypoint.is_file():
+        raise ValueError("split digests require measured entrypoint.py; the standalone public mirror does not ship it")
     binding = _binding()
     plugin = None
     if pins.is_file():
         for line in pins.read_text().splitlines():
             if line.startswith("PIN_GROK_SHA256="):
                 plugin = line.split("=", 1)[1].strip() or None
-    return {binding.PLUGIN_DIGEST_ENV: plugin,
-            binding.EGRESS_LIST_DIGEST_ENV: binding.derive_egress_list_digest(egress_list)}
+    digests = {binding.PLUGIN_DIGEST_ENV: plugin,
+               binding.EGRESS_LIST_DIGEST_ENV: binding.derive_egress_list_digest(egress_list)}
+    if split:
+        # Independent expectation preserves the deployed monolith's plugin binding.
+        digests.pop(binding.PLUGIN_DIGEST_ENV)
+        digests["ORMAS_PROTECTED_SHELL_PLUGIN_DIGEST"] = binding.derive_plugin_digest(entrypoint)
+        digests["ORMAS_PROTECTED_WORKER_POLICY_DIGEST"] = (
+            binding.derive_egress_list_digest(WORKER_POLICY_FILE)
+            if WORKER_POLICY_FILE.is_file() else "unset")
+    return digests
 
 
 def _digest_lines(digests: dict[str, str | None]) -> list[str]:
@@ -124,14 +183,31 @@ def write_readme(digests: dict[str, str | None], readme: Path = README) -> None:
 
 
 def _pin(args: argparse.Namespace) -> int:
-    if not _DIGEST.match(args.image_digest):
-        raise SystemExit("pin: --image-digest must be sha256:<64 lowercase hex>")
+    text = Path(args.compose).read_text()
+    images = service_images(text)
+    supplied = args.image_digest
+    if len(supplied) == 1 and "=" not in supplied[0]:
+        if "ormas-shell" in images or len(set(images.values())) != 1:
+            raise SystemExit("pin: repeat --image-digest SERVICE=sha256:… for every service")
+        image_digest(text)  # legacy form must retain the original repository check
+        pins = dict.fromkeys(images, supplied[0])
+    else:
+        pins = {}
+        for value in supplied:
+            name, sep, digest = value.partition("=")
+            if not sep or name in pins:
+                raise SystemExit("pin: expected unique SERVICE=sha256:… pins")
+            pins[name] = digest
+        if pins.keys() != images.keys():
+            raise SystemExit("pin: provide exactly one image digest for every service")
+    if any(not _DIGEST.fullmatch(digest) for digest in pins.values()):
+        raise SystemExit("pin: image digests must be sha256:<64 lowercase hex>")
     mr = json.loads(Path(args.expected_mr).read_text()) if Path(args.expected_mr).is_file() else None
     if mr is None:
         raise SystemExit(f"pin: expected-MR file not found: {args.expected_mr}")
-    text = Path(args.compose).read_text()
-    image_digest(text)
-    text = _IMAGE_LINE.sub(lambda m: f"{m.group(1)}{IMAGE_REPO}@{args.image_digest}", text)
+    names = iter(images)
+    text = _IMAGE_LINE.sub(
+        lambda m: f"{m[1]}{m[2]}@{pins[next(names)]}{m[4]}", text)
     if PLACEHOLDER in text:
         raise SystemExit("pin: compose still carries the placeholder digest")
     Path(args.compose).write_text(text)
@@ -142,7 +218,10 @@ def _pin(args: argparse.Namespace) -> int:
     # The manifest's top-level image_digest is the pushed image's content digest
     # (informational: the measurement is the compose hash below), so the stand-in
     # value is retired here and its note dropped.
-    data["image_digest"] = args.image_digest.split(":", 1)[1]
+    primary = "ormas-shell" if "ormas-shell" in pins else "miner"
+    data["image_digest"] = pins[primary].split(":", 1)[1]
+    if "ormas-shell" in pins:
+        data["image_digests"] = {name: digest.split(":", 1)[1] for name, digest in pins.items()}
     data["_notes"] = [n for n in data.get("_notes", []) if "image_digest is a stand-in" not in n]
     tdx = data.setdefault("tdx", {})
     entry = {"name": mr["name"], "mrtd_hex": mr["mrtd"], "rtmr0_hex": mr["rtmr0"],
@@ -154,8 +233,9 @@ def _pin(args: argparse.Namespace) -> int:
     tdx["require_no_debug"] = True
     tdx.pop("allowed_rtmr3_hex", None)
     manifest_path.write_text(json.dumps(data, indent=2) + "\n")
-    print(json.dumps({"image": f"{IMAGE_REPO}@{args.image_digest}", "compose_hash": digest}))
-    digests = gateway_digests()
+    pinned_images = service_images(text)
+    print(json.dumps({"image": pinned_images[primary], "images": pinned_images, "compose_hash": digest}))
+    digests = gateway_digests(compose_path=Path(args.compose))
     print("\n".join(_digest_lines(digests)))
     if Path(args.compose) == COMPOSE:
         write_readme(digests)
@@ -187,7 +267,8 @@ def main(argv: list[str] | None = None) -> int:
         if name in ("pin", "check"):
             p.add_argument("--manifest", default=str(MANIFEST))
         if name == "pin":
-            p.add_argument("--image-digest", required=True)
+            p.add_argument("--image-digest", required=True, action="append",
+                           help="sha256:… (legacy monolith), or repeat SERVICE=sha256:…")
             p.add_argument("--expected-mr", default=str(EXPECTED_MR))
         if name == "digests":
             p.add_argument("--write-readme", action="store_true")
@@ -199,7 +280,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(app_compose(Path(args.compose), Path(args.wrapper)), indent=2))
         return 0
     if args.cmd == "digests":
-        digests = gateway_digests()
+        try:
+            digests = gateway_digests(compose_path=Path(args.compose))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         print("\n".join(_digest_lines(digests)))
         if args.write_readme:
             write_readme(digests)
