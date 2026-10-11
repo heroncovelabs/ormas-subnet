@@ -71,18 +71,29 @@ or SN76.
 
 ## Connect a miner
 
-Use the user-only installer, then log in and check your host:
+Install, log in, register, then check your host. Replace `your-miner-name` with
+your public miner name and advertise only capabilities your miner supports:
 
 ```bash
 curl -fsSL https://ormas.ai/install.sh | bash
 ormas-miner login --gateway https://api.ormas.ai
+ormas-miner register --miner-id your-miner-name \
+  --cell task:code --cell task:code/small --cell task:lang/python \
+  --cell task:publication/github-artifact-v1 \
+  --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ormas-miner doctor
-ormas-miner register --cell task:code --miner-id <your-miner-name>
-ormas-miner run --runner-id <assigned-id> --miner-id <your-miner-name> \
-  --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'
+ormas-miner run --runner-id <assigned-id> --miner-id your-miner-name \
+  --repo-id <id> --repo-url <url> --solve-command '<cmd>' \
+  --cell task:code --cell task:code/small --cell task:lang/python \
+  --cell task:publication/github-artifact-v1 \
+  --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ```
 
-Login saves the key locally with mode `0600`. Run uses the saved gateway and key.
+Login only saves the key locally with mode `0600`; it does not register a miner.
+Doctor checks for an active registration owned by that key. The small-Python
+capability example above passes its cell checks; profile/environment qualification
+and claim approval remain separate. Keep the same cells on `run`, which registers
+again. Run uses the saved gateway and key.
 Save the assigned id from registration. Keep the same `--miner-id` on every run: it
 is your public identity, and once your miner slot is approved under that name the
 gateway reserves your qualification proof job on registration (the `qualification`
@@ -90,9 +101,8 @@ line on stderr tells you whether it was enqueued or which cells are missing). Re
 `ormas-miner register-hotkey --runner-id <assigned-id> --hotkey-ss58 <ss58>
 --sign-command '<signer>'`.
 
-The equivalent source-checkout command is `python neurons/miner.py --gateway
-https://api.ormas.ai --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id>
---repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`.
+For a source checkout, use `python neurons/miner.py --gateway https://api.ormas.ai
+--token-env ORMAS_MINER_TOKEN` followed by the same run flags above.
 See [Install and connect](docs/INSTALL.md) for credentials and qualification.
 For the Protected service level, use [Run a Protected miner on your own confidential VM](docs/PROTECTED.md).
 
@@ -122,7 +132,13 @@ def solve(draft: TaskDraft, workdir: Path) -> SolveResult:
 client = OrmasMinerClient(base_url="https://api.ormas.ai", token=my_token)
 config = MinerConfig(
     runner_id="", runner_version="0.1.0", platform="linux",
-    capacity=1, cells=("task:code",), workdir_root=Path.home() / ".ormas" / "work",
+    capacity=1,
+    cells=(
+        "task:code", "task:code/small", "task:lang/python",
+        "task:publication/github-artifact-v1", "task:acceptance/operator-run-v3",
+        "task:preflight/deferred-v1",
+    ),
+    workdir_root=Path.home() / ".ormas" / "work",
     repo_id="my-repo", repo_url="https://github.com/acme/target.git",
 )
 skeleton = MinerSkeleton(client, config, solve)

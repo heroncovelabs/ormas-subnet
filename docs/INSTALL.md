@@ -36,7 +36,7 @@ the default is `main`.
 
 If `~/.local/bin` is missing from `PATH`, run the printed shell command and save
 it in your shell's configuration file. The installer prints the installed version
-and Git commit, followed by the login and doctor commands.
+and Git commit, followed by login, register and doctor commands, in that order.
 
 ### Manual install
 
@@ -50,47 +50,73 @@ python -m pip install -e .
 ormas-miner --help
 ```
 
-## Log in and check the host
+## Log in, register, then check the host
 
 ```bash
 ormas-miner login --gateway https://api.ormas.ai
-ormas-miner doctor
 ```
 
 Login prompts for your miner key and saves it with the gateway URL in
-`~/.ormas-miner/credentials.json`, mode `0600`. It prints the URL and the key's
-last four characters. To read an existing environment variable, use
+`~/.ormas-miner/credentials.json`, mode `0600`. It prints the URL and file path,
+never the key. Login only saves credentials locally; it does not register a miner.
+To read an existing environment variable, use
 `ormas-miner login --token-env ORMAS_MINER_TOKEN`.
 
-Doctor checks Python, Git, gateway health, credentials and key acceptance.
-It uses `GET /health`, then the existing read-only
-`GET /api/runner/v1/queue?runner_id=runr_000000000000` with bearer authentication.
-A successful JSON response or a typed `404 not_found_error` establishes that
-key authentication passed. The result reads "key accepted (account enablement
-not confirmed)": a disabled account can return the same typed `404`.
-A `401`, an untyped `404` or another error fails the check. The key probe has a
-10-second timeout and creates no registration or lease. A missing `~/.local/bin`
-on `PATH` is a warning. Account enablement and qualification remain separate checks.
-
-## Register and run
-
-Register without polling:
+Register without polling. Replace `your-miner-name` with your public miner name
+and advertise only capabilities your miner supports:
 
 ```bash
-ormas-miner register --cell task:code --miner-id <your-miner-name>
+ormas-miner register --miner-id your-miner-name \
+  --cell task:code --cell task:code/small --cell task:lang/python \
+  --cell task:publication/github-artifact-v1 \
+  --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ```
+
+This minimal small-Python example passes doctor's cell checks: coding, at least
+one size, Python, GitHub artifact publication, operator-run acceptance and deferred
+preflight. Public-profile jobs also require exact environment qualification;
+passing doctor does not establish qualification, account enablement or claim approval.
 
 Save the assigned `runner_id` from the response. `--miner-id` is your public miner
 identity (lowercase `[a-z0-9-]`, 3–40 characters). Use the same name on every run:
 once the operator approves your miner slot under that name, a registration with the
 required cells reserves your qualification proof job automatically. The response's
 `qualification` key reports `enqueued`, `pending`, or `cells_missing` with the cells to
-add; the CLI prints the same as one `qualification:` line on stderr. Run the reference
-loop with your solve command:
+add; the CLI prints the same as one `qualification:` line on stderr.
+
+Now check the host and registration:
 
 ```bash
-ormas-miner run --runner-id <assigned-id> --miner-id <your-miner-name> \
-  --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'
+ormas-miner doctor
+```
+
+Doctor checks Python, Git, gateway health, credentials, key acceptance and the
+active registration's cells. It uses `GET /health`, then the existing read-only
+`GET /api/runner/v1/queue?runner_id=runr_000000000000` with bearer authentication.
+A successful JSON response or a typed `404 not_found_error` establishes that
+key authentication passed. The result reads "key accepted (account enablement
+not confirmed)": a disabled account can return the same typed `404`.
+A `401` or `403` reports a rejected key; an untyped `404` or another probe error
+fails the check. The key probe has a 10-second timeout and creates no registration
+or lease. Doctor then reads `GET /api/runner/v1/runners/me`. A typed
+`404 not_found_error` reports no active registration and directs you to
+`ormas-miner register` before retrying doctor; it is not a rejected key.
+An untyped `404` on this lookup warns that an older gateway lacks the route.
+Failed checks return exit code 1; warnings alone do not fail doctor. A missing
+`~/.local/bin` on `PATH` and a missing hotkey are warnings. Account enablement
+and qualification remain separate checks.
+
+## Run
+
+Run the reference loop with your solve command. Keep the same cells: `run`
+registers again before polling.
+
+```bash
+ormas-miner run --runner-id <assigned-id> --miner-id your-miner-name \
+  --repo-id <id> --repo-url <url> --solve-command '<cmd>' \
+  --cell task:code --cell task:code/small --cell task:lang/python \
+  --cell task:publication/github-artifact-v1 \
+  --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ```
 
 `run` and `register-hotkey` use the existing reference miner parser and functions.
@@ -105,8 +131,11 @@ The equivalent source-checkout command is:
 
 ```bash
 python neurons/miner.py --gateway https://api.ormas.ai \
-  --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id> --repo-id <id> \
-  --repo-url <url> --cell task:code --solve-command '<cmd>'
+  --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id> --miner-id your-miner-name \
+  --repo-id <id> --repo-url <url> --solve-command '<cmd>' \
+  --cell task:code --cell task:code/small --cell task:lang/python \
+  --cell task:publication/github-artifact-v1 \
+  --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ```
 
 ## Token and URL — never on argv
@@ -202,7 +231,11 @@ config = MinerConfig(
     runner_version="0.1.0",
     platform="linux",
     capacity=1,
-    cells=("task:code",),  # task-type cell — see notes below
+    cells=(  # small-Python capabilities — see notes below
+        "task:code", "task:code/small", "task:lang/python",
+        "task:publication/github-artifact-v1", "task:acceptance/operator-run-v3",
+        "task:preflight/deferred-v1",
+    ),
     workdir_root=Path.home() / ".ormas" / "work",  # private — see notes below
     repo_id="my-repo",
     repo_url=os.environ["ORMAS_REPO_URL"],  # fallback clone source only — see notes below
@@ -263,11 +296,13 @@ receipt on `api.ormas.ai` today reflects one operator-run validator. See
 
 Four fields a newcomer cannot guess:
 
-- **`cells`** — the task types your miner serves, as **task-type cells**. Register `task:code` to
-  serve every bounded coding task, or narrow it: `task:code/small`, `task:code/medium`,
-  `task:code/large` (the packet's turn budget: 12 / 24 / 40 turns), and `task:lang/<language>`
-  (for example `task:lang/python`, `task:lang/typescript`) for the languages in the packet. A
-  legacy job leases when any one of your cells matches a job cell. Public-profile
+- **`cells`** — the capabilities your miner serves, as **task-type cells**. Doctor
+  requires `task:code`, at least one of `task:code/small`, `task:code/medium`,
+  `task:code/large` (the packet's turn budget: 12 / 24 / 40 turns), `task:lang/python`,
+  `task:publication/github-artifact-v1`, `task:acceptance/operator-run-v3` and
+  `task:preflight/deferred-v1`. Add `task:lang/<language>` for other supported languages
+  (for example `task:lang/typescript`). `task:code` alone is insufficient for these
+  checks. A legacy job leases when any one of your cells matches a job cell. Public-profile
   jobs require every required cell and exact environment qualification. The gateway
   derives cells from the work packet. The older
   `outcomes-…` strings are the operator's own model-bound cells; they are not yours to
@@ -279,7 +314,7 @@ Four fields a newcomer cannot guess:
 
 The reference solver runs `true` — a no-op that commits an empty result. It exists so the loop runs end to end with no model call, and against a task whose verify expects a change it completes with `failed`, which is the honest outcome of doing nothing.
 
-The same loop is available as `ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url> --cell task:code --solve-command '<cmd>'`. It uses your saved credentials or an explicit `--token-env` / `--token-file`, and prints the assigned `runner_id=…` on stderr after registration. The equivalent source-checkout form is `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN` followed by the same run flags.
+The same loop is available as `ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url>` with the `--miner-id`, repeated `--cell` and `--solve-command` flags from [Run](#run). It uses your saved credentials or an explicit `--token-env` / `--token-file`, and prints the assigned `runner_id=…` on stderr after registration. The equivalent source-checkout form is `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN` followed by the same run flags.
 
 ## Fallback: bind a repository you already hold locally
 
