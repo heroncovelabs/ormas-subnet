@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import platform
+from datetime import datetime
 import shutil
 import stat
 import sys
@@ -18,6 +19,10 @@ import httpx
 
 from . import __version__
 from .client import OrmasGatewayError, OrmasMinerClient, load_token
+from .protected_env import (
+    MINER_ID, SPLIT_ALLOWED_ENVS, WORKER_DIGEST, json_object, parse_worker_env, provider_host,
+    read_input, sealed_json, sealed_text, write_private,
+)
 
 DEFAULT_GATEWAY = "https://api.ormas.ai"
 _AUTH_PROBE_ID = "runr_000000000000"
@@ -243,6 +248,201 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if passed else 1
 
 
+class _PrivateArgumentParser(argparse.ArgumentParser):
+    """Argparse's normal help/exit style, without echoing rejected env values."""
+
+    def error(self, message):
+        super().error("invalid or missing arguments; see --help")
+
+
+def _protected_env(args: argparse.Namespace) -> int:
+    # This command deliberately uses only a file or saved credentials, never argv keys.
+    saved = _read_credentials() if not args.token_file else {}
+    api_url = args.api_url or saved.get("gateway") or DEFAULT_GATEWAY
+    sealed_text("ORMAS_API_URL", api_url)
+    if args.runtime == "production" and api_url != DEFAULT_GATEWAY:
+        raise ValueError("ORMAS_API_URL: production requires the exact production gateway origin")
+    if args.runtime == "development" and urlsplit(api_url).scheme != "https":
+        raise ValueError("ORMAS_API_URL: development requires HTTPS")
+    api_url = _gateway(api_url)
+    if saved and api_url != _gateway(saved["gateway"]):
+        raise ValueError("ORMAS_RUNNER_TOKEN: saved key is bound to its gateway; use --token-file")
+    token = (read_input(args.token_file, "ORMAS_RUNNER_TOKEN").removesuffix("\n")
+             if args.token_file else saved.get("token", ""))
+    sealed_text("ORMAS_RUNNER_TOKEN", token)
+    try:
+        _validate_token(token)
+    except ValueError:
+        raise ValueError("ORMAS_RUNNER_TOKEN: missing or invalid miner key") from None
+    values = dict.fromkeys(SPLIT_ALLOWED_ENVS, "")
+    values.update({
+        "ORMAS_API_URL": api_url, "ORMAS_RUNNER_TOKEN": token,
+        "ORMAS_MINER_ID": args.miner_id, "ORMAS_RUNTIME": args.runtime,
+        "ORMAS_CELL_BOUNDS": args.cell_bounds or "", "ORMAS_APPROVED_BY": args.approved_by or "",
+        "ORMAS_TASK_CELLS": " ".join(args.task_cells), "ORMAS_BIND_PROJECT_ID": args.bind_project_id,
+        "MINER_WORKER_IMAGE": args.worker_image,
+    })
+    for key, value in values.items():
+        sealed_text(key, value)
+    if MINER_ID.fullmatch(args.miner_id) is None:
+        raise ValueError("ORMAS_MINER_ID: invalid registration name")
+    if (not args.worker_image.rsplit("@", 1)[0] or "@" not in args.worker_image
+            or any(char.isspace() for char in args.worker_image)
+            or args.worker_image.count("@") != 1
+            or WORKER_DIGEST.fullmatch(args.worker_image.rsplit("@", 1)[-1]) is None):
+        raise ValueError("MINER_WORKER_IMAGE: must be name@sha256 digest-pinned")
+    if not all(cell.startswith("task:") and len(cell) > len("task:")
+               and not any(char.isspace() for char in cell) for cell in args.task_cells):
+        raise ValueError("ORMAS_TASK_CELLS: expected task qualifications")
+    if args.authorization_file:
+        if args.cell_bounds or args.approved_by:
+            raise ValueError("ORMAS_AUTHORIZATION_JSON: use authorization file OR bounds and approver")
+        try:
+            record = json_object(read_input(args.authorization_file, "ORMAS_AUTHORIZATION_JSON"))
+        except ValueError:
+            raise ValueError("ORMAS_AUTHORIZATION_JSON: invalid JSON object") from None
+        values["ORMAS_AUTHORIZATION_JSON"] = sealed_json("ORMAS_AUTHORIZATION_JSON", record)
+    elif not args.cell_bounds or not args.approved_by:
+        raise ValueError("ORMAS_CELL_BOUNDS: supply bounds and --approved-by or --authorization-file")
+    try:
+        worker = parse_worker_env(read_input(args.worker_env_file, "MINER_WORKER_ENV_JSON"))
+    except ValueError:
+        raise ValueError("MINER_WORKER_ENV_JSON: invalid worker environment object") from None
+    values["MINER_WORKER_ENV_JSON"] = sealed_json("MINER_WORKER_ENV_JSON", worker)
+    if args.registry_auth_file:
+        values["MINER_WORKER_REGISTRY_AUTH"] = sealed_text(
+            "MINER_WORKER_REGISTRY_AUTH", read_input(args.registry_auth_file, "MINER_WORKER_REGISTRY_AUTH").removesuffix("\n"))
+    hosts = sorted({provider_host(host) for host in args.provider})
+    out = Path(args.out).expanduser()
+    files = {out: "".join(f"{key}={values[key]}\n" for key in SPLIT_ALLOWED_ENVS)}
+    providers = out.parent / "declared-providers.list"
+    pricing = out.parent / "pricing.json"
+    if out in (providers, pricing):
+        raise ValueError("env output must differ from companion file names")
+    files[providers] = "".join(host + "\n" for host in hosts)
+    if args.pricing_template:
+        files[pricing] = json.dumps({"estimate_usd": "<estimate>", "limit_usd": "<limit>"}, indent=2) + "\n"
+    if not args.force and any(path.exists() or path.is_symlink() for path in files):
+        raise ValueError("output exists; use --force to overwrite")
+    try:
+        out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        raise ValueError("cannot create output directory") from None
+    for path, text in files.items():
+        write_private(path, text, force=args.force)
+    print(out)
+    print(f"{len(SPLIT_ALLOWED_ENVS)} keys")
+    return 0
+
+
+# Public counterpart of protected_health's fixed refusal vocabulary; never echo error text.
+_RELEASE_REFUSALS = frozenset({
+    "challenge_unknown", "release_consumed", "challenge_expired", "verifier_error",
+    "collateral_unavailable", "attestation_refused", "mint_error", "seal_error",
+    "release_error", "audit_write_failed", "worker_digest_mismatch", "worker_policy_required", "other",
+})
+_JOB_STATUSES = frozenset({"queued", "offering", "running", "done", "failed", "cancelled", "outcome_unknown", "pending"})
+
+
+def _diagnostic_time(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.isoformat() if parsed.tzinfo is not None else None
+    except ValueError:
+        return None
+
+
+def _doctor_protected(args: argparse.Namespace) -> int:
+    passed = True
+
+    def line(level: str, topic: str, text: str):
+        nonlocal passed
+        if level == "fail":
+            passed = False
+        print(f"{level} {topic}: {text}")
+
+    try:
+        gateway, token = _settings(args)
+    except (OSError, ValueError):
+        line("fail", "credentials", "miner key unavailable or invalid")
+        return 1
+    try:
+        with httpx.Client(base_url=gateway, headers={"Authorization": f"Bearer {token}"},
+                          timeout=10.0) as transport:
+            with OrmasMinerClient(gateway, token, http_client=transport,
+                                  device_nonce=args.device_nonce) as client:
+                registration = client.get_registration(args.runner_id)
+    except OrmasGatewayError as exc:
+        detail = "not registered" if exc.status_code == 404 else f"gateway rejected lookup (HTTP {exc.status_code})"
+        line("fail", "registration", detail)
+        return 1
+    except (httpx.HTTPError, OSError, ValueError):
+        line("fail", "registration", "lookup failed or invalid response")
+        return 1
+    if not isinstance(registration.get("runner_id"), str) or not registration["runner_id"]:
+        line("fail", "registration", "invalid response")
+        return 1
+    line("ok", "registration", "yes")
+    protected = registration.get("protected")
+    if not isinstance(protected, dict):
+        line("fail", "protected", "gateway diagnostics unavailable")
+        return 1
+    approved = protected.get("slot_approved") is True
+    if approved and protected.get("slot_bound") is not True:
+        line("warn", "slot", "approved, not yet bound")
+    else:
+        line("ok" if approved else "fail", "slot", "approved" if approved else "not approved")
+    declared = protected.get("declared_worker_digests")
+    if not isinstance(declared, list) or any(
+            not isinstance(digest, str) or WORKER_DIGEST.fullmatch(digest) is None for digest in declared):
+        line("fail", "declared-workers", "invalid gateway response")
+        declared = []
+    else:
+        line("ok" if declared else "warn", "declared-workers", ", ".join(declared) if declared else "none declared")
+    policy = protected.get("approved_worker_policy") is True
+    line("ok" if policy else "warn", "worker-policy", "yes" if policy else "no policy approved yet")
+    status = protected.get("qualification_job_status")
+    if status is None:
+        line("warn", "qualification", "none")
+    elif isinstance(status, str) and status in _JOB_STATUSES:
+        level = "ok" if status == "done" else "warn" if status in {"queued", "offering", "running", "pending"} else "fail"
+        line(level, "qualification", status)
+    else:
+        line("fail", "qualification", "unknown")
+    release = protected.get("last_release")
+    release_at = _diagnostic_time(release.get("at")) if isinstance(release, dict) else None
+    refusal = protected.get("last_refusal")
+    if protected.get("audit_status") != "ok":
+        line("fail", "key-release", "audit unavailable")
+    elif refusal is None:
+        line("ok", "key-release", "no refusal recorded")
+    elif (isinstance(refusal, dict) and isinstance(refusal.get("reason"), str)
+          and refusal["reason"] in _RELEASE_REFUSALS and _diagnostic_time(refusal.get("at"))):
+        at = _diagnostic_time(refusal["at"])
+        resolved = release_at and datetime.fromisoformat(release_at) > datetime.fromisoformat(at)
+        line("warn" if resolved else "fail", "key-release", f"{refusal['reason']} {at}")
+    else:
+        line("fail", "key-release", "invalid gateway response")
+    if not declared:
+        line("warn", "worker-digest", "none declared")
+    elif release is None:
+        line("warn", "worker-digest", "no release recorded")
+    elif not isinstance(release, dict) or not release_at:
+        line("fail", "worker-digest", "invalid gateway response")
+    else:
+        digest = release.get("worker_image_digest")
+        if digest is None:
+            line("fail", "worker-digest", "mismatch (release has no worker digest)")
+        elif not isinstance(digest, str) or WORKER_DIGEST.fullmatch(digest) is None:
+            line("fail", "worker-digest", "invalid gateway response")
+        else:
+            match = digest in declared
+            line("ok" if match else "fail", "worker-digest", f"{'match' if match else 'mismatch'} {digest}")
+    return 0 if passed else 1
+
+
 def _reference_args(argv: list[str], *, hotkey: bool = False) -> tuple[list[str], str]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--gateway")
@@ -297,25 +497,48 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="ormas-miner", description="Set up and run a miner")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("command", choices=("login", "doctor", "register", "register-hotkey", "run"))
+    parser.add_argument("command", choices=("login", "doctor", "protected-env", "register", "register-hotkey", "run"))
     if not argv or argv[0].startswith("-"):
         parser.parse_args(argv)
     command = parser.parse_args(argv[:1]).command
     try:
+        if command == "protected-env":
+            sub = _PrivateArgumentParser(prog="ormas-miner protected-env")
+            sub.add_argument("--api-url", help="Gateway URL; defaults to saved credentials")
+            sub.add_argument("--token-file", help="Private file holding the miner key")
+            sub.add_argument("--miner-id", required=True)
+            sub.add_argument("--runtime", choices=("development", "production"), required=True)
+            sub.add_argument("--authorization-file", help="Expense authorization JSON object")
+            sub.add_argument("--cell-bounds", help="Approved cell expense bounds")
+            sub.add_argument("--approved-by", help="Authorization approver")
+            sub.add_argument("--task-cells", action="append", required=True, help="Repeat for each task cell")
+            sub.add_argument("--bind-project-id", required=True)
+            sub.add_argument("--worker-image", required=True, help="Worker OCI image pinned by SHA-256")
+            sub.add_argument("--worker-env-file", required=True, help="Private worker environment JSON object")
+            sub.add_argument("--registry-auth-file", help="Optional private registry authentication file")
+            sub.add_argument("--provider", action="append", default=[], help="Declared provider DNS host; repeatable")
+            sub.add_argument("--pricing-template", action="store_true", help="Write pricing.json placeholders beside env")
+            sub.add_argument("--out", required=True, help="Sealed env output path (mode 0600)")
+            sub.add_argument("--force", action="store_true", help="Replace env and companion output files")
+            return _protected_env(sub.parse_args(argv[1:]))
         if command in ("login", "doctor"):
-            sub = argparse.ArgumentParser(prog=f"ormas-miner {command}")
+            parser_class = _PrivateArgumentParser if command == "doctor" and "--protected" in argv else argparse.ArgumentParser
+            sub = parser_class(prog=f"ormas-miner {command}")
             sub.add_argument("--gateway", help=f"Gateway URL (default: {DEFAULT_GATEWAY})")
             if command == "doctor":
+                sub.add_argument("--protected", action="store_true", help="Read only this miner's gateway Protected status")
                 sub.add_argument("--runner-id", help=(
-                    "Registered miner ID for queue diagnostics; this queue read refreshes last_seen "
-                    "and marks a stopped miner live for the liveness window."
+                    "Registered miner ID; without --protected, queue diagnostics refresh last_seen "
+                    "and mark a stopped miner live for the liveness window."
                 ))
                 sub.add_argument("--device-nonce", help="Registered device nonce, when bound")
             group = sub.add_mutually_exclusive_group()
             group.add_argument("--token-env", help="Environment variable holding the miner key")
             group.add_argument("--token-file", help="File holding the miner key")
             args = sub.parse_args(argv[1:])
-            return _login(args) if command == "login" else _doctor(args)
+            if command == "login":
+                return _login(args)
+            return _doctor_protected(args) if args.protected else _doctor(args)
         return _reference_command(command, argv[1:])
     except KeyboardInterrupt:
         print(f"{command}: interrupted", file=sys.stderr)
