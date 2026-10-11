@@ -18,6 +18,10 @@ Subcommands:
   pin           write each service's image digest, fill the manifest's tdx tuple;
                 repeat --image-digest SERVICE=sha256:… for split images. A single
                 --image-digest sha256:… retains the legacy same-image monolith form.
+                A monolith pin replaces the admitted hash only when the manifest
+                admits no other compose hash carrying a Transition note; otherwise
+                it refuses (--retire-others replaces, dropping those notes). A split
+                pin replaces the previous split hash and keeps the monolith's.
   check         exit 1 unless the manifest admits the recomputed hash
   digests       print the gateway's plugin, egress-list and worker-policy digests;
                 monolith plugin = grok sha256 from pins.env. Split shell plugin =
@@ -106,19 +110,25 @@ def service_images(compose_text: str) -> dict[str, str]:
     return images
 
 
-def app_compose(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> dict:
+def _app_compose_from_text(text: str, wrapper_path: Path) -> dict:
     wrapper = json.loads(Path(wrapper_path).read_text())
-    text = Path(compose_path).read_text()
     envs = SPLIT_ALLOWED_ENVS if "ormas-shell" in service_images(text) else ALLOWED_ENVS
     return dict(wrapper, **OVERRIDES, allowed_envs=envs, docker_compose_file=text)
 
 
-def compose_hash(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> str:
+def app_compose(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> dict:
+    return _app_compose_from_text(Path(compose_path).read_text(), wrapper_path)
+
+
+def _app_compose_hash(doc: dict) -> str:
     # Serialization copied verbatim from scripts/phala_proof/fill_manifest.py:app_compose_hash
     # (the proof matched both live CVMs with it); tests assert the two stay equal.
-    doc = app_compose(compose_path, wrapper_path)
     blob = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def compose_hash(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> str:
+    return _app_compose_hash(app_compose(compose_path, wrapper_path))
 
 
 def image_digests(compose_text: str) -> dict[str, str]:
@@ -182,6 +192,49 @@ def write_readme(digests: dict[str, str | None], readme: Path = README) -> None:
     readme.write_text(text[:start] + block + text[end:])
 
 
+def _names(note: str, digest: str) -> bool:
+    """A Transition note names an admitted hash by its 8-char prefix (no atomicity here)."""
+    return digest[:8] in note
+
+
+def _transition_note(notes: list[str], digest: str) -> bool:
+    return any(note.startswith("Transition") and _names(note, digest) for note in notes)
+
+
+def _replace_split_pins(data: dict, digest: str, keep: str) -> tuple[list[str], list[str]]:
+    """Plan first admission, unchanged pin or replacement from the ORIGINAL manifest."""
+    admitted = list(data.get("tdx", {}).get("allowed_compose_hashes_hex", []))
+    notes = list(data.get("_notes", []))
+    if keep not in admitted:
+        raise SystemExit(
+            f"pin: monolith compose hash {keep[:8]} is not admitted; "
+            "compose/manifest drift: reconcile before pinning the split recipe")
+    if "image_digests" in data:
+        old = [h for h in admitted if h != keep]
+        if len(old) != 1:
+            raise SystemExit(
+                "pin: split re-pin needs exactly one previous admitted split hash; "
+                f"found {len(old)} other admitted hashes in {admitted}. "
+                "Re-pin is ambiguous: reconcile the manifest (or the stale image_digests) by hand")
+        retired = old[0]
+        if not _transition_note(notes, retired):
+            raise SystemExit(
+                f"pin: previous split hash {retired[:8]} has no Transition note naming it; "
+                "fix the manifest notes before re-pinning the split recipe")
+        if retired == digest:
+            return admitted, notes  # No-op: do not filter the unchanged hash out first.
+        admitted = [digest if h == retired else h for h in admitted]
+        notes = [n for n in notes if not (n.startswith("Transition") and _names(n, retired))]
+    elif digest not in admitted:
+        admitted.append(digest)
+    if not _transition_note(notes, digest):
+        notes.append(
+            f"Transition: {digest} is the split pluggable-worker recipe, admitted BESIDE "
+            f"the monolith {keep}, which stays the rollback recipe. "
+            "Retire one when the other is withdrawn.")
+    return admitted, notes
+
+
 def _pin(args: argparse.Namespace) -> int:
     text = Path(args.compose).read_text()
     images = service_images(text)
@@ -210,37 +263,53 @@ def _pin(args: argparse.Namespace) -> int:
         lambda m: f"{m[1]}{m[2]}@{pins[next(names)]}{m[4]}", text)
     if PLACEHOLDER in text:
         raise SystemExit("pin: compose still carries the placeholder digest")
-    Path(args.compose).write_text(text)
-    digest = compose_hash(Path(args.compose), Path(args.wrapper))
-
+    # Compute and validate the proposed state without changing either input file.
+    digest = _app_compose_hash(_app_compose_from_text(text, Path(args.wrapper)))
     manifest_path = Path(args.manifest)
     data = json.loads(manifest_path.read_text())
-    # The manifest's top-level image_digest is the pushed image's content digest
-    # (informational: the measurement is the compose hash below), so the stand-in
-    # value is retired here and its note dropped.
     primary = "ormas-shell" if "ormas-shell" in pins else "miner"
     split = "ormas-shell" in pins
+    current = compose_hash() if split else digest
     if split:
-        # The split recipe is admitted BESIDE the monolith: the gateway loads one miner
-        # manifest for every release, so the monolith's image_digest and compose hash stay.
-        data["image_digests"] = {name: digest.split(":", 1)[1] for name, digest in pins.items()}
+        admitted, notes = _replace_split_pins(data, digest, current)
+        # Inspect the original image_digests BEFORE recording the new split pins.
+        data["image_digests"] = {name: pin.split(":", 1)[1] for name, pin in pins.items()}
     else:
+        admitted = data.get("tdx", {}).get("allowed_compose_hashes_hex", [])
+        notes = list(data.get("_notes", []))
+        retired = [h for h in admitted if h != digest and _transition_note(notes, h)]
+        if retired and not args.retire_others:
+            raise SystemExit(
+                "pin: manifest admits other compose hashes named in a Transition note "
+                f"({', '.join(h[:8] for h in retired)}); a monolith pin replaces them. "
+                "Pass --retire-others to retire them deliberately, then update any part-2 "
+                "manifest that shares this file")
+        # Legacy monolith pins always replace the list, never append the old hash.
+        admitted = [digest]
+        notes = [n for n in notes if not n.startswith("Transition")]
         data["image_digest"] = pins[primary].split(":", 1)[1]
-    data["_notes"] = [n for n in data.get("_notes", []) if "image_digest is a stand-in" not in n]
+        data.pop("image_digests", None)  # No split recipe remains admitted.
+    previous = [h for h in admitted if h != current]
+    if any(not _transition_note(notes, h) for h in previous) or any(
+            n.startswith("Transition") and not any(_names(n, h) for h in previous)
+            for n in notes):
+        raise SystemExit("pin: compose/manifest Transition notes drift; reconcile before pinning")
+    data["_notes"] = [n for n in notes if "image_digest is a stand-in" not in n]
     tdx = data.setdefault("tdx", {})
     entry = {"name": mr["name"], "mrtd_hex": mr["mrtd"], "rtmr0_hex": mr["rtmr0"],
              "rtmr1_hex": mr["rtmr1"], "rtmr2_hex": mr["rtmr2"]}
     images = [i for i in tdx.get("allowed_os_images", []) if i.get("name") != entry["name"]]
     tdx["allowed_os_images"] = images + [entry]
-    admitted = [h for h in tdx.get("allowed_compose_hashes_hex", []) if h != digest]
-    tdx["allowed_compose_hashes_hex"] = (admitted + [digest]) if split else [digest]
+    tdx["allowed_compose_hashes_hex"] = admitted
     tdx.setdefault("allowed_tcb_statuses", ["UpToDate"])
     tdx["require_no_debug"] = True
     tdx.pop("allowed_rtmr3_hex", None)
-    manifest_path.write_text(json.dumps(data, indent=2) + "\n")
     pinned_images = service_images(text)
-    print(json.dumps({"image": pinned_images[primary], "images": pinned_images, "compose_hash": digest}))
     digests = gateway_digests(compose_path=Path(args.compose))
+    manifest_text = json.dumps(data, indent=2) + "\n"
+    Path(args.compose).write_text(text)
+    manifest_path.write_text(manifest_text)
+    print(json.dumps({"image": pinned_images[primary], "images": pinned_images, "compose_hash": digest}))
     print("\n".join(_digest_lines(digests)))
     if Path(args.compose) == COMPOSE:
         write_readme(digests)
@@ -275,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--image-digest", required=True, action="append",
                            help="sha256:… (legacy monolith), or repeat SERVICE=sha256:…")
             p.add_argument("--expected-mr", default=str(EXPECTED_MR))
+            p.add_argument("--retire-others", action="store_true",
+                           help="monolith pin may replace hashes named in Transition notes")
         if name == "digests":
             p.add_argument("--write-readme", action="store_true")
     args = ap.parse_args(argv)
