@@ -91,7 +91,9 @@ def run_image(work, image, mode, wall_time_s, negative=None):
         (work / "negative_worker.py").chmod(0o644)
         argv += ["--entrypoint", "python3", image, "-I", "/work/negative_worker.py", negative]
     else:
-        argv.append(image)
+        # Reference-only pricing comes from the operator env, by NAME, never a
+        # value on argv. Arbitrary workers may bake their own pricing strategy.
+        argv += ["-e", "REFERENCE_WORKER_PRICE_USD", image]
     try:
         return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=wall_time_s, check=False).returncode
@@ -156,6 +158,11 @@ def check_result(work, mode, exit_code, max_bytes, packet):
         if mode == "solve":
             intake_check.validate_patch_scope(text, allowed_paths=packet["allowed_paths"],
                                               immutable_paths=packet["immutable_paths"])
+            try:
+                metering = intake_check.read_patch(fd, "metering.json", max_bytes=max_bytes)
+                intake_check.parse_metering(metering.decode("utf-8"))
+            except (intake_check.PatchIntakeError, intake_check.MeteringError, UnicodeError):
+                raise CheckError("metering_unavailable") from None
         else:
             try:
                 intake_check.parse_offer(text)
@@ -187,7 +194,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Local worker conformance; no gateway/provider access")
     parser.add_argument("image", help="candidate Docker image")
     parser.add_argument("--max-patch-bytes", type=positive_integer, required=True,
-                        help="operator-supplied artifact byte cap (also applies to offers)")
+                        help="operator-supplied artifact byte cap (patch, metering and offer)")
     parser.add_argument("--wall-time-seconds", type=positive_integer,
                         help="optional operator-supplied per-invocation wall-time; no default")
     args = parser.parse_args(argv)
