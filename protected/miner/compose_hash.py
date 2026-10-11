@@ -219,16 +219,21 @@ def _pin(args: argparse.Namespace) -> int:
     # (informational: the measurement is the compose hash below), so the stand-in
     # value is retired here and its note dropped.
     primary = "ormas-shell" if "ormas-shell" in pins else "miner"
-    data["image_digest"] = pins[primary].split(":", 1)[1]
-    if "ormas-shell" in pins:
+    split = "ormas-shell" in pins
+    if split:
+        # The split recipe is admitted BESIDE the monolith: the gateway loads one miner
+        # manifest for every release, so the monolith's image_digest and compose hash stay.
         data["image_digests"] = {name: digest.split(":", 1)[1] for name, digest in pins.items()}
+    else:
+        data["image_digest"] = pins[primary].split(":", 1)[1]
     data["_notes"] = [n for n in data.get("_notes", []) if "image_digest is a stand-in" not in n]
     tdx = data.setdefault("tdx", {})
     entry = {"name": mr["name"], "mrtd_hex": mr["mrtd"], "rtmr0_hex": mr["rtmr0"],
              "rtmr1_hex": mr["rtmr1"], "rtmr2_hex": mr["rtmr2"]}
     images = [i for i in tdx.get("allowed_os_images", []) if i.get("name") != entry["name"]]
     tdx["allowed_os_images"] = images + [entry]
-    tdx["allowed_compose_hashes_hex"] = [digest]
+    admitted = [h for h in tdx.get("allowed_compose_hashes_hex", []) if h != digest]
+    tdx["allowed_compose_hashes_hex"] = (admitted + [digest]) if split else [digest]
     tdx.setdefault("allowed_tcb_statuses", ["UpToDate"])
     tdx["require_no_debug"] = True
     tdx.pop("allowed_rtmr3_hex", None)
