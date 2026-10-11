@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shlex
 import stat
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -208,15 +209,64 @@ def test_doctor_malformed_optional_registration_fields(cli, gateway, capsys):
     assert "qualification: cap unknown" in output
 
 
-@pytest.mark.parametrize("status", [401, 404, 500])
-def test_doctor_registration_refusal_redacted(cli, gateway, capsys, status):
+@pytest.mark.parametrize("queue_status", [200, 404])
+def test_doctor_unregistered_key_gets_registration_guidance(cli, gateway, capsys, queue_status):
+    credentials()
+    if queue_status == 404:
+        gateway[1]["/api/runner/v1/queue"] = 404, {
+            "error": {"type": "not_found_error", "message": TOKEN},
+        }
+    gateway[1]["/api/runner/v1/runners/me"] = 404, {
+        "error": {"type": "not_found_error", "message": TOKEN},
+    }
+    assert cli.main(["doctor"]) == 1
+    output = capsys.readouterr()
+    assert "ok token: key accepted (account enablement not confirmed)" in output.out
+    assert "FAIL registration: no active registration found for this key" in output.out
+    assert "ormas-miner register" in output.out
+    assert "--miner-id" in output.out and "--cell" in output.out
+    assert "gateway rejected lookup" not in output.out
+    assert "gateway rejected key" not in output.out
+    assert TOKEN not in output.out + output.err
+    assert [request.url.path for request in gateway[0]] == [
+        "/health", "/api/runner/v1/queue", "/api/runner/v1/runners/me",
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("route,label", [
+    ("/api/runner/v1/queue", "token"),
+    ("/api/runner/v1/runners/me", "registration"),
+])
+def test_doctor_rejected_key_is_not_registration_guidance(cli, gateway, capsys, status,
+                                                         route, label):
+    credentials()
+    gateway[1][route] = status, {
+        "error": {"type": "authentication_error" if status == 401 else "permission_error",
+                  "message": TOKEN},
+    }
+    assert cli.main(["doctor"]) == 1
+    output = capsys.readouterr()
+    assert f"FAIL {label}: gateway rejected key (HTTP {status})" in output.out
+    assert "no active registration" not in output.out
+    assert "ormas-miner register" not in output.out
+    assert TOKEN not in output.out + output.err
+    if label == "token":
+        assert "ok token:" not in output.out
+        assert len(gateway[0]) == 2
+
+
+@pytest.mark.parametrize("status,error_type", [(404, "other_error"), (500, "internal_error")])
+def test_doctor_registration_refusal_redacted(cli, gateway, capsys, status, error_type):
     credentials()
     gateway[1]["/api/runner/v1/runners/me"] = status, {
-        "error": {"type": "not_found_error", "message": TOKEN},
+        "error": {"type": error_type, "message": TOKEN},
     }
     assert cli.main(["doctor"]) == 1
     output = capsys.readouterr().out
     assert f"FAIL registration: gateway rejected lookup (HTTP {status})" in output
+    assert "no active registration" not in output
+    assert "ormas-miner register" not in output
     assert TOKEN not in output
 
 
@@ -645,6 +695,30 @@ def test_standalone_reference_credentials_stay_required(capsys):
                       "--hotkey-ss58", "address", "--sign-command", "signer"])
     assert result.value.code == 2
     assert "--gateway" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("document", ["README.md", "docs/INSTALL.md"])
+def test_onboarding_docs_register_before_doctor(document):
+    text = (ROOT / document).read_text()
+    assert text.index("ormas-miner login --gateway") < text.index("ormas-miner register --")
+    assert text.index("ormas-miner register --") < text.index("ormas-miner doctor")
+
+
+@pytest.mark.parametrize("document", ["README.md", "docs/INSTALL.md"])
+def test_documented_registration_passes_doctor(cli, gateway, capsys, document):
+    credentials()
+    text = (ROOT / document).read_text().replace("\\\n", "")
+    command = next(line for line in text.splitlines() if line.startswith("ormas-miner register "))
+    argv = shlex.split(command.replace("<your-miner-name>", "your-miner-name"))
+    assert cli.main(argv[1:]) == 0
+    payload = json.loads(gateway[0][0].content)
+    assert payload["miner_id"] == "your-miner-name"
+    gateway[1]["/api/runner/v1/runners/me"][1]["cells"] = payload["health"]["cells"]
+    capsys.readouterr()
+    assert cli.main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert "cells: ok (sizes: small)" in output
+    assert "FAIL" not in output
 
 
 def test_install_run_example_uses_assigned_id():

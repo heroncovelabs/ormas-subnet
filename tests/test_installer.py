@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -123,7 +124,8 @@ def test_python_fallback_upgrade_and_shell_path(setup, shell, export):
     assert first.returncode == 0, first.stderr
     assert export in first.stdout
     assert f"Installed commit: {COMMIT}" in first.stdout
-    assert first.stdout.endswith("Next: ormas-miner login && ormas-miner doctor\n")
+    assert "Next: ormas-miner login && ormas-miner register " in first.stdout
+    assert first.stdout.endswith(" && ormas-miner doctor\n")
     link = home / ".local/bin/ormas-miner"
     assert link.is_symlink()
     assert link.resolve() == home / ".ormas-miner/venv/bin/ormas-miner"
@@ -138,6 +140,26 @@ def test_python_fallback_upgrade_and_shell_path(setup, shell, export):
     assert second.returncode == 0, second.stderr
     assert log.read_text().count(forced) == 2
     assert log.read_text().count(dependencies) == 2
+
+
+def test_installer_hint_registers_before_doctor(setup, capsys):
+    from neurons import miner
+    from ormas_subnet.miner_cli import _doctor_registration
+
+    _, commands, _, env = setup
+    python_command(commands, "python3.12")
+    result = install(env)
+    assert result.returncode == 0, result.stderr
+    hint = next(line.removeprefix("Next: ") for line in result.stdout.splitlines()
+                if line.startswith("Next: "))
+    steps = [shlex.split(step) for step in hint.split(" && ")]
+    assert [step[:2] for step in steps] == [
+        ["ormas-miner", "login"], ["ormas-miner", "register"], ["ormas-miner", "doctor"],
+    ]
+    registration = miner.build_parser(credential_defaults=True).parse_args(steps[1][2:])
+    assert registration.miner_id == "your-miner-name"
+    assert _doctor_registration({"cells": registration.cell})
+    assert "cells: ok (sizes: small)" in capsys.readouterr().out
 
 
 def test_uv_is_first_choice(setup):

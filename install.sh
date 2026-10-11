@@ -91,7 +91,8 @@ from importlib.metadata import distribution
 metadata = json.loads(distribution("ormas-subnet").read_text("direct_url.json"))
 print("Installed commit:", metadata["vcs_info"]["commit_id"])
 PYTHON
-    printf 'Next: ormas-miner login && ormas-miner doctor\n'
+    printf 'Replace your-miner-name with your public miner name; advertise only capabilities you support (see docs/INSTALL.md).\n'
+    printf '%s\n' 'Next: ormas-miner login && ormas-miner register --miner-id your-miner-name --cell task:code --cell task:code/small --cell task:lang/python --cell task:publication/github-artifact-v1 --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1 && ormas-miner doctor'
 }
 
 main "$@"

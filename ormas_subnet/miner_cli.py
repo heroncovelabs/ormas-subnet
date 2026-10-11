@@ -226,17 +226,26 @@ def _doctor(args: argparse.Namespace) -> int:
                         coverage_ok = _doctor_registration(registration)
                         passed = passed and coverage_ok
                     except OrmasGatewayError as exc:
+                        if exc.status_code == 404 and exc.error_type == "not_found_error":
+                            check("registration", False,
+                                  "no active registration found for this key; run ormas-miner "
+                                  "register with --miner-id and --cell (see docs/INSTALL.md), "
+                                  "then rerun doctor")
                         # A gateway older than the /runners/me route answers a plain 404
                         # with no typed error; that is a missing feature, not a refusal.
-                        if exc.status_code == 404 and not exc.error_type:
+                        elif exc.status_code == 404 and not exc.error_type:
                             print("WARN registration: gateway does not expose /runners/me")
+                        elif exc.status_code in (401, 403):
+                            check("registration", False,
+                                  f"gateway rejected key (HTTP {exc.status_code})")
                         else:
                             check("registration", False,
                                   f"gateway rejected lookup (HTTP {exc.status_code})")
                     except (httpx.HTTPError, OSError, ValueError):
                         check("registration", False, "lookup failed or invalid registration response")
         except OrmasGatewayError as exc:
-            check("token", False, f"gateway rejected probe (HTTP {exc.status_code})")
+            rejected = "key" if exc.status_code in (401, 403) else "probe"
+            check("token", False, f"gateway rejected {rejected} (HTTP {exc.status_code})")
         except (httpx.HTTPError, OSError, ValueError):
             check("token", False, "authentication probe failed")
     else:
