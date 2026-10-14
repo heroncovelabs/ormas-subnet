@@ -646,15 +646,46 @@ def repository_git(args, *, cwd, repo_url, credential):
 
 
 
-def build_public_artifact(packet, workdir, result_commit, target):
-    """Serialize committed regular files as bounded raw bytes, never a Git pack."""
+def _publication_path_covered(path, policy_paths):
+    """Apply the frozen file/directory policy without path reinterpretation."""
+    return any(
+        path.startswith(entry) if entry.endswith('/') else path == entry
+        for entry in policy_paths if entry
+    )
+
+
+def public_result_scope(packet, workdir, result_commit):
+    """Return the authoritative public result scope decision and changed paths."""
     validate_public_execution_packet(packet)
     if 'publication' not in packet['execution_requirements'] or not re.fullmatch('[0-9a-f]{40}', result_commit):
         raise ValueError('public artifact contract required')
+    policy = packet['execution_policy']
+    allowed, immutable = policy.get('allowed_paths'), policy.get('immutable_paths')
+    if not isinstance(allowed, list) or any(not isinstance(path, str) for path in allowed):
+        raise ValueError('invalid_allowed_paths')
+    if not isinstance(immutable, list) or any(not isinstance(path, str) for path in immutable):
+        raise ValueError('invalid_immutable_paths')
+    raw = public_git(['diff', '--name-only', '--no-renames', '-z', policy['repo_base_sha'],
+        result_commit, '--'], cwd=workdir)
+    if raw and not raw.endswith(b'\0'):
+        raise ValueError('public artifact path list is not NUL terminated')
+    try:
+        changed = tuple(sorted(raw[:-1].decode('utf-8').split('\0'))) if raw else ()
+    except UnicodeDecodeError:
+        raise ValueError('public artifact path is not valid UTF-8') from None
+    scope_ok = ((not allowed) or all(_publication_path_covered(path, allowed) for path in changed))
+    scope_ok = scope_ok and not any(
+        _publication_path_covered(path, immutable) for path in changed
+    )
+    return scope_ok, changed
+
+
+def build_public_artifact(packet, workdir, result_commit, target):
+    """Serialize authorized committed regular files as bounded raw bytes."""
+    scope_ok, changed = public_result_scope(packet, workdir, result_commit)
+    if not scope_ok:
+        raise ValueError('public artifact scope violation')
     limits = packet['execution_requirements']['limits']
-    changed = public_git(['diff', '--name-only', '--no-renames', '-z', packet['execution_policy']['repo_base_sha'],
-        result_commit, '--'], cwd=workdir).decode('utf-8').split('\0')
-    changed = sorted(p for p in changed if p)
     if not 0 < len(changed) <= packet['execution_requirements']['publication']['max_changed_files']:
         raise ValueError('public artifact file limit')
     tree = {}
