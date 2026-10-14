@@ -290,17 +290,23 @@ List eligible task shapes before offering. `OrmasMinerClient.list_queue(runner_i
 URL-encodes the assigned id and returns an object with `schema_version` and `jobs`.
 Listing creates no lease. Qualification, capacity, task cells, execution profile,
 service level, publication and admission checks still apply. At capacity, `jobs`
-is empty. The skeleton falls back to the legacy `ask_usd` claim only on a queue
-HTTP 404 with no `error.type`, indicating an older gateway without this route,
-and remembers that fallback for the process. A 404 with
+is empty. Before observing an offer-idempotency protocol floor, the skeleton
+falls back to the legacy `ask_usd` claim only on a queue HTTP 404 with no
+`error.type`, indicating an older gateway without this route, and remembers that
+fallback for the process. After observing the floor, the same downgrade writes a
+sticky rollback poison and requires reconciliation. A 404 with
 `error.type == "not_found_error"` is raised to the operator: it can mean an unknown
 runner, or no priced binding and no eligible project. Other queue errors also
 surface to the caller.
 
-Ordinary queue entries have `job_id`, `created_at` and `envelope`, with no
-window marker. A job awarded to this runner adds `awarded_to_you: true`,
-`bid_id` and `award_id`. The envelope admits only these keys; absent or invalid
-values are omitted:
+When offer idempotency is enabled, the response advertises
+`offer_idempotency.protocol = "ormas-offer-request-v1"` and a 32-character
+lowercase hexadecimal `authority_epoch`. Every queue entry also carries a random
+32-character lowercase hexadecimal `offer_window_id`. The gateway keeps that id
+stable for one acceptability generation and replaces it when the generation
+changes. A job awarded to this runner adds `awarded_to_you: true`, `bid_id` and
+`award_id`. The envelope admits only these keys; absent or invalid values are
+omitted:
 
 | Key | Shape |
 |---|---|
@@ -330,9 +336,14 @@ A response with a subset of valid envelope keys:
 ```json
 {
   "schema_version": "ormas.runner-queue.v1",
+  "offer_idempotency": {
+    "protocol": "ormas-offer-request-v1",
+    "authority_epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
   "jobs": [{
     "job_id": "job-1",
     "created_at": "2026-10-02T00:00:00Z",
+    "offer_window_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "envelope": {
       "service_level": "standard",
       "repository_visibility": "public",
@@ -343,6 +354,7 @@ A response with a subset of valid envelope keys:
   }, {
     "job_id": "job-2",
     "created_at": "2026-10-02T00:01:00Z",
+    "offer_window_id": "cccccccccccccccccccccccccccccccc",
     "envelope": {
       "service_level": "standard",
       "repository_visibility": "public",
@@ -360,9 +372,10 @@ Rollout requires a gateway with offer-window support. The reference miner ships
 with `MinerConfig.offer_window=False`; `--offer-window` enables it explicitly.
 Window mode uses `offer_fn(entry)` for per-job firm or limit terms. With no hook,
 a configured positive finite `ask_usd` supplies a static firm offer. Missing
-pricing is refused. The legacy defaults and bare queue-404 fallback keep their
-existing claim bodies. A miner with saved window bids refuses a route-missing
-fallback so it can preserve its own award binding.
+pricing is refused. The legacy defaults and pre-floor bare queue-404 fallback
+keep their existing claim bodies. A miner that has observed the idempotency
+protocol refuses a route-missing fallback so it can preserve its request and
+award bindings.
 
 The gateway owns two clocks: `ack_by_s` defaults to 60 seconds and ranges from
 15 to 60; manual `window_s` defaults to 600 seconds and has a maximum of 600.
@@ -374,56 +387,79 @@ miners introduce no local bidding deadlines or reserve estimates.
 ### `POST /api/runner/v1/offers`
 
 `submit_offer(runner_id, offer, offer_request_id=None,
-offer_authority_epoch=None)` sends one of these bodies, with no `schema_version`.
-Direct callers that omit both identity fields retain the legacy wire body. The
-reference miner uses the idempotent form only when the queue advertises:
+offer_authority_epoch=None, offer_window_id=None)` sends one of these bodies,
+with no `schema_version`. Direct callers that omit all three identity fields
+retain the legacy wire body. The reference miner uses the idempotent form only
+when the queue advertises:
 
 ```json
 {"offer_idempotency": {"protocol": "ormas-offer-request-v1", "authority_epoch": "0123456789abcdef0123456789abcdef"}}
 ```
 
-It journals the exact terms, request id, advertised authority epoch and expected
-terms digest before its first POST:
+It journals the exact terms, request id, advertised authority epoch, queue row's
+window id and expected terms digest before its first POST:
 
 ```json
-{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "firm", "price_usd": 0.20, "offer_request_id": "ofr_0123456789abcdef0123456789abcdef", "offer_authority_epoch": "0123456789abcdef0123456789abcdef"}
+{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "firm", "price_usd": 0.20, "offer_request_id": "ofr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602cccccccccccccccccccccccccccccccc", "offer_authority_epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offer_window_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
 ```
 
 ```json
-{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30, "offer_request_id": "ofr_0123456789abcdef0123456789abcdef", "offer_authority_epoch": "0123456789abcdef0123456789abcdef"}
+{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30, "offer_request_id": "ofr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb3b58827346182c3b55ca4d1e05bc6fd9a4157dcee7adf098229891eda3579265cccccccccccccccccccccccccccccccc", "offer_authority_epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offer_window_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
 ```
 
 Firm prices are positive finite numbers. Limit amounts satisfy
 `0 < estimate_usd <= limit_usd` and are finite. Booleans are refused locally.
-An `offer_request_id` is exactly `ofr_` followed by 32 lowercase hexadecimal
-characters. `offer_authority_epoch` is exactly 32 lowercase hexadecimal
-characters. The gateway compares the supplied epoch with its current durable
-epoch before any authority or bid mutation. An epoch mismatch creates no request
-or bid record and returns HTTP 409 `conflict_error` with message
+An `offer_request_id` is exactly `ofr_`, the 32-character `offer_window_id`, the
+64-character `offer_terms_sha256`, and 32 random lowercase hexadecimal
+characters. Its total length is 132 characters. The client and gateway reject a
+request whose embedded window or digest differs from the separate fields and
+terms. `offer_authority_epoch` and `offer_window_id` are each exactly 32 lowercase
+hexadecimal characters. The gateway compares the supplied epoch with its current
+durable epoch before any authority or bid mutation. An epoch mismatch creates no
+request or bid record and returns HTTP 409 `conflict_error` with message
 `offer_authority_epoch_mismatch`; the miner retains its journal for manual
 reconciliation.
 
-The success response contains the exact echoed `offer_request_id`,
-`offer_authority_epoch`, `job_id`, gateway-computed `offer_terms_sha256`, `bid_id`,
-`ack_by_at` and frozen `window_closes_at`. The terms digest is SHA-256 of compact,
-key-sorted JSON after the gateway normalizes all price fields to JSON floats; it
-is an acknowledgement field and is not sent in the POST. The miner computes it
-independently and requires an exact match. An over-reserve POST receives the same
-acknowledgement shape, with no reserve feedback. Replacing terms uses a new
-request identity and returns a new `bid_id`; the old open bid becomes `replaced`.
+Cross-implementation digest vectors for the canonical encoding are:
 
-An exact replay of the same runner, request id and terms returns the original
-frozen acknowledgement without creating or replacing another bid. Reusing an id
-with different terms returns HTTP 409 `offer_request_conflict`. A final refusal
-is stored by the gateway and returned as HTTP 409:
+| Terms | SHA-256 |
+|---|---|
+| `{"job_id":"job-1","kind":"firm","price_usd":0.2}` | `1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602` |
+| `{"job_id":"task_1","kind":"firm","price_usd":1.0}` | `75446b10a33e374110a2de8909da965a20c11433033eae9c545233a8cd444d45` |
+| `{"estimate_usd":0.2,"job_id":"tâche-雪","kind":"limit","limit_usd":1.0}` | `88dff061f258375e70cc280d58043d4676b9dab75dc1f9d869bd8f354008cefb` |
+
+The JSON shown is the compact key-sorted representation after numeric
+normalization. UTF-8 bytes are hashed directly; JSON's default non-ASCII
+escaping therefore forms part of the wire digest contract.
+
+The success response contains the exact echoed `offer_request_id`,
+`offer_authority_epoch`, `offer_window_id`, `job_id`, gateway-computed
+`offer_terms_sha256`, `bid_id`, `ack_by_at` and frozen `window_closes_at`. The
+terms digest is SHA-256 of compact, key-sorted JSON after the gateway normalizes
+all price fields to JSON floats; it is an acknowledgement field and is not sent
+in the POST. The miner computes it independently and requires an exact match. An
+over-reserve POST receives the same acknowledgement shape, with no reserve
+feedback. Replacing terms uses a new request identity and returns a new `bid_id`;
+the gateway replaces the old open bid atomically with acceptance of the new one.
+The miner does not withdraw the current bid while a replacement is unresolved.
+
+An exact replay of the same runner, request id, epoch, window and terms returns
+the original frozen acknowledgement without creating or replacing another bid.
+Reusing an id with different bindings returns HTTP 409
+`offer_request_conflict`. A final refusal is stored by the gateway and returned
+as HTTP 409:
 
 ```json
-{"error": {"type": "offer_request_refused", "message": "window_closed", "offer_request_id": "ofr_0123456789abcdef0123456789abcdef", "job_id": "job-1", "offer_terms_sha256": "1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602", "offer_authority_epoch": "0123456789abcdef0123456789abcdef"}}
+{"error": {"type": "offer_request_refused", "message": "window_closed", "offer_request_id": "ofr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602cccccccccccccccccccccccccccccccc", "job_id": "job-1", "offer_terms_sha256": "1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602", "offer_authority_epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offer_window_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
 ```
 
-Only this typed refusal, with `message` equal to `window_closed` or `not_offering`
-and every binding field equal to the journal, lets the reference miner clear a
-pending request. Transport errors, generic HTTP errors, malformed
+Only this typed refusal, with `message` equal to `window_closed`, `not_offering`
+or `request_limit` and every binding field equal to the journal, lets the
+reference miner clear a pending request. The gateway persists an immutable
+per-window saturation marker before returning `request_limit`; this prevents a
+delayed handler from accepting any request that the client treats as terminal.
+The miner archives the complete validated refusal in the same durable state
+replacement that clears pending. Transport errors, generic HTTP errors, malformed
 acknowledgements, authority-epoch mismatches and binding mismatches retain it for
 exact replay or manual reconciliation.
 
@@ -435,12 +471,12 @@ job. The response is `{"job_id": str, "window_closed": bool, "bid": object|null}
 an included bid carries its immutable `terms`, status and bid identity. This
 route does not evaluate a window, update liveness or award work.
 
-New reference-miner journals replay their saved idempotent POST instead. A
-pre-id journal may adopt one exact matching own bid that is not already in its
-local bid records. Absence, a locally known bid or different immutable terms can
-never prove the outcome of an unkeyed POST, including when `window_closed` is
-true; those journals stay fail closed for manual reconciliation. Known prior
-open and awarded bids keep their original frozen terms and identities.
+New reference-miner journals replay their saved idempotent POST instead. Every
+pre-id journal stays fail closed for manual reconciliation. A latest-own-bid GET,
+including an unknown same-terms bid, cannot causally identify which unkeyed POST
+created it. Absence, elapsed time and `window_closed` also cannot prove that an
+unkeyed POST is unable to commit. Known prior open and awarded bids keep their
+original frozen terms and identities.
 
 ### `GET /api/runner/v1/offers/{bid_id}`
 
@@ -483,6 +519,7 @@ posted = client.submit_offer(
     offer,
     offer_request_id=journalled_request_id,
     offer_authority_epoch=journalled_authority_epoch,
+    offer_window_id=journalled_window_id,
 )
 bid = client.get_offer(posted["bid_id"])
 if bid["status"] == "open":
@@ -504,27 +541,36 @@ price/estimate/limit must match a saved own awarded bid. Unknown or mismatched
 awards are refused. `award_id` is status/queue metadata; the lease carries
 `bid_id`.
 
-An ordinary queue entry does not identify whether its job uses a window. HTTP
-409 `conflict_error` with message `not_offering` identifies a legacy job; that
-job can use the existing per-job `/leases` offers API after an empty-offer claim
-has reconciled awards. The default legacy route accepts on arrival within the
-client's undisclosed spending limit. Saved window identities remain required
-for every window award returned by either claim path.
+An exact request-bound `not_offering` refusal classifies that authority epoch and
+window generation as a legacy job. The miner archives the refusal and reuses the
+classification across restarts, passing current pricing to the existing per-job
+`/leases` offers API after an empty-offer claim has reconciled awards. It does not
+mint another standalone request on each poll. A changed window generation uses a
+fresh bound request. An authority-epoch change while a legacy classification is
+saved requires manual reconciliation. The default legacy route accepts on
+arrival within the client's undisclosed spending limit. Saved window identities
+remain required for every window award returned by either claim path.
 
 Recovery limits: idempotent replay requires a gateway version that advertises the
 protocol and durably binds success and refusal to the request id, authority epoch,
-job and terms digest. The reference miner does not start a new POST without that
-capability. If an inconsistent fleet advertises it and then rejects the identity
-fields, the miner retains the request and refuses claims rather than retrying
-without its identity. Rollout therefore installs the schema and id-aware code on
-the whole gateway fleet before advertising the capability or releasing this miner
-behavior. Once an id-bearing request may have reached the gateway, downgrade to
-an id-unaware gateway is unsupported until that request is reconciled.
+window, job and terms digest. A saved request is replayed only while the capability
+retains its authority epoch. It may recover an immutable outcome after the queue
+advances or omits the old window row. A fresh request always uses the current row's
+exact window id. Missing or malformed window identity blocks that request.
 
-The queue omits a window identity for reopened jobs. The reference miner retains
-unchanged bid records and avoids automatic same-price resubmission for such a
-job. It reconciles gateway-owned reopening and awards at the saved terms.
-Explicitly changed terms submit with a new request identity; the miner executes
+The miner persists a protocol floor after observing v1. Later capability loss or
+downgrade writes a sticky rollback poison and refuses further offer and claim
+activity until manual reconciliation; capability restoration does not silently
+clear that poison. An inconsistent fleet that rejects already journalled identity
+fields also leaves the request pending. Rollout therefore installs the schema and
+id-aware code on the whole gateway fleet before advertising the capability or
+releasing this miner behavior. Once an id-bearing request may have reached the
+gateway, downgrade to an id-unaware gateway is unsupported.
+
+The reference miner retains unchanged bid records and reconciles gateway-owned
+reopening and awards at saved terms. Explicitly changed terms submit with a new
+request identity. The current v2 bid remains intact until the gateway
+authoritatively accepts and atomically applies its replacement. The miner executes
 only an own award bound to its saved terms.
 
 Offer windows preserve reserve privacy, task-shape-only queue disclosure,

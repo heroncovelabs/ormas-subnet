@@ -45,8 +45,9 @@ HOTKEY_CHALLENGE_MAX_BYTES = 512
 _HOTKEY = re.compile(r"[1-9A-HJ-NP-Za-km-z]{30,64}")
 _MINER_IDENTITY = re.compile(r"miner:[A-Za-z0-9_-]{1,128}")
 _HOTKEY_NONCE = re.compile(r"[0-9a-f]{32}")
-_OFFER_REQUEST_ID = re.compile(r"ofr_[0-9a-f]{32}")
+_OFFER_REQUEST_ID = re.compile(r"ofr_[0-9a-f]{128}")
 _OFFER_AUTHORITY_EPOCH = re.compile(r"[0-9a-f]{32}")
+_OFFER_WINDOW_ID = re.compile(r"[0-9a-f]{32}")
 
 
 def _utc_timestamp(value: Any) -> datetime:
@@ -178,16 +179,32 @@ def _validate_window_offer(offer: Any) -> None:
         raise ValueError("estimate_usd must be at most limit_usd")
 
 
-def _validate_offer_request_id(value: Any) -> str:
-    """Return one bounded, log-safe offer idempotency key."""
+def _validate_offer_request_id(
+    value: Any,
+    *,
+    offer_window_id: str | None = None,
+    offer_terms_sha256: str | None = None,
+) -> str:
+    """Return one bounded request key and verify its embedded bindings."""
     if not isinstance(value, str) or _OFFER_REQUEST_ID.fullmatch(value) is None:
-        raise ValueError("offer_request_id must be 'ofr_' plus 32 lowercase hex characters")
+        raise ValueError("offer_request_id must be 'ofr_' plus 128 lowercase hex characters")
+    encoded = value[4:]
+    if offer_window_id is not None and encoded[:32] != offer_window_id:
+        raise ValueError("offer_request_id window binding mismatch")
+    if offer_terms_sha256 is not None and encoded[32:96] != offer_terms_sha256:
+        raise ValueError("offer_request_id terms binding mismatch")
     return value
 
 
 def _validate_offer_authority_epoch(value: Any) -> str:
     if not isinstance(value, str) or _OFFER_AUTHORITY_EPOCH.fullmatch(value) is None:
         raise ValueError("offer_authority_epoch must be 32 lowercase hex characters")
+    return value
+
+
+def _validate_offer_window_id(value: Any) -> str:
+    if not isinstance(value, str) or _OFFER_WINDOW_ID.fullmatch(value) is None:
+        raise ValueError("offer_window_id must be 32 lowercase hex characters")
     return value
 
 
@@ -423,26 +440,39 @@ class OrmasMinerClient:
         *,
         offer_request_id: str | None = None,
         offer_authority_epoch: str | None = None,
+        offer_window_id: str | None = None,
     ) -> dict[str, Any]:
         """POST an own offer; a replacement returns a new bid identity.
 
         The offers route accepts pricing fields and runner_id without a schema
-        version. ``offer_request_id`` and ``offer_authority_epoch`` make an
-        exact retry idempotent when the gateway advertises that protocol. Its
-        acknowledgement must echo the request identity, epoch, job and terms
-        digest. Omitting both preserves the legacy wire body for direct callers.
+        version. ``offer_request_id``, ``offer_authority_epoch`` and
+        ``offer_window_id`` make an exact retry idempotent when the gateway
+        advertises that protocol. Its acknowledgement must echo the request
+        identity, epoch, window, job and terms digest. Omitting all three
+        preserves the legacy wire body for direct callers.
         """
         if not isinstance(runner_id, str) or not runner_id.strip():
             raise ValueError("runner_id must be a non-empty string")
         _validate_window_offer(offer)
         body = {"runner_id": runner_id, **offer}
-        if (offer_request_id is None) != (offer_authority_epoch is None):
-            raise ValueError("offer_request_id and offer_authority_epoch must be provided together")
-        if offer_request_id is not None and offer_authority_epoch is not None:
-            body["offer_request_id"] = _validate_offer_request_id(offer_request_id)
+        identity = (offer_request_id, offer_authority_epoch, offer_window_id)
+        if any(value is None for value in identity) and any(value is not None for value in identity):
+            raise ValueError(
+                "offer_request_id, offer_authority_epoch and offer_window_id "
+                "must be provided together",
+            )
+        if offer_request_id is not None:
+            window_id = _validate_offer_window_id(offer_window_id)
+            terms_sha256 = _offer_terms_sha256(offer)
+            body["offer_request_id"] = _validate_offer_request_id(
+                offer_request_id,
+                offer_window_id=window_id,
+                offer_terms_sha256=terms_sha256,
+            )
             body["offer_authority_epoch"] = _validate_offer_authority_epoch(
                 offer_authority_epoch,
             )
+            body["offer_window_id"] = window_id
         resp = self._post("/api/runner/v1/offers", body)
         self._raise_for_status(resp)
         payload = resp.json()
@@ -451,8 +481,9 @@ class OrmasMinerClient:
                 raise ValueError("invalid offer acknowledgement")
             if (payload.get("offer_request_id") != offer_request_id
                     or payload.get("offer_authority_epoch") != offer_authority_epoch
+                    or payload.get("offer_window_id") != offer_window_id
                     or payload.get("job_id") != offer["job_id"]
-                    or payload.get("offer_terms_sha256") != _offer_terms_sha256(offer)):
+                    or payload.get("offer_terms_sha256") != terms_sha256):
                 raise ValueError("offer acknowledgement request identity mismatch")
         return payload
 

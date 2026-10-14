@@ -9,7 +9,12 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
-from ormas_subnet.client import OrmasGatewayError, OrmasMinerClient, _offer_terms_sha256
+from ormas_subnet.client import (
+    OrmasGatewayError,
+    OrmasMinerClient,
+    _offer_terms_sha256,
+    _validate_offer_request_id,
+)
 from ormas_subnet.protocol import RUNNER_DEVICE_HEADER
 from ormas_subnet.skeleton import MinerSkeleton
 from ormas_subnet._recovery import RecoveryRequired
@@ -18,11 +23,21 @@ from .test_skeleton import _offer_skeleton
 from .test_skeleton_public_recovery import _config, _lease_and_draft
 
 
+def offer_request_id(window_id, terms, random_hex="c" * 32):
+    return f"ofr_{window_id}{_offer_terms_sha256(terms)}{random_hex}"
+
+
 class OfferTransport:
     """In-process contract: POST replaces, queue/claim award, GET reads own status."""
 
     def __init__(self):
-        self.jobs = [{"job_id": "task_1", "created_at": "2026-10-08T00:00:00Z", "envelope": {}}]
+        self.offer_window_id = "b" * 32
+        self.jobs = [{
+            "job_id": "task_1",
+            "created_at": "2026-10-08T00:00:00Z",
+            "envelope": {},
+            "offer_window_id": self.offer_window_id,
+        }]
         self.calls = []
         self.bids = {}
         self.offer_requests = {}
@@ -34,6 +49,7 @@ class OfferTransport:
         self.offer_epoch_echo = None
         self.offer_digest_echo = None
         self.offer_job_echo = None
+        self.offer_window_echo = None
         self.offer_refusal_reason = None
         self.award = None
         self.award_on_claim = False
@@ -59,7 +75,9 @@ class OfferTransport:
     @staticmethod
     def request_terms(body):
         return {key: value for key, value in body.items()
-                if key not in {"runner_id", "offer_request_id", "offer_authority_epoch"}}
+                if key not in {
+                    "runner_id", "offer_request_id", "offer_authority_epoch", "offer_window_id",
+                }}
 
     def request_refusal(self, request_id, reason, body):
         terms = self.request_terms(body)
@@ -76,6 +94,10 @@ class OfferTransport:
             "offer_authority_epoch": (
                 body["offer_authority_epoch"] if self.offer_epoch_echo is None
                 else self.offer_epoch_echo
+            ),
+            "offer_window_id": (
+                body["offer_window_id"] if self.offer_window_echo is None
+                else self.offer_window_echo
             ),
         }})
 
@@ -103,6 +125,16 @@ class OfferTransport:
                 if saved_body != body:
                     return self.request_conflict(request_id)
                 return _FakeResponse(status, deepcopy(payload))
+            if request_id is not None:
+                terms = self.request_terms(body)
+                try:
+                    _validate_offer_request_id(
+                        request_id,
+                        offer_window_id=body.get("offer_window_id"),
+                        offer_terms_sha256=_offer_terms_sha256(terms),
+                    )
+                except ValueError:
+                    return self.conflict("offer_request_binding_mismatch")
             if self.lose_offer_before_commit:
                 self.lose_offer_before_commit = False
                 raise RuntimeError("replacement outcome unknown")
@@ -121,6 +153,12 @@ class OfferTransport:
 
             if self.offer_refusal_reason is not None:
                 return refuse(self.offer_refusal_reason)
+            current_window = next((
+                job.get("offer_window_id") for job in self.jobs
+                if job.get("job_id") == body["job_id"]
+            ), None)
+            if request_id is not None and body.get("offer_window_id") != current_window:
+                return refuse("window_closed")
             if body["job_id"] in self.legacy:
                 return refuse("not_offering")
             if self.race == "window_closed":
@@ -149,6 +187,10 @@ class OfferTransport:
                     offer_authority_epoch=(
                         body["offer_authority_epoch"] if self.offer_epoch_echo is None
                         else self.offer_epoch_echo
+                    ),
+                    offer_window_id=(
+                        body["offer_window_id"] if self.offer_window_echo is None
+                        else self.offer_window_echo
                     ),
                 )
                 if self.offer_request_echo is not False:
@@ -330,33 +372,35 @@ def test_submit_limit_compares_original_amounts_like_offer_backend():
 def test_offer_request_id_is_bounded_echoed_and_reuse_conflicts():
     transport = OfferTransport()
     client = client_for(transport)
-    request_id = "ofr_0123456789abcdef0123456789abcdef"
     authority_epoch = transport.offer_authority_epoch
+    window_id = transport.offer_window_id
     terms = {"job_id": "task_1", "kind": "firm", "price_usd": 1.25}
+    request_id = offer_request_id(window_id, terms)
     posted = client.submit_offer(
         "runner-1", terms,
         offer_request_id=request_id,
         offer_authority_epoch=authority_epoch,
+        offer_window_id=window_id,
     )
     assert posted["offer_request_id"] == request_id
     assert posted["offer_terms_sha256"] == _offer_terms_sha256(terms)
     assert posted["offer_authority_epoch"] == authority_epoch
+    assert posted["offer_window_id"] == window_id
     assert transport.calls[0][2] == {
         "runner_id": "runner-1", **terms, "offer_request_id": request_id,
-        "offer_authority_epoch": authority_epoch,
+        "offer_authority_epoch": authority_epoch, "offer_window_id": window_id,
     }
-    with pytest.raises(OrmasGatewayError) as raised:
+    with pytest.raises(ValueError, match="terms binding mismatch"):
         client.submit_offer(
             "runner-1", {**terms, "price_usd": 2.5}, offer_request_id=request_id,
             offer_authority_epoch=authority_epoch,
+            offer_window_id=window_id,
         )
-    assert raised.value.error_type == "offer_request_conflict"
-    assert raised.value.details["offer_request_id"] == request_id
-    assert len(transport.bids) == 1
+    assert len(transport.bids) == 1 and len(offers(transport)) == 1
 
 
 @pytest.mark.parametrize("request_id", [
-    "", "x" * 36, "ofr_" + "A" * 32, "ofr_" + "a" * 31,
+    "", "x" * 132, "ofr_" + "A" * 128, "ofr_" + "a" * 127,
     "has space", "has/slash", True, b"bytes",
 ])
 def test_offer_request_id_rejects_unsafe_or_unbounded_values_before_post(request_id):
@@ -366,23 +410,29 @@ def test_offer_request_id_rejects_unsafe_or_unbounded_values_before_post(request
             "runner-1", {"job_id": "task_1", "kind": "firm", "price_usd": 1},
             offer_request_id=request_id,
             offer_authority_epoch="a" * 32,
+            offer_window_id="b" * 32,
         )
     assert transport.calls == []
 
 
-@pytest.mark.parametrize("request_id,authority_epoch", [
-    ("ofr_" + "a" * 32, None),
-    (None, "a" * 32),
-    ("ofr_" + "a" * 32, "A" * 32),
-    ("ofr_" + "a" * 32, "a" * 31),
+@pytest.mark.parametrize("request_id,authority_epoch,window_id", [
+    ("ofr_" + "a" * 128, None, "b" * 32),
+    (None, "a" * 32, "b" * 32),
+    (None, None, "b" * 32),
+    ("ofr_" + "a" * 128, "A" * 32, "b" * 32),
+    ("ofr_" + "a" * 128, "a" * 31, "b" * 32),
+    ("ofr_" + "a" * 128, "a" * 32, "B" * 32),
 ])
-def test_offer_request_identity_requires_exact_epoch_pair(request_id, authority_epoch):
+def test_offer_request_identity_requires_exact_bound_triple(
+    request_id, authority_epoch, window_id,
+):
     transport = OfferTransport()
-    with pytest.raises(ValueError, match="offer_(request_id|authority_epoch)"):
+    with pytest.raises(ValueError, match="offer_(request_id|authority_epoch|window_id)"):
         client_for(transport).submit_offer(
             "runner-1", {"job_id": "task_1", "kind": "firm", "price_usd": 1},
             offer_request_id=request_id,
             offer_authority_epoch=authority_epoch,
+            offer_window_id=window_id,
         )
     assert transport.calls == []
 
@@ -393,6 +443,15 @@ def test_offer_terms_digest_uses_gateway_float_normalization_and_canonical_json(
     expected = "75446b10a33e374110a2de8909da965a20c11433033eae9c545233a8cd444d45"
     assert _offer_terms_sha256(first) == expected
     assert _offer_terms_sha256(second) == expected
+    assert _offer_terms_sha256({
+        "job_id": "job-1", "kind": "firm", "price_usd": .2,
+    }) == "1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602"
+    assert _offer_terms_sha256({
+        "job_id": "task_1", "kind": "limit", "estimate_usd": .2, "limit_usd": .3,
+    }) == "41d910a896fe625104f533d8616dc7a56bcfc006b5d84899edb3dd36a07857b2"
+    assert _offer_terms_sha256({
+        "job_id": "tâche-雪", "kind": "limit", "estimate_usd": .2, "limit_usd": 1,
+    }) == "88dff061f258375e70cc280d58043d4676b9dab75dc1f9d869bd8f354008cefb"
 
 
 def test_bid_identity_is_one_url_segment():
@@ -566,7 +625,13 @@ def test_new_award_recovers_without_static_pricing(tmp_path, queue_view):
     transport.set_award("bid_1")
     miner.config.ask_usd = None
     if queue_view == "ordinary":
-        transport.queue_response = _FakeResponse(200, {"jobs": deepcopy(transport.jobs)})
+        transport.queue_response = _FakeResponse(200, {
+            "jobs": deepcopy(transport.jobs),
+            "offer_idempotency": {
+                "protocol": "ormas-offer-request-v1",
+                "authority_epoch": transport.offer_authority_epoch,
+            },
+        })
     elif queue_view == "absent":
         transport.jobs = []
     transport.calls.clear()
@@ -754,6 +819,120 @@ def test_typed_not_offering_keeps_per_job_legacy_claim(tmp_path):
     assert transport.source.completed["terminal"]["verification_state"] == "verified"
 
 
+def test_stable_legacy_window_uses_one_request_across_32_idle_polls_and_restart(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.source = None
+    transport.legacy.add("task_1")
+    assert miner.run_once() is False
+    for _ in range(31):
+        restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+        assert restarted.run_once() is False
+
+    posted = offers(transport)
+    assert len(posted) == 1
+    assert len(transport.offer_requests) == 1
+    assert len(claims(transport)) == 64
+    assert all(body["offers"] == [] for body in claims(transport)[::2])
+    assert all(body["offers"] == [{
+        "job_id": "task_1", "kind": "firm", "price_usd": 1.25,
+    }] for body in claims(transport)[1::2])
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is None
+    assert len(state["request_outcomes"]) == 1
+    assert state["window_markers"]["task_1"]["reason"] == "not_offering"
+
+
+def test_stable_legacy_window_passes_changed_price_to_claim_without_new_post(tmp_path):
+    desired = [{"job_id": "task_1", "kind": "firm", "price_usd": 1.25}]
+    transport, miner = window_miner(tmp_path, lambda _: dict(desired[0]))
+    transport.source = None
+    transport.legacy.add("task_1")
+    assert miner.run_once() is False
+    desired[0]["price_usd"] = 2.5
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    assert restarted.run_once() is False
+    assert len(offers(transport)) == 1
+    assert claims(transport)[-1]["offers"] == [desired[0]]
+
+
+def test_legacy_classification_epoch_change_stays_fenced(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.source = None
+    transport.legacy.add("task_1")
+    assert miner.run_once() is False
+    transport.offer_authority_epoch = "c" * 32
+    transport.calls.clear()
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="authority changed"):
+        restarted.run_once()
+    assert offers(transport) == claims(transport) == []
+
+
+def test_changed_window_generation_gets_one_fresh_bound_request(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.source = None
+    transport.legacy.add("task_1")
+    assert miner.run_once() is False
+    first_request = offers(transport)[0][2]["offer_request_id"]
+    transport.offer_window_id = "c" * 32
+    transport.jobs[0]["offer_window_id"] = transport.offer_window_id
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    assert restarted.run_once() is False
+    posted = offers(transport)
+    assert len(posted) == 2
+    assert posted[1][2]["offer_request_id"] != first_request
+    assert posted[1][2]["offer_request_id"][4:36] == transport.offer_window_id
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert len(state["request_outcomes"]) == 2
+    assert state["window_markers"]["task_1"]["offer_window_id"] == transport.offer_window_id
+
+
+@pytest.mark.parametrize("reason", ["window_closed", "request_limit"])
+def test_terminal_window_marker_prevents_new_request_until_window_changes(tmp_path, reason):
+    transport, miner = window_miner(tmp_path)
+    transport.source = None
+    transport.offer_refusal_reason = reason
+    assert miner.run_once() is False
+    transport.offer_refusal_reason = None
+    for _ in range(3):
+        restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+        assert restarted.run_once() is False
+    assert len(offers(transport)) == 1
+    assert len(transport.offer_requests) == 1
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["window_markers"]["task_1"]["reason"] == reason
+    assert next(iter(state["request_outcomes"].values()))["message"] == reason
+    transport.offer_window_id = "d" * 32
+    transport.jobs[0]["offer_window_id"] = transport.offer_window_id
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    assert restarted.run_once() is False
+    assert len(offers(transport)) == 2
+    assert offers(transport)[-1][2]["offer_window_id"] == transport.offer_window_id
+
+
+def test_request_limit_binding_mismatch_retains_pending(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.offer_refusal_reason = "request_limit"
+    transport.offer_window_echo = "f" * 32
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        miner.run_once()
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is not None
+    assert state["request_outcomes"] == state["window_markers"] == {}
+
+
+def test_terminal_refusal_replay_cannot_later_create_a_bid(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.offer_refusal_reason = "request_limit"
+    assert miner.run_once() is False
+    posted = offers(transport)[0][2]
+    transport.offer_refusal_reason = None
+    response = transport.post("/api/runner/v1/offers", json=posted, headers={})
+    assert response.status_code == 409
+    assert response.json()["error"]["message"] == "request_limit"
+    assert transport.bids == {} and len(transport.offer_requests) == 1
+
+
 @pytest.mark.parametrize("error,expected", [
     (RuntimeError("transport broke"), RecoveryRequired),
     (_FakeResponse(401, {"error": {
@@ -762,6 +941,9 @@ def test_typed_not_offering_keeps_per_job_legacy_claim(tmp_path):
     (_FakeResponse(503, {"error": {
         "type": "service_unavailable", "message": "retry",
     }}), OrmasGatewayError),
+    (_FakeResponse(409, {"error": {
+        "type": "conflict_error", "message": "request_limit",
+    }}), RecoveryRequired),
 ])
 def test_window_nonfenced_errors_keep_request_pending(tmp_path, error, expected):
     transport, miner = window_miner(tmp_path)
@@ -800,9 +982,12 @@ def test_lost_ack_restart_replays_exact_request_and_recovers_one_bid(tmp_path):
     saved = json.loads(journal.read_text())["pending"]
     assert saved["version"] == 2
     assert saved["offer_request_id"].startswith("ofr_")
-    assert len(saved["offer_request_id"]) == 36
+    assert len(saved["offer_request_id"]) == 132
     assert saved["offer_authority_epoch"] == transport.offer_authority_epoch
+    assert saved["offer_window_id"] == transport.offer_window_id
     assert saved["offer_terms_sha256"] == _offer_terms_sha256(saved["terms"])
+    assert saved["offer_request_id"][4:36] == saved["offer_window_id"]
+    assert saved["offer_request_id"][36:100] == saved["offer_terms_sha256"]
 
     restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
     assert restarted.run_once() is False
@@ -845,10 +1030,11 @@ def test_replayed_success_preserves_award_identity_before_execution(tmp_path):
 
 @pytest.mark.parametrize(("attribute", "echo"), [
     ("offer_request_echo", False),
-    ("offer_request_echo", "ofr_ffffffffffffffffffffffffffffffff"),
+    ("offer_request_echo", "ofr_" + "f" * 128),
     ("offer_epoch_echo", "b" * 32),
     ("offer_digest_echo", "f" * 64),
     ("offer_job_echo", "other-task"),
+    ("offer_window_echo", "f" * 32),
 ])
 def test_missing_or_mismatched_success_binding_keeps_request_pending(
     tmp_path, attribute, echo,
@@ -873,6 +1059,26 @@ def test_exact_typed_durable_refusal_is_the_only_error_that_clears_pending(tmp_p
     assert miner.run_once() is False
     state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
     assert state["pending"] is None and state["bids"] == {}
+    assert len(state["request_outcomes"]) == 1
+    request_id, refusal = next(iter(state["request_outcomes"].items()))
+    assert refusal == {
+        "version": 2,
+        "offer_request_id": request_id,
+        "offer_authority_epoch": transport.offer_authority_epoch,
+        "offer_window_id": transport.offer_window_id,
+        "offer_terms_sha256": _offer_terms_sha256(refusal["terms"]),
+        "terms": {"job_id": "task_1", "kind": "firm", "price_usd": 1.25},
+        "outcome": "refused",
+        "http_status": 409,
+        "error_type": "offer_request_refused",
+        "message": "window_closed",
+    }
+    assert state["window_markers"] == {"task_1": {
+        "offer_request_id": request_id,
+        "offer_authority_epoch": transport.offer_authority_epoch,
+        "offer_window_id": transport.offer_window_id,
+        "reason": "window_closed",
+    }}
 
 
 def test_typed_refusal_with_unknown_message_stays_pending(tmp_path):
@@ -885,10 +1091,11 @@ def test_typed_refusal_with_unknown_message_stays_pending(tmp_path):
 
 
 @pytest.mark.parametrize(("attribute", "echo"), [
-    ("offer_refusal_echo", "ofr_ffffffffffffffffffffffffffffffff"),
+    ("offer_refusal_echo", "ofr_" + "f" * 128),
     ("offer_epoch_echo", "b" * 32),
     ("offer_digest_echo", "f" * 64),
     ("offer_job_echo", "other-task"),
+    ("offer_window_echo", "f" * 32),
 ])
 def test_typed_refusal_with_wrong_binding_stays_pending(tmp_path, attribute, echo):
     transport, miner = window_miner(tmp_path)
@@ -959,18 +1166,108 @@ def test_authority_epoch_change_cannot_mutate_or_clear_pending_request(tmp_path)
 
     transport.offer_authority_epoch = "b" * 32
     restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
-    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown") as raised:
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
         restarted.run_once()
 
-    assert isinstance(raised.value.__cause__, OrmasGatewayError)
-    assert raised.value.__cause__.status_code == 409
-    assert raised.value.__cause__.error_type == "conflict_error"
-    assert raised.value.__cause__.message == "offer_authority_epoch_mismatch"
     assert json.loads(journal.read_text())["pending"] == before
     assert transport.bids == {} and transport.offer_requests == {}
     posted = offers(transport)
-    assert len(posted) == 2 and posted[0][2] == posted[1][2]
+    assert len(posted) == 1
     assert claims(transport) == []
+
+
+def test_pending_success_replays_after_queue_advances_to_new_window(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.lose_offer_ack = True
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        miner.run_once()
+    original = offers(transport)[0][2]
+    transport.offer_window_id = "c" * 32
+    transport.jobs[0]["offer_window_id"] = transport.offer_window_id
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    assert restarted.run_once() is False
+    posted = offers(transport)
+    assert len(posted) == 2 and posted[1][2] == original
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is None
+    assert state["bids"]["bid_1"]["offer_window_id"] == "b" * 32
+
+
+def test_pending_uncommitted_request_gets_bound_close_after_window_advances(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.lose_offer_before_commit = True
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        miner.run_once()
+    original = offers(transport)[0][2]
+    transport.offer_window_id = "c" * 32
+    transport.jobs[0]["offer_window_id"] = transport.offer_window_id
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    assert restarted.run_once() is False
+    posted = offers(transport)
+    assert len(posted) == 2 and posted[1][2] == original
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is None
+    assert next(iter(state["request_outcomes"].values()))["message"] == "window_closed"
+
+
+def test_missing_window_identity_blocks_fresh_request(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    del transport.jobs[0]["offer_window_id"]
+    with pytest.raises(RecoveryRequired, match="window identity"):
+        miner.run_once()
+    assert offers(transport) == claims(transport) == []
+
+
+def test_capability_rollback_sets_sticky_poison(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    assert miner.run_once() is False
+    transport.advertise_offer_idempotency = False
+    with pytest.raises(RecoveryRequired, match="protocol rollback"):
+        miner.run_once()
+    journal = next(Path(tmp_path).rglob("offers.json"))
+    state = json.loads(journal.read_text())
+    assert state["offer_protocol_floor"] == "ormas-offer-request-v1"
+    assert state["offer_protocol_poisoned"] is True
+
+    transport.advertise_offer_idempotency = True
+    transport.calls.clear()
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="protocol rollback"):
+        restarted.run_once()
+    assert transport.calls == []
+
+
+def test_capability_rollback_keeps_pending_and_blocks_later_replay(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.lose_offer_before_commit = True
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        miner.run_once()
+    journal = next(Path(tmp_path).rglob("offers.json"))
+    pending = json.loads(journal.read_text())["pending"]
+    transport.advertise_offer_idempotency = False
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="protocol rollback"):
+        restarted.run_once()
+    state = json.loads(journal.read_text())
+    assert state["pending"] == pending
+    assert state["offer_protocol_poisoned"] is True
+    assert len(offers(transport)) == 1
+
+
+def test_ambiguous_replacement_never_withdraws_current_v2_bid(tmp_path):
+    desired = [{"job_id": "task_1", "kind": "firm", "price_usd": 1.25}]
+    transport, miner = window_miner(tmp_path, lambda _: dict(desired[0]))
+    assert miner.run_once() is False
+    desired[0]["price_usd"] = 2.5
+    transport.lose_offer_before_commit = True
+    transport.calls.clear()
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        miner.run_once()
+    assert transport.bids["bid_1"]["status"] == "open"
+    assert not any(call[0] == "DELETE" for call in transport.calls)
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["current"] == {"task_1": "bid_1"}
+    assert state["pending"]["terms"] == desired[0]
 
 
 def test_legacy_pending_absence_never_clears_even_after_window_close(tmp_path):
@@ -990,7 +1287,7 @@ def test_legacy_pending_absence_never_clears_even_after_window_close(tmp_path):
     assert len(offers(transport)) == 1
 
 
-def test_legacy_pending_may_adopt_one_exact_unknown_own_bid(tmp_path):
+def test_legacy_pending_never_adopts_same_terms_unknown_own_bid(tmp_path):
     transport, miner = window_miner(tmp_path)
     transport.lose_offer_before_commit = True
     with pytest.raises(RecoveryRequired):
@@ -1000,13 +1297,17 @@ def test_legacy_pending_may_adopt_one_exact_unknown_own_bid(tmp_path):
     terms = state["pending"]["terms"]
     state["pending"] = terms
     journal.write_text(json.dumps(state))
+    before = journal.read_bytes()
     transport.bids["bid_external"] = {"terms": deepcopy(terms), "status": "open"}
     restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
-    assert restarted.run_once() is False
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        restarted.run_once()
+    assert journal.read_bytes() == before
     recovered = json.loads(journal.read_text())
-    assert recovered["pending"] is None
-    assert recovered["current"] == {"task_1": "bid_external"}
+    assert recovered["pending"] == terms
+    assert recovered["current"] == {}
     assert len(offers(transport)) == 1
+    assert not any(call[0] == "GET" and "/offers?" in call[1] for call in transport.calls)
 
 
 @pytest.mark.parametrize("status", ["open", "awarded"])
@@ -1095,10 +1396,13 @@ def test_offer_request_is_durable_before_post_and_bid_before_claim(tmp_path, mon
             pending = json_module.loads(journals[0].read_text())["pending"]
             assert pending["offer_request_id"] == json["offer_request_id"]
             assert pending["offer_authority_epoch"] == json["offer_authority_epoch"]
+            assert pending["offer_window_id"] == json["offer_window_id"]
             assert pending["offer_terms_sha256"] == _offer_terms_sha256(pending["terms"])
             assert pending["terms"] == {
                 key: value for key, value in json.items()
-                if key not in {"runner_id", "offer_request_id", "offer_authority_epoch"}
+                if key not in {
+                    "runner_id", "offer_request_id", "offer_authority_epoch", "offer_window_id",
+                }
             }
         elif path.endswith("/leases"):
             saved = [p for p in miner.config.workdir_root.rglob("*.json") if "bid_1" in p.read_text()]
