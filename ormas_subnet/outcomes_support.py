@@ -25,6 +25,7 @@ from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
 from .verifier_runtime import (
     RuntimeRefusal,
     dependency_spec,
@@ -34,6 +35,14 @@ from .verifier_runtime import (
 )
 
 PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
+
+# Historical catalogs remain available for interpreting frozen evidence, but a
+# compiler that lost execution approval must never become executable merely by
+# selecting its old catalog digest.  Updating this allowlist requires review of
+# the exact embedded verifier source and coordinated gateway/SDK rollout.
+_ACTIVE_VERIFIER_COMPILERS = frozenset({
+    'd609ed993b3bda292cc93e5e995699da1175ca995d4226d17cb8794a8ab89151',
+})
 
 
 def digest(value):
@@ -57,6 +66,13 @@ def load_support_catalog(catalog_digest=None):
 
 def _runtime_source():
     return Path(__file__).with_name('verifier_runtime.py').read_text()
+
+
+def _active_compiler(catalog):
+    compiler = catalog.get('verifier_compiler_sha256') if isinstance(catalog, dict) else None
+    if compiler not in _ACTIVE_VERIFIER_COMPILERS:
+        raise ValueError('verifier_compiler_revoked')
+    return compiler
 
 
 def _profile(profile_id, catalog_digest=None):
@@ -154,7 +170,8 @@ def _service(value):
 
 def effective_command(config):
     source = _runtime_source()
-    if hashlib.sha256(source.encode()).hexdigest() != load_support_catalog().get('verifier_compiler_sha256'):
+    compiler = _active_compiler(load_support_catalog())
+    if hashlib.sha256(source.encode()).hexdigest() != compiler:
         raise ValueError('compiler_catalog_stale')
     encoded = base64.b64encode(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).decode()
     return shlex.join(['python3', '-I', '-S', '-c', source, encoded])
@@ -313,6 +330,7 @@ def validate_public_execution_packet(packet):
     catalog, profile = _profile(environment['profile'].get('profile_id'), environment['catalog_digest'])
     if environment['catalog_digest'] != digest(catalog) or environment['profile'] != profile:
         raise ValueError('execution_catalog_changed')
+    compiler = _active_compiler(catalog)
     if 'repository_access' in environment:
         _private_repository_access(environment['repository_access'], catalog)
     if 'repository_gitlinks' in environment:
@@ -345,7 +363,7 @@ def validate_public_execution_packet(packet):
     arguments = shlex.split(expected_command)
     encoded = base64.b64encode(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).decode()
     if (len(arguments) != 6 or arguments[:4] != ['python3', '-I', '-S', '-c']
-            or hashlib.sha256(arguments[4].encode()).hexdigest() != catalog.get('verifier_compiler_sha256')
+            or hashlib.sha256(arguments[4].encode()).hexdigest() != compiler
             or arguments[5] != encoded or shlex.join(arguments) != expected_command):
         raise ValueError('verifier_compiler_mismatch')
     sha = hashlib.sha256(expected_command.encode()).hexdigest()
@@ -383,14 +401,24 @@ def validate_public_execution_packet(packet):
     return expected
 
 
+def _trusted_tool(name):
+    try:
+        return trusted_executable(name)
+    except TrustedExecutableUnavailable as exc:
+        raise ValueError(f'trusted {name} executable unavailable') from exc
+
+
 def _git_environment():
-    return {'PATH': os.environ.get('PATH', ''), 'HOME': '/nonexistent',
+    git = _trusted_tool('git')
+    return {'PATH': str(git.parent), 'HOME': '/nonexistent',
             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': os.devnull,
-            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'}
+            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
+            'GIT_NO_REPLACE_OBJECTS': '1'}
 
 
 def _isolated_git(args, *, cwd, env):
-    proc = subprocess.run(['git', '--literal-pathspecs', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + os.devnull,
+    git = _trusted_tool('git')
+    proc = subprocess.run([str(git), '--literal-pathspecs', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + os.devnull,
         '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never',
         '-c', 'protocol.file.allow=never', *args], cwd=str(cwd), env=env,
         capture_output=True, check=False, timeout=120)
@@ -595,7 +623,7 @@ def repository_git(args, *, cwd, repo_url, credential):
             with os.fdopen(fd, 'w') as stream:
                 stream.write(body if body.endswith('\n') else body + '\n')
         env = _git_environment()
-        env['GIT_SSH_COMMAND'] = shlex.join(['ssh', '-F', os.devnull, '-i', str(key),
+        env['GIT_SSH_COMMAND'] = shlex.join([str(_trusted_tool('ssh')), '-F', os.devnull, '-i', str(key),
             '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
             '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + str(hosts),
             '-o', 'GlobalKnownHostsFile=' + os.devnull, '-o', 'HostKeyAlgorithms=ssh-ed25519',

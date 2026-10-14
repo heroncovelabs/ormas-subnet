@@ -65,7 +65,7 @@ def test_clone_runs_under_the_served_read_credential_and_key_is_gone_after(tmp_p
     real_run = subprocess.run
 
     def spy(argv, **kwargs):
-        if argv[:2] == ["git", "clone"]:
+        if Path(argv[0]).name == "git" and argv[1:2] == ["clone"]:
             env = kwargs.get("env") or {}
             kp = _key_path(env.get("GIT_SSH_COMMAND", ""))
             seen.append({"ssh": env.get("GIT_SSH_COMMAND", ""), "key_exists": bool(kp) and Path(kp).exists(), "kp": kp})

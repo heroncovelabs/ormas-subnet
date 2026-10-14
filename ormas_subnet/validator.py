@@ -916,7 +916,8 @@ class ValidatorDaemon:
 
         try:
             diff_out = _run_git(
-                ["diff", "--name-only", "--no-renames", "-z",
+                ["diff", "--no-ext-diff", "--no-textconv",
+                 "--name-only", "--no-renames", "-z",
                  base_commit, result_commit, "--"],
                 cwd=workdir,
             )
@@ -951,9 +952,12 @@ class ValidatorDaemon:
         def verify(phase):
             if evidence_root(verify_command) is None:
                 return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
-                                           raise_setup_errors=True)
+                                           raise_setup_errors=True,
+                                           trusted_public_python=public_execution)
             return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
-                                       raise_setup_errors=True, evidence_identity={
+                                       raise_setup_errors=True,
+                                       trusted_public_python=public_execution,
+                                       evidence_identity={
                 "job_id": assignment.get("job_id"), "role": "validator",
                 "assignment_id": assignment.get("assignment_id"), "phase": phase,
                 "validation_run_id": validation_run_id,

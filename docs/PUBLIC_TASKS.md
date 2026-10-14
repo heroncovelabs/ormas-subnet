@@ -163,8 +163,12 @@ and validator operator. Completion remains pending until the frozen acceptance
 policy is satisfied. The gateway is the receipt and settlement authority.
 
 New languages, interfaces and environments expand through versioned qualifications.
-An in-flight task keeps its frozen catalog and checker policy. Changing its check or
-environment requires a new agreement.
+An in-flight task normally keeps its frozen catalog and checker policy. A verifier
+compiler security revocation overrides execution compatibility: inventory and drain
+or expire affected queued, leased and recovery-pending packets, recompile the frozen
+inputs with an active compiler, and requeue under a new agreement. Keep the original
+packet as audit evidence rather than accepting or rewriting it in place. Other check
+or environment changes also require a new agreement.
 
 ## Offers and payment
 

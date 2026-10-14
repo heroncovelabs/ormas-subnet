@@ -81,21 +81,15 @@ def make_shell_solver(command: str, *, commit_message: str = "ormas-subnet: refe
 
 
 def _changed_paths(workdir: Path) -> list[str]:
-    # NOT `_run_git` here: its shared helper strips the *whole* stdout blob,
-    # which — when the porcelain output's first line legitimately starts with
-    # a status-code space (e.g. " M out.txt") — eats that leading column and
-    # shifts every fixed-width `line[3:]` slice by one character. Parse the
-    # raw, unstripped subprocess output instead so the "skip the 2-char XY +
-    # 1 space" slice lines up. (This self-report is a cross-check only now —
-    # `MinerSkeleton._compute_scope` treats `git diff` as ground truth — but a
-    # cross-check that is wrong on every call isn't worth having.)
-    proc = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=str(workdir), capture_output=True, text=True, check=False,
-    )
-    if proc.returncode != 0:
+    # `_run_git` removes only trailing line terminators, preserving the leading
+    # status-code space used by porcelain output while pinning the executable
+    # and stripping ambient service authority.
+    try:
+        output = _run_git(["status", "--porcelain"], cwd=workdir)
+    except GitError:
         return []
     paths: list[str] = []
-    for line in proc.stdout.splitlines():
+    for line in output.splitlines():
         if len(line) > 3:
             paths.append(line[3:].strip())
     return paths

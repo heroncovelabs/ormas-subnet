@@ -19,7 +19,16 @@ Installing this candidate does not activate it in production.
 ## Prerequisites
 
 - Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). A **legacy validator** host additionally needs every Python minor a client may declare in a packet `toolchain` installed as `python3.X` on `PATH` (today: `python3.12`); a declared interpreter that is missing makes the validator post `error` for that assignment, which is excluded from quorum. Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
-- `git` on `PATH`; the legacy credential route also needs an `ssh` client. Bounded-packet (public-profile) jobs publish through the gateway: public-repository jobs clone anonymously; private-repository jobs use a per-job read credential for both miners and validators. A legacy unbound claim carries `repo_credential`; the bind fallback uses access you already hold.
+- A system `git`; the legacy credential route also needs a system `ssh`, and a
+  bounded-packet validator needs a system `python3` and the Docker CLI. Privileged
+  calls ignore inherited `PATH` and resolve these programs only from `/usr/bin`,
+  `/bin` or `/usr/local/bin`.
+  The resolved program must be a regular executable whose file and parent path the
+  service account cannot modify. Unsupported layouts and a root service account fail
+  closed. Bounded-packet jobs publish through the gateway: public-repository jobs
+  clone anonymously; private-repository jobs use a per-job read credential for both
+  miners and validators. A legacy unbound claim carries `repo_credential`; the bind
+  fallback uses access you already hold.
 - A runner key (starts `ormr_`). Mint it yourself: sign in at [ormas.ai](https://ormas.ai), open **Miner → Runner keys**, and create a key. It is shown once; save it with `ormas-miner login`. A new key is **register-only** (daily claim cap 0): it can register your miner and hotkey and submit qualification evidence against `https://api.ormas.ai`, but job claims return 429 until the operator approves your qualification and raises the cap (see [`CONTRACT.md`](CONTRACT.md)). Keys expire after 30 days; mint a new one on the same page. A project id and base commit are needed only for the bind fallback.
 
 ## Install (recommended)
