@@ -32,7 +32,7 @@ from .validator import (
     make_ed25519_signer,
 )
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 __all__ = [
     "__version__",
