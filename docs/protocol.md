@@ -569,7 +569,14 @@ is SHA256 over the entire framed body. A successful JSON response includes the
 canonical `result_ref`, `result_commit`, `tree_sha` and `artifact_sha256`.
 The SDK's `outcomes_support.build_public_artifact` is the executable serializer;
 only committed regular files within allowed scope and the frozen publication bounds
-are admitted. Raw Git packs, symlinks and submodules are not this protocol.
+are admitted. The SDK first checks the canonical packet body against
+`work_packet_sha256`, taking a detached JSON snapshot so nested policy data cannot be
+changed by the solver. Before it reads a result blob or writes artifact bytes, it
+recomputes the rename-disabled final-tree diff from the frozen base and rejects paths
+outside `allowed_paths` or within `immutable_paths`. A failed scope check produces a
+failed completion with no result ref, result commit or settled price. Raw Git packs,
+symlinks and submodules are not this protocol. Intermediate solver commits are not
+serialized; the gateway creates one result commit directly on the frozen base.
 
 The gateway holds the saved repository write token, creates the canonical
 `refs/heads/ormas/job/<task_id>` result and verifies its exact tree and sole base
@@ -591,7 +598,19 @@ retains a tombstone. An interruption before the artifact was saved reports abort
 with an unknown outcome. Corrupt/unsafe journal state refuses further work rather
 than guessing. No journal creates a second queue or settlement receipt.
 
+Recovery records created before the scope-gated artifact format (journal version 1)
+do not prove that the frozen immutable-path policy was checked. A restart can still
+turn a pre-artifact record into an aborted completion, but holds version 1 artifact
+and completion records for operator reconciliation instead of uploading or settling
+them. Drain or reconcile those records before upgrading a miner with retained work.
+
 ### Legacy toolchain and repository credentials
+
+The legacy publisher rechecks its final-tree diff against `allowed_paths` before it
+creates or pushes a result ref. The legacy route publishes the solver's commit graph,
+so a path changed and restored in an intermediate commit is outside that final-tree
+check. Miners that require history-level exclusion should publish a squashed result
+or use the bounded artifact route, whose canonical result contains no solver history.
 
 `work_packet` may carry an optional **`toolchain`** block the client declared at
 prepare time (protocol addition 2026-09-14):

@@ -177,7 +177,7 @@ def test_private_v2_postpublication_fetch_uses_read_key_and_checks_topology(
     monkeypatch.setattr(sk, "_build_public_artifact", artifact)
     ref, result = _miner(tmp_path, Client())._publish_public(
         SimpleNamespace(lease_id="lease"), _draft("private", _credential()),
-        tmp_path, sk.SolveResult(RESULT),
+        tmp_path, sk.SolveResult(RESULT), capture={"scope_ok": True},
     )
     assert ref == "refs/heads/ormas/job/job_private"
     assert result.result_commit == RESULT

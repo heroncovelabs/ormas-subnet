@@ -242,8 +242,21 @@ def _public_packet(draft):
     packet = dict(raw) if isinstance(raw, Mapping) else {}
     if not has_public_execution(packet):
         return None
+    try:
+        encoded = json.dumps(
+            packet, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+            allow_nan=False,
+        ).encode('utf-8')
+        packet = json.loads(encoded)
+    except (TypeError, ValueError):
+        raise GitError('invalid public work packet') from None
+    if getattr(draft, 'work_packet_sha256', None) != hashlib.sha256(encoded).hexdigest():
+        raise GitError('public draft packet hash mismatch')
     validate_public_execution_packet(packet)
-    if draft.base_commit != packet['execution_policy']['repo_base_sha'] or draft.verify_command != packet['verification_command']:
+    policy = packet['execution_policy']
+    if (draft.base_commit != policy['repo_base_sha']
+            or draft.verify_command != packet['verification_command']
+            or tuple(draft.allowed_paths) != tuple(policy['allowed_paths'])):
         raise GitError('public draft contract mismatch')
     return packet
 
@@ -727,6 +740,13 @@ class MinerSkeleton:
         return workdir
 
     def _publish(self, task_id: str, workdir: Path, result: SolveResult, draft: TaskDraft | None = None) -> str:
+        if draft is None:
+            raise GitError('publication scope decision required')
+        scope_ok, _changed_paths = self._compute_scope(
+            workdir, draft, result, warn_on_mismatch=False,
+        )
+        if not scope_ok:
+            raise GitError('publication scope validation failed')
         branch = f"ormas/job/{task_id}"
         _run_git(["branch", "-f", branch, result.result_commit], cwd=workdir)
         if draft is not None and getattr(draft, "repo_credential", None) and draft.repo_url:
@@ -746,6 +766,8 @@ class MinerSkeleton:
         return f"{_RESULT_REF_LOCAL}{task_id}"
 
     def _publish_public(self, lease, draft, workdir, result, *, capture=None):
+        if not isinstance(capture, Mapping) or capture.get('scope_ok') is not True:
+            raise GitError('public publication scope validation failed')
         store = self._public_recovery
         with ExitStack() as stack:
             if store is not None:
@@ -804,44 +826,51 @@ class MinerSkeleton:
         return hashlib.sha256(diff.encode("utf-8")).hexdigest()
 
     def _compute_scope(
-        self, workdir: Path, draft: TaskDraft, result: SolveResult,
+        self,
+        workdir: Path,
+        draft: TaskDraft,
+        result: SolveResult,
+        *,
+        warn_on_mismatch: bool = True,
     ) -> tuple[bool, tuple[str, ...]]:
         """Compute ``scope_ok``/``changed_paths`` for real, from git — not the solver's say-so.
 
         ``changed_paths`` is the literal, rename-disabled path union between
-        ``base_commit`` and ``result_commit``.
-        in the workdir: the ground truth of what actually landed. The solver's
+        ``base_commit`` and ``result_commit`` in the workdir: the ground truth
+        of what actually landed. The solver's
         own ``SolveResult.changed_paths`` is used only as a cross-check; a
         mismatch is warned (never silently trusted over git — a solver could be
-        wrong or lying about its own diff). ``scope_ok`` is vacuously ``True``
-        when ``draft.allowed_paths`` is empty (no restriction declared),
-        otherwise every changed path must be covered by an entry
-        (`_path_covered_by_allowed`, mirroring the private policy's directory-
-        prefix-vs-exact-match rule).
+        wrong or lying about its own diff). ``scope_ok`` requires every changed
+        path to be covered by ``allowed_paths`` when that list is nonempty.
+        Public packets additionally reject every change covered by their frozen
+        ``immutable_paths``. Coverage uses ``_path_covered_by_allowed``, mirroring
+        the private policy's directory-prefix-vs-exact-match rule.
         """
-        try:
+        packet = _public_packet(draft)
+        if packet is not None:
+            from .outcomes_support import public_result_scope
+            scope_ok, changed_paths = public_result_scope(
+                packet, workdir, result.result_commit,
+            )
+        else:
             diff_out = _run_git(
                 ["diff", "--no-ext-diff", "--no-textconv",
                  "--name-only", "--no-renames", "-z",
                  draft.base_commit, result.result_commit, "--"], cwd=workdir,
             )
             changed_paths = _nul_git_paths(diff_out)
-        except GitError:
-            raise
+            allowed = tuple(draft.allowed_paths)
+            scope_ok = ((not allowed)
+                        or all(_path_covered_by_allowed(p, allowed) for p in changed_paths))
         reported = set(result.changed_paths)
         actual = set(changed_paths)
-        if reported != actual:
+        if warn_on_mismatch and reported != actual:
             warnings.warn(
                 "solve()-reported changed_paths "
                 f"{sorted(reported)} does not match git diff {sorted(actual)}; "
                 "using git diff as ground truth for scope_ok",
                 stacklevel=2,
             )
-        allowed = tuple(draft.allowed_paths)
-        if not allowed:
-            scope_ok = True
-        else:
-            scope_ok = all(_path_covered_by_allowed(p, allowed) for p in changed_paths)
         return scope_ok, changed_paths
 
     # ------------------------------------------------------------------
@@ -1222,13 +1251,19 @@ class MinerSkeleton:
             # Its provider outcome is unknown, so do not call the solver again.
             self._report_lease_failure(lease, draft, RecoveryRequired('public execution interrupted'), start)
             return self._public_recovery.pending() is None
+        if pending.get('version') != 2:
+            raise RecoveryRequired(
+                'legacy public recovery lacks frozen publication scope authorization'
+            )
         if pending['stage'] == 'artifact':
             workdir = self.config.workdir_root / draft.task_id
             if workdir.is_symlink() or not workdir.is_dir():
                 raise RecoveryRequired('public recovery checkout is missing or unsafe')
             try:
                 result_ref, result = self._publish_public(
-                    lease, draft, workdir, SolveResult(**pending['result']))
+                    lease, draft, workdir, SolveResult(**pending['result']),
+                    capture=pending['capture'],
+                )
             except OrmasGatewayError as exc:
                 if exc.status_code != 409 or exc.error_type != 'lease_lost':
                     raise
@@ -1262,6 +1297,10 @@ class MinerSkeleton:
         return float(min(limit, price))
 
     def _freeze_public_completion(self, lease, result_ref, result, capture):
+        if capture.get('scope_ok') is not True and (
+            result_ref is not None or result.result_commit
+        ):
+            raise GitError('publication scope validation failed')
         terminal = TaskTerminal(lease_id=lease.lease_id,
             verification_state=capture['status'], result_ref=result_ref,
             settlement_state='unset', rating=None, result_commit=result.result_commit,
@@ -1403,8 +1442,14 @@ class MinerSkeleton:
             if result.failure_class is not None:
                 capture["failure_class"] = result.failure_class
 
-            if packet is not None:
-                result_ref, result = self._publish_public(lease, draft, workdir, result, capture=capture)
+            if not scope_ok:
+                capture["failure_class"] = "scope_violation"
+                result_ref = None
+                result = replace(result, result_commit="")
+            elif packet is not None:
+                result_ref, result = self._publish_public(
+                    lease, draft, workdir, result, capture=capture,
+                )
             else:
                 result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
             receipt, terminal = self._freeze_public_completion(lease, result_ref, result, capture)
