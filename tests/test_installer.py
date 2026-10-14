@@ -288,16 +288,14 @@ def test_truncated_download_has_no_install_side_effects(setup):
 
 
 def test_real_pip_upgrade_of_fixed_version_offline(tmp_path):
-    env = dict(os.environ, PIP_NO_INDEX="1", PIP_NO_BUILD_ISOLATION="1",
+    # pip's negative option uses false to select --no-build-isolation; a truthy
+    # value re-enables isolation and makes this offline fixture depend on cache.
+    env = dict(os.environ, PIP_NO_INDEX="1", PIP_NO_BUILD_ISOLATION="false",
                PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
     env["PATH"] = "/Library/Developer/CommandLineTools/usr/bin:" + env.get("PATH", os.defpath)
     git = shutil.which("git", path=env["PATH"])
     if not git:
         pytest.skip("git is unavailable")
-    probe = subprocess.run([sys.executable, "-c", "import pip, setuptools, wheel"],
-                           env=env, capture_output=True, text=True)
-    if probe.returncode:
-        pytest.skip("offline pip build tools are unavailable")
     repo = tmp_path / "source"
     repo.mkdir()
     (repo / "setup.py").write_text(
@@ -327,6 +325,10 @@ def test_real_pip_upgrade_of_fixed_version_offline(tmp_path):
     venv = home / ".ormas-miner/venv"
     subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
                    env=env, check=True, capture_output=True, text=True)
+    probe = subprocess.run([str(venv / "bin/python"), "-c", "import pip, setuptools, wheel"],
+                           env=env, capture_output=True, text=True)
+    if probe.returncode:
+        pytest.skip("offline pip build tools are unavailable in the installer environment")
     script = tmp_path / "install-local.sh"
     script.write_text(INSTALLER.read_text().replace(
         "https://github.com/heroncovelabs/ormas-subnet", repo.as_uri()))
