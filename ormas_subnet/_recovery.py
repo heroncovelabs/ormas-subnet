@@ -5,6 +5,7 @@ miner must resolve its current record before claiming another lease.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 import hashlib
 import json
@@ -81,7 +82,7 @@ class PublicRecovery:
                 envelope = json.loads(source.read(1_048_577))
             body = envelope["record"]
             if (envelope["sha256"] != hashlib.sha256(_encoded(body)).hexdigest()
-                    or body["version"] != 1 or body["gateway"] != self.namespace
+                    or body["version"] not in {1, 2} or body["gateway"] != self.namespace
                     or body["runner_id"] != self.runner_id
                     or body["stage"] not in {"claimed", "artifact", "completion"}
                     or any(not isinstance(body[key], str) or not body[key]
@@ -121,7 +122,9 @@ class PublicRecovery:
             if previous["packet_hash"] != draft.work_packet_sha256:
                 raise RecoveryRequired("repeated public lease changed its packet")
             raise RecoveryRequired("gateway re-served an acknowledged public lease")
-        body = {"version": 1, "gateway": self.namespace, "runner_id": self.runner_id,
+        # Version 2 records are created only by miners whose artifact builder
+        # independently enforces the frozen allowed/immutable path policy.
+        body = {"version": 2, "gateway": self.namespace, "runner_id": self.runner_id,
                 "task_id": draft.task_id, "lease_id": lease.lease_id,
                 "packet_hash": draft.work_packet_sha256, "base_commit": draft.base_commit,
                 "repo_url": draft.repo_url, "stage": "claimed"}
@@ -131,6 +134,8 @@ class PublicRecovery:
         return body
 
     def checkpoint_artifact(self, build, *, result, capture):
+        if not isinstance(capture, Mapping) or capture.get("scope_ok") is not True:
+            raise RecoveryRequired("public artifact requires passing frozen scope")
         body = self.pending()
         if body is None or body["stage"] != "claimed":
             raise RecoveryRequired("public artifact checkpoint has no claimed lease")
