@@ -191,9 +191,19 @@ def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
     # again when the validator checks out the result.  GIT_SSH_COMMAND and other
     # explicit call-site settings are preserved above.
     git_env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    git_env["GIT_CONFIG_COUNT"] = "1"
-    git_env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
-    git_env["GIT_CONFIG_VALUE_0"] = os.devnull
+    command_config = (
+        ("core.hooksPath", os.devnull),
+        ("core.fsmonitor", "false"),
+        ("credential.helper", ""),
+        ("protocol.ext.allow", "never"),
+        ("user.name", "Ormas Reference Miner"),
+        ("user.email", "reference-miner@ormas.invalid"),
+        ("commit.gpgSign", "false"),
+    )
+    git_env["GIT_CONFIG_COUNT"] = str(len(command_config))
+    for index, (key, value) in enumerate(command_config):
+        git_env[f"GIT_CONFIG_KEY_{index}"] = key
+        git_env[f"GIT_CONFIG_VALUE_{index}"] = value
     proc = subprocess.run(
         [str(git), *args], cwd=str(cwd), capture_output=True, text=True,
         encoding="utf-8", errors="surrogateescape", check=False, env=git_env,
@@ -263,33 +273,29 @@ def _credential_git_env(credential: Mapping[str, Any] | None) -> Iterator[dict[s
     if not isinstance(private_key, str) or not private_key:
         yield None
         return
-    key_dir = tempfile.mkdtemp(prefix="ormas-job-key-")
-    path = os.path.join(key_dir, "id_job")
-    try:
+    with tempfile.TemporaryDirectory(prefix="ormas-job-key-") as key_dir:
+        path = os.path.join(key_dir, "id_job")
+        hosts = os.path.join(key_dir, "known_hosts")
         try:
             ssh = trusted_executable("ssh")
         except TrustedExecutableUnavailable as exc:
             raise GitError("trusted ssh executable unavailable") from exc
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            payload = private_key if private_key.endswith("\n") else private_key + "\n"
-            os.write(fd, payload.encode())
-        finally:
-            os.close(fd)
-        os.chmod(path, 0o600)
+        for target, payload in ((path, private_key), (hosts, "")):
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                if payload:
+                    body = payload if payload.endswith("\n") else payload + "\n"
+                    os.write(fd, body.encode())
+            finally:
+                os.close(fd)
         yield {"GIT_SSH_COMMAND": shlex.join([
-            str(ssh), "-i", path, "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+            str(ssh), "-F", os.devnull, "-i", path,
+            "-o", "IdentityAgent=none", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=" + hosts,
+            "-o", "GlobalKnownHostsFile=" + os.devnull,
+            "-o", "BatchMode=yes",
         ])}
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        try:
-            os.rmdir(key_dir)
-        except OSError:
-            pass
 
 
 def _build_receipt(lease_id: str, result: SolveResult) -> TaskReceipt:
@@ -766,7 +772,10 @@ class MinerSkeleton:
         if not base_commit or not result_commit:
             return None
         try:
-            diff = _run_git(["diff", base_commit, result_commit], cwd=workdir)
+            diff = _run_git(
+                ["diff", "--no-ext-diff", "--no-textconv", base_commit, result_commit],
+                cwd=workdir,
+            )
         except GitError:
             return None
         return hashlib.sha256(diff.encode("utf-8")).hexdigest()
@@ -789,7 +798,8 @@ class MinerSkeleton:
         """
         try:
             diff_out = _run_git(
-                ["diff", "--name-only", "--no-renames", "-z",
+                ["diff", "--no-ext-diff", "--no-textconv",
+                 "--name-only", "--no-renames", "-z",
                  draft.base_commit, result.result_commit, "--"], cwd=workdir,
             )
             changed_paths = _nul_git_paths(diff_out)

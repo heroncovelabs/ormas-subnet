@@ -35,6 +35,65 @@ class RuntimeRefusal(Exception):
     pass
 
 
+_SYSTEM_EXECUTABLE_DIRS = (Path('/usr/bin'), Path('/bin'), Path('/usr/local/bin'))
+
+
+def _path_lineage(path):
+    while True:
+        yield path
+        if path.parent == path:
+            return
+        path = path.parent
+
+
+def _service_can_write(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return True
+    groups = {os.getegid(), *os.getgroups()}
+    if info.st_uid == os.geteuid():
+        mode_write = info.st_mode & stat.S_IWUSR
+    elif info.st_gid in groups:
+        mode_write = info.st_mode & stat.S_IWGRP
+    else:
+        mode_write = info.st_mode & stat.S_IWOTH
+    if mode_write:
+        return True
+    try:
+        return os.access(path, os.W_OK, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        return os.access(path, os.W_OK)
+
+
+def _trusted_executable(name):
+    """Resolve a host tool from fixed system paths that this UID cannot replace."""
+    if name not in {'git', 'docker'}:
+        raise RuntimeRefusal('runtime_executable_unavailable')
+    for directory in _SYSTEM_EXECUTABLE_DIRS:
+        candidate = directory / name
+        try:
+            resolved = candidate.resolve(strict=True)
+            info = resolved.stat()
+        except OSError:
+            continue
+        protected = (*_path_lineage(candidate.parent), *_path_lineage(resolved))
+        if (not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK)
+                or any(_service_can_write(path) for path in protected)):
+            continue
+        return resolved
+    raise RuntimeRefusal('runtime_executable_unavailable')
+
+
+def _host_environment(git, docker):
+    trusted_path = os.pathsep.join(dict.fromkeys((str(Path(git).parent),
+                                                  str(Path(docker).parent))))
+    return {"PATH": trusted_path, "HOME": "/nonexistent", "LANG": "C.UTF-8",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 # These helpers live in the client-owned driver, never in the candidate. The
 # socket is mounted only there. Requests can execute only in the named candidate
 # container; neither host commands nor driver paths are accepted by the bridge.
@@ -275,13 +334,13 @@ request.end(Buffer.from(cfg.body, "base64"));
 
 _CLEANUP_GUARD = r'''
 import json,os,shutil,subprocess,sys,time
-parent,seconds,scratch,containers,volumes=json.loads(sys.argv[1])
+parent,seconds,scratch,containers,volumes,docker=json.loads(sys.argv[1])
 deadline=time.monotonic()+seconds
 while time.monotonic()<deadline:
     try: os.kill(parent,0)
     except ProcessLookupError: break
     time.sleep(.2)
-for argv in (['docker','rm','-f',*containers],['docker','volume','rm',*volumes]):
+for argv in ([docker,'rm','-f',*containers],[docker,'volume','rm',*volumes]):
     try: subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15)
     except (OSError,subprocess.TimeoutExpired): pass
 if os.path.isdir(scratch):
@@ -780,10 +839,10 @@ def _source_file(root_fd, name, directory_modes):
         os.close(fd)
 
 
-def safe_git_argv(*args):
+def safe_git_argv(git, *args):
     # Command-line settings override repository config, including includes. Git's
     # fsmonitor is executable code even for an otherwise read-only ls-files/status.
-    return ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    return [git, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
             '-c', 'core.excludesFile=/dev/null', *args]
 
 
@@ -797,8 +856,8 @@ def validate_repository_gitlinks(value):
     return dict(value)
 
 
-def _indexed_gitlinks(source, deadline, env):
-    code, raw = _bounded(safe_git_argv('ls-files', '--stage', '-z'),
+def _indexed_gitlinks(source, deadline, env, git):
+    code, raw = _bounded(safe_git_argv(git, 'ls-files', '--stage', '-z'),
                         cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
     if code:
         raise RuntimeRefusal('source_inventory_unavailable')
@@ -832,14 +891,14 @@ def _empty_gitlink(root_fd, name, directory_modes):
         os.close(fd)
 
 
-def _snapshot(source, target, cfg, deadline, env):
+def _snapshot(source, target, cfg, deadline, env, git):
     # Unversioned exclusions are not transferable to a fresh validator clone.
     # Refuse them instead of silently hiding material or exposing ignored files.
-    code, local_excludes = _bounded(safe_git_argv('config', '--local', '--includes', '--get', 'core.excludesFile'),
+    code, local_excludes = _bounded(safe_git_argv(git, 'config', '--local', '--includes', '--get', 'core.excludesFile'),
                                     cwd=source, deadline=deadline, cap=4096, env=env)
     if code == 0 and local_excludes.strip():
         raise RuntimeRefusal('repository_exclusion_override_unsupported')
-    code, exclude_path = _bounded(safe_git_argv('rev-parse', '--git-path', 'info/exclude'),
+    code, exclude_path = _bounded(safe_git_argv(git, 'rev-parse', '--git-path', 'info/exclude'),
                                   cwd=source, deadline=deadline, cap=4096, env=env)
     if code:
         raise RuntimeRefusal('source_inventory_unavailable')
@@ -851,13 +910,13 @@ def _snapshot(source, target, cfg, deadline, env):
             raise RuntimeRefusal('repository_exclusion_override_unsupported')
         if any(line.strip() and not line.lstrip().startswith('#') for line in path.read_text().splitlines()):
             raise RuntimeRefusal('repository_exclusion_override_unsupported')
-    code, raw = _bounded(safe_git_argv("ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+    code, raw = _bounded(safe_git_argv(git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"),
                          cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
     if code:
         raise RuntimeRefusal("source_inventory_unavailable")
     names = sorted(set(os.fsdecode(n) for n in raw.split(b"\0") if n))
     gitlinks = validate_repository_gitlinks(cfg.get('repository_gitlinks', {}))
-    if _indexed_gitlinks(source, deadline, env) != gitlinks:
+    if _indexed_gitlinks(source, deadline, env, git) != gitlinks:
         raise RuntimeRefusal('repository_gitlink_changed')
     if len(names) > cfg["limits"]["max_files"]:
         raise RuntimeRefusal("source_file_limit")
@@ -1071,15 +1130,12 @@ def run_verifier(cfg, *, cwd=None):
     source = Path(cwd or os.getcwd()).resolve()
     deadline = time.monotonic() + cfg["limits"]["timeout_s"]
     cap = cfg["limits"]["output_bytes"]
-    host_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home()),
-                "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    for exe in ("docker", "git"):
-        path = shutil.which(exe, path=host_env["PATH"])
-        if path is None or Path(path).resolve().is_relative_to(source):
-            raise RuntimeRefusal("runtime_executable_unavailable")
     uid, gid = os.getuid(), os.getgid()
     if uid == 0:
         raise RuntimeRefusal("runtime_nonroot_required")
+    git = str(_trusted_executable('git'))
+    docker = str(_trusted_executable('docker'))
+    host_env = _host_environment(git, docker)
     token = "ormas-verify-" + uuid.uuid4().hex
     verifier, installer, volume = token + "-check", token + "-install", token + "-data"
     candidate_container, driver_volume = token + '-candidate', token + '-driver'
@@ -1096,7 +1152,8 @@ def run_verifier(cfg, *, cwd=None):
     # verifier. It has only this invocation's exact container/volume/temp names.
     guard = subprocess.Popen([sys.executable, '-I', '-S', '-c', _CLEANUP_GUARD,
                               json.dumps([os.getpid(), cfg['limits']['timeout_s'] + 40, str(scratch),
-                                          [installer, verifier, candidate_container], [volume, driver_volume]])],
+                                          [installer, verifier, candidate_container],
+                                          [volume, driver_volume], docker])],
                              cwd='/', env=host_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
 
@@ -1112,7 +1169,7 @@ def run_verifier(cfg, *, cwd=None):
     try:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             old_handlers[sig] = signal.signal(sig, cancel)
-        _snapshot(source, candidate, cfg, deadline, host_env)
+        _snapshot(source, candidate, cfg, deadline, host_env, git)
         driver = scratch / 'driver'
         driver.mkdir()
         acceptance_projection(candidate, driver, cfg)
@@ -1121,7 +1178,7 @@ def run_verifier(cfg, *, cwd=None):
         report_path = '/tmp/' + uuid.uuid4().hex + '.xml'
         test_argv, report_kind = structured_test_argv(cfg, driver, report_path)
         fetch_dependencies(cfg, candidate, artifacts, deadline)
-        code, info = command(["docker", "info", "--format", "{{json .}}"], required=False)
+        code, info = command([docker, "info", "--format", "{{json .}}"], required=False)
         try:
             runtime_info = json.loads(info)
         except (ValueError, UnicodeError):
@@ -1134,27 +1191,27 @@ def run_verifier(cfg, *, cwd=None):
         # Docker. Only projection readers need it. Candidate processes retain
         # their nonzero UID and original group, distinct from the keeper/probe.
         reader_gid = 0 if rootless else gid
-        code, _ = command(["docker", "image", "inspect", cfg["image"]], required=False)
+        code, _ = command([docker, "image", "inspect", cfg["image"]], required=False)
         if code:
-            command(["docker", "pull", "--platform", cfg["platform"], cfg["image"]])
+            command([docker, "pull", "--platform", cfg["platform"], cfg["image"]])
         # Reap only expired volumes from this primitive. Docker refuses a volume
         # still in use, so concurrent current executions cannot lose their data.
-        _, old_volumes = command(["docker", "volume", "ls", "-q", "--filter", "label=ormas.verifier=v1"])
+        _, old_volumes = command([docker, "volume", "ls", "-q", "--filter", "label=ormas.verifier=v1"])
         for old_volume in old_volumes.decode().splitlines():
-            code, metadata = command(["docker", "volume", "inspect", old_volume], required=False)
+            code, metadata = command([docker, "volume", "inspect", old_volume], required=False)
             # Another verifier can remove its finished volume after the list.
             # Reaping is opportunistic; never delete an uninspected volume.
             if code:
                 continue
             expiry = json.loads(metadata)[0].get("Labels", {}).get("ormas.expires", "")
             if expiry.isdigit() and int(expiry) < int(time.time()):
-                command(["docker", "volume", "rm", old_volume], required=False)
+                command([docker, "volume", "rm", old_volume], required=False)
         for name in (volume, driver_volume):
-            command(["docker", "volume", "create", "--driver", "local", "--label", "ormas.verifier=v1",
+            command([docker, "volume", "create", "--driver", "local", "--label", "ormas.verifier=v1",
                      "--label", f"ormas.expires={int(time.time()) + cfg['limits']['timeout_s'] + 60}",
                      "--opt", "type=tmpfs", "--opt", "device=tmpfs", "--opt",
                      f"o=size={max(1, min(cfg['limits']['disk_mib'] // 4, cfg['limits']['memory_mib'] // 4))}m,uid={uid},gid={gid},mode=0700", name])
-        common = ["docker", "run", "--rm", "--pull", "never", "--platform", cfg["platform"],
+        common = [docker, "run", "--rm", "--pull", "never", "--platform", cfg["platform"],
                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
                   "--tmpfs", "/tmp:rw,exec,size=256m", "--memory", f"{max(1, cfg['limits']['memory_mib'] // 4)}m",
                   "--cpus", str(cfg["limits"]["cpus"] / 2), "--pids-limit", "128", "--shm-size", "128m",
@@ -1173,7 +1230,7 @@ def run_verifier(cfg, *, cwd=None):
         def observe(argv, call_deadline, call_cap):
             # CLI options end at the fixed container id. Client argv never reaches
             # the host shell or controls Docker options/container selection.
-            return _bounded(['docker', 'exec', '--user', f'{uid}:{gid}', candidate_container, '/usr/bin/timeout', '--signal=KILL',
+            return _bounded([docker, 'exec', '--user', f'{uid}:{gid}', candidate_container, '/usr/bin/timeout', '--signal=KILL',
                              str(max(1, int(call_deadline - time.monotonic())))] + argv,
                             cwd=scratch, deadline=call_deadline, cap=call_cap, env=host_env)
         bridge = CandidateBridge(bridge_root / 'socket', observe, deadline=deadline, cap=cap)
@@ -1197,7 +1254,7 @@ def run_verifier(cfg, *, cwd=None):
                 # Prove the selected daemon's actual namespace mapping before
                 # granting group access or running anything from the checkout.
                 for kind, host_id in (('uid', uid), ('gid', gid)):
-                    _, mapping = command(['docker', 'exec', '--user', f'{uid}:{gid}', name,
+                    _, mapping = command([docker, 'exec', '--user', f'{uid}:{gid}', name,
                                           '/bin/cat', f'/proc/self/{kind}_map'], limit=4096)
                     _check_rootless_map(mapping, host_id)
                 for projection_root in (candidate, driver, artifacts, helpers):
@@ -1226,7 +1283,7 @@ def run_verifier(cfg, *, cwd=None):
                         'timeout_ms': max(1, int((call_deadline - time.monotonic()) * 1000) - 250)}
                 argument = base64.b64encode(json.dumps(spec, separators=(',', ':')).encode()).decode()
                 code, raw = _bounded(
-                    ['docker', 'exec', '--user', f'{probe_uid}:{probe_uid}', '--workdir', '/',
+                    [docker, 'exec', '--user', f'{probe_uid}:{probe_uid}', '--workdir', '/',
                      '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', candidate_container,
                      '/usr/bin/node', '-e', NODE_HTTP_PROBE, argument],
                     cwd=scratch, env=host_env, deadline=call_deadline,
@@ -1243,7 +1300,7 @@ def run_verifier(cfg, *, cwd=None):
                 except (ValueError, TypeError, KeyError):
                     raise RuntimeRefusal('candidate_http_response_invalid') from None
             service = CandidateService(
-                ['docker', 'exec', '--user', f'{uid}:{gid}', '--workdir', '/work',
+                [docker, 'exec', '--user', f'{uid}:{gid}', '--workdir', '/work',
                  '-e', 'PORT=' + str(frozen['port']), '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=',
                  candidate_container, '/usr/bin/node', *frozen['argv'][1:]],
                 cwd=scratch, env=host_env, deadline=deadline)
@@ -1259,7 +1316,7 @@ def run_verifier(cfg, *, cwd=None):
                         raise
                     time.sleep(.1)
             bridge.http_execute = http_observe
-        code, output = command(["docker", "exec", '--user', f'{uid}:{reader_gid}', verifier] + test_argv, required=False)
+        code, output = command([docker, "exec", '--user', f'{uid}:{reader_gid}', verifier] + test_argv, required=False)
         # Drain any observation already accepted by the host before deciding.
         # A late transport/refusal result must not be hidden by a test report.
         bridge.close()
@@ -1267,7 +1324,7 @@ def run_verifier(cfg, *, cwd=None):
         sys.stdout.buffer.flush()
         report = output
         if report_kind == 'junit-file':
-            report_code, report = command(['docker', 'exec', verifier, 'cat', report_path], required=False)
+            report_code, report = command([docker, 'exec', verifier, 'cat', report_path], required=False)
             if report_code:
                 raise RuntimeRefusal('structured_test_report_missing')
         outcome = structured_result(report_kind, report)
@@ -1287,7 +1344,8 @@ def run_verifier(cfg, *, cwd=None):
         return 86 if outcome == 'assertion' else 0
     finally:
         # Cleanup has its own small deadline even after the test exhausts its budget.
-        for argv in (["docker", "rm", "-f", installer, verifier, candidate_container], ["docker", "volume", "rm", volume, driver_volume]):
+        for argv in ([docker, "rm", "-f", installer, verifier, candidate_container],
+                     [docker, "volume", "rm", volume, driver_volume]):
             try:
                 subprocess.run(argv, env=host_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
             except (OSError, subprocess.TimeoutExpired):
