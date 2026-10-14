@@ -1421,11 +1421,13 @@ class MinerSkeleton:
             raise RecoveryRequired("unknown own award bid")
         if bid.get("legacy"):
             return bid
-        if bid["status"] in {"withdrawn", "replaced", "no_capacity", "award_lapsed"}:
+        if bid["status"] in {
+            "not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed",
+        }:
             # These gateway-owned terminal states never reopen. Keeping them
             # locally sticky also blocks a two-step stale view
-            # (terminal -> open -> awarded). `not_awarded` remains pollable
-            # because the protocol explicitly permits that bid to reopen.
+            # (terminal -> open -> awarded). A new offer generation requires a
+            # new request identity; only requestless legacy bids may reopen.
             return bid
         response = self.client.get_offer(bid_id)
         status, award = response.get("status"), response.get("award_id")
@@ -1452,7 +1454,6 @@ class MinerSkeleton:
         lease, draft = claimed
         bid = state["bids"].get(lease.bid_id)
         legacy = False
-        reopened = False
         if bid is None:
             terms = next((offer for offer in legacy_offers if offer["job_id"] == lease.task_id), None)
             if terms is None:
@@ -1471,19 +1472,7 @@ class MinerSkeleton:
                 raise RecoveryRequired("lease award is from a superseded offer generation")
             current_id = state["current"].get(lease.task_id)
             if current_id != lease.bid_id:
-                current = state["bids"].get(current_id)
-                same_generation = (
-                    bid.get("status") == "not_awarded"
-                    and bid.get("offer_request_id") is not None
-                    and current is not None
-                    and current.get("offer_request_id") is not None
-                    and bid.get("offer_authority_epoch")
-                    == current.get("offer_authority_epoch")
-                    and bid.get("offer_window_id") == current.get("offer_window_id")
-                )
-                if not same_generation:
-                    raise RecoveryRequired("lease award is from a superseded offer generation")
-                reopened = True
+                raise RecoveryRequired("lease award is from a superseded offer generation")
             bid = self._read_bid(state, lease.bid_id)
         terms = bid["terms"]
         if (bid["status"] != "awarded" or lease.task_id != terms["job_id"]
@@ -1493,9 +1482,6 @@ class MinerSkeleton:
                 or lease.estimate_usd != (float(terms["estimate_usd"]) if terms["kind"] == "limit" else None)
                 or lease.limit_usd != (float(terms["limit_usd"]) if terms["kind"] == "limit" else None)):
             raise RecoveryRequired("lease award bid identity or frozen terms mismatch")
-        if reopened:
-            state["current"][lease.task_id] = lease.bid_id
-            self._save_offers(state)
         if legacy:
             if not isinstance(lease.bid_id, str) or not lease.bid_id:
                 raise RecoveryRequired("legacy offer lease has no bid identity")
@@ -1556,22 +1542,8 @@ class MinerSkeleton:
             bid = state["bids"].get(bid_id)
             if entry.get("awarded_to_you"):
                 awarded_id = entry.get("bid_id")
-                saved_award = state["bids"].get(awarded_id)
                 if state["current"].get(job_id) != awarded_id:
-                    current = state["bids"].get(state["current"].get(job_id))
-                    reopenable = (
-                        saved_award is not None
-                        and saved_award.get("status") == "not_awarded"
-                        and saved_award.get("offer_request_id") is not None
-                        and current is not None
-                        and current.get("offer_request_id") is not None
-                        and saved_award.get("offer_authority_epoch")
-                        == current.get("offer_authority_epoch")
-                        and saved_award.get("offer_window_id")
-                        == current.get("offer_window_id")
-                    )
-                    if not reopenable:
-                        raise RecoveryRequired("queue award is from a superseded offer generation")
+                    raise RecoveryRequired("queue award is from a superseded offer generation")
                 awarded = self._read_bid(state, awarded_id)
                 if (awarded["terms"]["job_id"] != job_id or awarded["status"] != "awarded"
                         or awarded.get("award_id") != entry.get("award_id")

@@ -647,21 +647,20 @@ def test_new_award_recovers_without_static_pricing(tmp_path, queue_view):
     assert all(body["offers"] == [] for body in claims(transport))
 
 
-def test_not_awarded_can_reopen_and_win_at_frozen_terms(tmp_path):
-    """e8b25616 allows a fresh bid while retaining recovery of an older award."""
+def test_request_id_not_awarded_cannot_reopen_into_a_later_bid(tmp_path):
     transport, miner = window_miner(tmp_path)
     assert miner.run_once() is False
     transport.bids["bid_1"]["status"] = "not_awarded"
     assert miner.run_once() is False
     assert len(offers(transport)) == 2
-    transport.bids["bid_1"]["status"] = "open"
-    assert miner.run_once() is False
-    assert len(offers(transport)) == 2
     transport.set_award("bid_1")
-    miner.config.offer_fn = lambda _: pytest.fail("a reopened award must retain its frozen terms")
-    assert miner.run_once() is True
+    miner.solve_fn = lambda *_: pytest.fail("a terminal request-ID bid cannot execute")
+
+    with pytest.raises(RecoveryRequired, match="superseded offer generation"):
+        miner.run_once()
+
     assert len(offers(transport)) == 2
-    assert transport.source.completed["terminal"]["verification_state"] == "verified"
+    assert transport.source.completed is None
 
 
 @pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed"])

@@ -494,21 +494,21 @@ next award or return to the queue. A miner may submit a fresh bid at identical t
 after observing its own `award_lapsed` status. Saved awards recover through this
 explicit status; other award identity mismatches require recovery. Pending offer
 POSTs and execution start/completion records retain their existing fences.
-Losing offers become `not_awarded`. If the earlier winner
-fails to claim, the gateway may reopen a `not_awarded` bid and award it at its
-frozen terms. The miner accepts that historical award only when its saved prior
-state was `not_awarded` and its epoch and window match the current saved v1 bid.
-It rejects historical awards from a different generation and bids already saved
-as withdrawn, replaced, no-capacity or award-lapsed. The gateway owns the valid
-status transitions. This route exposes no competitor book, reserve, model
-identity or provider cost.
+Losing request-ID offers become terminal `not_awarded` bids. If the earlier
+winner fails to claim, the gateway opens a fresh generation and the miner uses a
+fresh request ID, including for identical terms. Replaying the old request ID
+returns its original response and never reenters that bid into the current
+generation. During rollout, the gateway may reopen only a requestless legacy
+`not_awarded` bid at its frozen terms. The miner rejects a request-ID bid that
+later appears open or awarded. The gateway owns the valid status transitions.
+This route exposes no competitor book, reserve, model identity or provider cost.
 
 When the current queue page contains the job, every request-ID-bearing lease must
 match that page's authority epoch and window even if the bid is still the local
 `current` pointer or the queue omits `awarded_to_you`. An exact replay for an older
 generation is archived without becoming current, and the newer row is processed in
-the same poll. Saved `withdrawn`, `replaced`, `no_capacity` and `award_lapsed`
-states are locally terminal; only `not_awarded` retains the documented reopen path.
+the same poll. Saved request-ID `not_awarded`, `withdrawn`, `replaced`,
+`no_capacity` and `award_lapsed` states are locally terminal.
 
 ### `DELETE /api/runner/v1/offers/{bid_id}`
 
