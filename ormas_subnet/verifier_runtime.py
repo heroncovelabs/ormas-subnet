@@ -791,12 +791,15 @@ def installer_argv(profile_id):
     raise RuntimeRefusal('unsupported_runtime_profile')
 
 
-def _bounded(argv, *, cwd, deadline, cap, env=None):
+def _bounded(argv, *, cwd, deadline, cap, env=None, stderr_to_stdout=True):
     """Drain combined output without allowing a pipe or memory deadlock."""
     if time.monotonic() >= deadline:
         raise RuntimeRefusal("verification_timeout")
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if stderr_to_stdout else subprocess.DEVNULL,
+        start_new_session=True,
+    )
     output = bytearray()
     try:
         with selectors.DefaultSelector() as selector:
@@ -858,7 +861,8 @@ def validate_repository_gitlinks(value):
 
 def _indexed_gitlinks(source, deadline, env, git):
     code, raw = _bounded(safe_git_argv(git, 'ls-files', '--stage', '-z'),
-                        cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
+                        cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env,
+                        stderr_to_stdout=False)
     if code:
         raise RuntimeRefusal('source_inventory_unavailable')
     links = {}
@@ -895,11 +899,13 @@ def _snapshot(source, target, cfg, deadline, env, git):
     # Unversioned exclusions are not transferable to a fresh validator clone.
     # Refuse them instead of silently hiding material or exposing ignored files.
     code, local_excludes = _bounded(safe_git_argv(git, 'config', '--local', '--includes', '--get', 'core.excludesFile'),
-                                    cwd=source, deadline=deadline, cap=4096, env=env)
+                                    cwd=source, deadline=deadline, cap=4096, env=env,
+                                    stderr_to_stdout=False)
     if code == 0 and local_excludes.strip():
         raise RuntimeRefusal('repository_exclusion_override_unsupported')
     code, exclude_path = _bounded(safe_git_argv(git, 'rev-parse', '--git-path', 'info/exclude'),
-                                  cwd=source, deadline=deadline, cap=4096, env=env)
+                                  cwd=source, deadline=deadline, cap=4096, env=env,
+                                  stderr_to_stdout=False)
     if code:
         raise RuntimeRefusal('source_inventory_unavailable')
     path = Path(os.fsdecode(exclude_path.strip()))
@@ -911,7 +917,8 @@ def _snapshot(source, target, cfg, deadline, env, git):
         if any(line.strip() and not line.lstrip().startswith('#') for line in path.read_text().splitlines()):
             raise RuntimeRefusal('repository_exclusion_override_unsupported')
     code, raw = _bounded(safe_git_argv(git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"),
-                         cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
+                         cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env,
+                         stderr_to_stdout=False)
     if code:
         raise RuntimeRefusal("source_inventory_unavailable")
     names = sorted(set(os.fsdecode(n) for n in raw.split(b"\0") if n))
@@ -969,7 +976,7 @@ def _snapshot(source, target, cfg, deadline, env, git):
         # Recheck opaque boundaries after the copy; never recurse into a submodule.
         for name in gitlinks:
             _empty_gitlink(root_fd, name, directory_modes)
-        if _indexed_gitlinks(source, deadline, env) != gitlinks:
+        if _indexed_gitlinks(source, deadline, env, git) != gitlinks:
             raise RuntimeRefusal('repository_gitlink_changed')
     finally:
         os.close(root_fd)
