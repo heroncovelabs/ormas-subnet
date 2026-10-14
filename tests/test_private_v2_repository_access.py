@@ -92,6 +92,7 @@ def _assert_scoped_remote(argv: list[str], env: dict[str, str], observed: list[P
     assert any(arg.startswith("core.hooksPath=") for arg in argv)
     ssh = env["GIT_SSH_COMMAND"]
     words = shlex.split(ssh)
+    assert Path(words[0]).is_absolute()
     assert words[words.index("-F") + 1] == os.devnull
     assert "IdentityAgent=none" in words
     assert "IdentitiesOnly=yes" in words

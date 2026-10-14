@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from httpx import HTTPError
 
+from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
 from .client import OrmasGatewayError, OrmasMinerClient, _positive_usd, _validate_window_offer
 from ._recovery import PublicRecovery, RecoveryRequired
 from .verification_context import verification_call
@@ -166,19 +167,45 @@ SolveFn = Callable[[TaskDraft, Path], SolveResult]
 
 
 def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None) -> str:
-    git_env = os.environ.copy()
-    if env is not None:
-        git_env.update(env)
+    try:
+        git = trusted_executable("git")
+    except TrustedExecutableUnavailable as exc:
+        raise GitError("trusted git executable unavailable") from exc
+    overrides = dict(env or {})
+    if set(overrides) - {"GIT_SSH_COMMAND"}:
+        raise GitError("unsupported git environment override")
+    # Git receives no ambient service secrets, user configuration, proxy or
+    # executable search path.  The single call-site override is a generated,
+    # job-scoped SSH command whose executable is independently vetted below.
+    git_env = {
+        "PATH": str(git.parent),
+        "HOME": "/nonexistent",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        **overrides,
+    }
     # Repository code runs between trusted Git operations.  Never let a verifier
     # install replacement refs or hooks that change the object view or execute
     # again when the validator checks out the result.  GIT_SSH_COMMAND and other
     # explicit call-site settings are preserved above.
     git_env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    git_env["GIT_CONFIG_COUNT"] = "1"
-    git_env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
-    git_env["GIT_CONFIG_VALUE_0"] = os.devnull
+    command_config = (
+        ("core.hooksPath", os.devnull),
+        ("core.fsmonitor", "false"),
+        ("credential.helper", ""),
+        ("protocol.ext.allow", "never"),
+        ("user.name", "Ormas Reference Miner"),
+        ("user.email", "reference-miner@ormas.invalid"),
+        ("commit.gpgSign", "false"),
+    )
+    git_env["GIT_CONFIG_COUNT"] = str(len(command_config))
+    for index, (key, value) in enumerate(command_config):
+        git_env[f"GIT_CONFIG_KEY_{index}"] = key
+        git_env[f"GIT_CONFIG_VALUE_{index}"] = value
     proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+        [str(git), *args], cwd=str(cwd), capture_output=True, text=True,
         encoding="utf-8", errors="surrogateescape", check=False, env=git_env,
     )
     if proc.returncode != 0:
@@ -246,32 +273,29 @@ def _credential_git_env(credential: Mapping[str, Any] | None) -> Iterator[dict[s
     if not isinstance(private_key, str) or not private_key:
         yield None
         return
-    key_dir = tempfile.mkdtemp(prefix="ormas-job-key-")
-    path = os.path.join(key_dir, "id_job")
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with tempfile.TemporaryDirectory(prefix="ormas-job-key-") as key_dir:
+        path = os.path.join(key_dir, "id_job")
+        hosts = os.path.join(key_dir, "known_hosts")
         try:
-            payload = private_key if private_key.endswith("\n") else private_key + "\n"
-            os.write(fd, payload.encode())
-        finally:
-            os.close(fd)
-        os.chmod(path, 0o600)
-        yield {
-            **os.environ,
-            "GIT_SSH_COMMAND": (
-                f"ssh -i {path} -o IdentitiesOnly=yes "
-                f"-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-            ),
-        }
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        try:
-            os.rmdir(key_dir)
-        except OSError:
-            pass
+            ssh = trusted_executable("ssh")
+        except TrustedExecutableUnavailable as exc:
+            raise GitError("trusted ssh executable unavailable") from exc
+        for target, payload in ((path, private_key), (hosts, "")):
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                if payload:
+                    body = payload if payload.endswith("\n") else payload + "\n"
+                    os.write(fd, body.encode())
+            finally:
+                os.close(fd)
+        yield {"GIT_SSH_COMMAND": shlex.join([
+            str(ssh), "-F", os.devnull, "-i", path,
+            "-o", "IdentityAgent=none", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=" + hosts,
+            "-o", "GlobalKnownHostsFile=" + os.devnull,
+            "-o", "BatchMode=yes",
+        ])}
 
 
 def _build_receipt(lease_id: str, result: SolveResult) -> TaskReceipt:
@@ -362,6 +386,7 @@ def _split_verify_command(verify_command: str) -> tuple[list[str], dict[str, str
 def _run_verify_command(
     verify_command: str, *, cwd: Path, path_prefix: str | None = None,
     evidence_identity=None, raise_setup_errors: bool = False,
+    trusted_public_python: bool = False,
 ) -> int:
     """Run ``verify_command`` in ``cwd`` under a bounded, credential-free env.
 
@@ -373,6 +398,9 @@ def _run_verify_command(
     fails closed (1 / 127) rather than raising past the caller.
     When ``path_prefix`` is set, it is prepended to the child's ``PATH`` and
     ``VIRTUAL_ENV`` is set to that prefix's parent directory.
+    Validated public verifier commands set ``trusted_public_python`` so their
+    leading ``python3`` is replaced with an operator-vetted absolute system
+    interpreter and the inherited ``PATH`` cannot choose the verifier process.
     Validators set ``raise_setup_errors`` to distinguish a command that never
     launched from a real verifier that returned the same numeric exit code.
     """
@@ -382,9 +410,28 @@ def _run_verify_command(
         if raise_setup_errors:
             raise ValueError("invalid_verifier_command") from exc
         return 1
+    trusted_python: Path | None = None
+    if trusted_public_python:
+        # This mode is used only after the generated public execution contract
+        # has been reconstructed and validated.  Keep that boundary explicit:
+        # leading environment assignments and legacy toolchain prefixes belong
+        # to the legacy verifier path, never to the embedded public verifier.
+        if path_prefix is not None or env_overrides or argv[0] != "python3":
+            if raise_setup_errors:
+                raise ValueError("invalid_public_verifier_command")
+            return 1
+        try:
+            trusted_python = trusted_executable("python3")
+        except TrustedExecutableUnavailable as exc:
+            if raise_setup_errors:
+                raise ValueError("trusted_verifier_python_unavailable") from exc
+            return 127
+        argv[0] = str(trusted_python)
     with tempfile.TemporaryDirectory(prefix="ormas-verify-home-") as scratch_home:
         env: dict[str, str] = {}
-        if path_prefix is not None:
+        if trusted_python is not None:
+            env["PATH"] = str(trusted_python.parent)
+        elif path_prefix is not None:
             env["PATH"] = path_prefix + os.pathsep + os.environ.get("PATH", "")
             env["VIRTUAL_ENV"] = os.path.dirname(path_prefix)
         else:
@@ -748,7 +795,10 @@ class MinerSkeleton:
         if not base_commit or not result_commit:
             return None
         try:
-            diff = _run_git(["diff", base_commit, result_commit], cwd=workdir)
+            diff = _run_git(
+                ["diff", "--no-ext-diff", "--no-textconv", base_commit, result_commit],
+                cwd=workdir,
+            )
         except GitError:
             return None
         return hashlib.sha256(diff.encode("utf-8")).hexdigest()
@@ -771,7 +821,8 @@ class MinerSkeleton:
         """
         try:
             diff_out = _run_git(
-                ["diff", "--name-only", "--no-renames", "-z",
+                ["diff", "--no-ext-diff", "--no-textconv",
+                 "--name-only", "--no-renames", "-z",
                  draft.base_commit, result.result_commit, "--"], cwd=workdir,
             )
             changed_paths = _nul_git_paths(diff_out)
@@ -1281,7 +1332,9 @@ class MinerSkeleton:
         try:
             packet = _public_packet(draft)
             if packet is not None:
-                base_exit = _run_verify_command(draft.verify_command, cwd=workdir)
+                base_exit = _run_verify_command(
+                    draft.verify_command, cwd=workdir, trusted_public_python=True,
+                )
                 if base_exit == 0:
                     # A passing base is not an interrupted run. Complete it
                     # before solve_fn; the gateway rejects the generic abort.
@@ -1324,7 +1377,11 @@ class MinerSkeleton:
                 ),
             )
 
-            verify_exit_code = _run_verify_command(draft.verify_command, cwd=workdir)
+            verify_exit_code = _run_verify_command(
+                draft.verify_command,
+                cwd=workdir,
+                trusted_public_python=packet is not None,
+            )
             wall_s = time.monotonic() - start
 
             material_sha = self._material_diff_sha256(workdir, draft.base_commit, result.result_commit)
