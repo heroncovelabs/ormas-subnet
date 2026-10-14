@@ -179,3 +179,4 @@ def test_public_bridge_does_not_import_private_gateway_catalog() -> None:
     project = (Path(__file__).parents[1] / "pyproject.toml").read_text()
     project_section = project.split("[project]", 1)[1].split("[", 1)[0]
     assert '\nname = "ormas-subnet"\n' in project_section
+    assert '\nversion = "0.0.3"\n' in project_section
