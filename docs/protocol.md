@@ -483,7 +483,14 @@ A public `ormas.work-packet.v2` preparation includes:
 
 The gateway and SDK recompile and compare the executable/configuration against the
 frozen catalog. They do not trust a client-supplied wrapper merely because its shape
-looks valid. Earlier admitted catalog versions remain loadable for in-flight jobs.
+looks valid. Historical catalogs remain loadable for evidence and profile
+interpretation, while execution also requires the catalog's verifier compiler hash
+to be on the explicit active allowlist. A revoked compiler fails closed even for an
+already admitted packet. Before revocation rollout, inventory queued, leased and
+recovery-pending packets using that compiler; drain or expire them, then recompile
+their frozen inputs with an active compiler and requeue them under a new agreement.
+Retain the original packet and state as audit evidence; do not silently execute or
+rewrite it in place.
 
 `TaskDraft.acceptance_contract` is optional for legacy drafts and required on this
 public publication path. It has the exact keys `schema_version`, `policy`, `miner`,

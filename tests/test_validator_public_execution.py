@@ -67,6 +67,7 @@ def test_public_decision_distinguishes_assertion_from_environment_failure(
     def verify(command, **kwargs):
         assert command == assignment['verify_command']
         assert kwargs.get('path_prefix') is None
+        assert kwargs.get('trusted_public_python') is True
         calls.append(command)
         return next(exits)
     monkeypatch.setattr(module, '_run_verify_command', verify)
@@ -82,6 +83,22 @@ def test_public_contract_never_provisions_an_ambient_host_toolchain(tmp_path, mo
     exits = iter([86, 0])
     monkeypatch.setattr(module, '_run_verify_command', lambda *args, **kw: next(exits))
     assert daemon(tmp_path)._decide(assignment, tmp_path) == 'accept'
+
+
+def test_historical_catalog_loads_but_revoked_compiler_cannot_execute(assignment):
+    previous_digest = 'sha256:e4511421b6b2d459810e31cf50338c12bd91b02cee054a98d69d602cd9b0717f'
+    previous = support.load_support_catalog(previous_digest)
+    value = copy.deepcopy(assignment)
+    environment = value['execution_contract']['execution_environment']
+    profile_id = environment['profile']['profile_id']
+    environment['catalog_digest'] = previous_digest
+    environment['profile'] = next(
+        profile for profile in previous['profiles'] if profile['profile_id'] == profile_id
+    )
+
+    assert previous['revision'] == '2026-10-04.1'
+    with pytest.raises(ValueError, match='verifier_compiler_revoked'):
+        module.validate_assignment_execution(value)
 
 
 @pytest.mark.parametrize('field', ['verify_command', 'environment', 'base', 'compiler', 'contract_shape'])
