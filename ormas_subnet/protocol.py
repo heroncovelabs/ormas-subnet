@@ -16,11 +16,11 @@ logic itself.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 
+from ._workdir import require_safe_component
 from .public_acceptance import validate_acceptance_contract
 
 RUNNER_PROTOCOL_V1 = "ormas-runner-v1"
@@ -74,12 +74,6 @@ _FORBIDDEN_RUNNER_WIRE_FIELDS = frozenset(
     }
 )
 
-# Landed tb-web path-segment grammar for runner lease task IDs (max 128 chars).
-_RUNNER_TASK_ID_RE = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$"
-)
-
-
 def _wire_value(value: Any) -> Any:
     """Return a JSON-shaped copy of one DTO field without exposing internals."""
     if isinstance(value, Mapping):
@@ -91,9 +85,7 @@ def _wire_value(value: Any) -> Any:
 
 def require_task_id(task_id: str) -> str:
     """Reject untrusted path segments before they reach a dynamic runner URL."""
-    if not isinstance(task_id, str) or _RUNNER_TASK_ID_RE.fullmatch(task_id) is None:
-        raise ValueError("invalid task_id")
-    return task_id
+    return require_safe_component(task_id, field_name="task_id")
 
 
 def snapshot_evidence(value: Any) -> Any:
@@ -224,6 +216,7 @@ class TaskDraft(_RunnerWireDTO):
     acceptance_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        require_task_id(self.task_id)
         object.__setattr__(self, "allowed_paths", tuple(self.allowed_paths))
         object.__setattr__(self, "work_packet", MappingProxyType(dict(self.work_packet)))
         object.__setattr__(self, "repair_findings", tuple(self.repair_findings))
@@ -295,6 +288,9 @@ class TaskLease(_RunnerWireDTO):
     # Limit offers: the miner's expected charge, at or below ``limit_usd``.
     estimate_usd: float | None = None
     limit_usd: float | None = None
+
+    def __post_init__(self) -> None:
+        require_task_id(self.task_id)
 
     def to_wire(self) -> dict[str, Any]:
         payload = super().to_wire()

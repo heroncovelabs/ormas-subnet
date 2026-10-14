@@ -228,7 +228,11 @@ def test_private_checker_git_failure_posts_error_and_keeps_polling(
         allowed_paths=["demo.py"], immutable_paths=["tests/test_demo.py"],
         execution_contract=contract,
     )
-    assignment = {"assignment_id": "asgn_private", **fields,
+    assignment = {"assignment_id": "asgn_private", "validator_id": "val_test",
+                  "decision_protocol_version": "ormas-validator-decision-v2",
+                  "decision_nonce": "9" * 64,
+                  "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
+                  "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
                   "evidence_digest_sha256": evidence_digest_hex(fields),
                   "repo_credential": _credential()}
     gateway = _FakeValidatorGateway(assignment=assignment)

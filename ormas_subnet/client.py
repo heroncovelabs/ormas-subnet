@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from ._gateway_url import require_secure_gateway_url
 from ._private_file import read_private_text
 from .protocol import (
     RUNNER_DEVICE_HEADER,
@@ -199,6 +200,17 @@ class OrmasGatewayError(RuntimeError):
         super().__init__(f"gateway {label}{type_part}: {message}")
 
 
+class _ClaimIdentityError(ValueError):
+    """A decoded claim whose lease and draft identify different tasks."""
+
+
+def _task_path_segment(task_id: str) -> str:
+    """Validate and encode one task identity before placing it in a URL path."""
+    from urllib.parse import quote
+
+    return quote(require_task_id(task_id), safe="")
+
+
 def load_token(*, token_env: str | None = None, token_path: str | os.PathLike[str] | None = None) -> str:
     """Resolve a runner token from an env var name or a file path.
 
@@ -239,7 +251,9 @@ class OrmasMinerClient:
         http_client: Any | None = None,
         device_nonce: str | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = require_secure_gateway_url(
+            base_url, allow_local_transport=http_client is not None,
+        )
         self.token = token
         self.device_nonce = device_nonce
         if http_client is not None:
@@ -252,6 +266,8 @@ class OrmasMinerClient:
                 base_url=self.base_url,
                 headers={"Authorization": f"Bearer {self.token}"},
                 timeout=60.0,
+                follow_redirects=False,
+                trust_env=False,
             )
             self._owns_client = True
 
@@ -457,7 +473,11 @@ class OrmasMinerClient:
         draft_raw = payload.get("draft")
         if not isinstance(lease_raw, Mapping) or not isinstance(draft_raw, Mapping):
             raise ValueError("invalid claim payload")
-        return TaskLease.from_wire(lease_raw), TaskDraft.from_wire(draft_raw)
+        lease = TaskLease.from_wire(lease_raw)
+        draft = TaskDraft.from_wire(draft_raw)
+        if lease.task_id != draft.task_id:
+            raise _ClaimIdentityError("claim task identity mismatch")
+        return lease, draft
 
     def heartbeat_task(
         self,
@@ -469,7 +489,7 @@ class OrmasMinerClient:
         event: TaskEvent | None = None,
     ) -> dict[str, Any]:
         """POST /api/runner/v1/leases/{task_id}/heartbeat — extend the lease or emit progress."""
-        task_id = require_task_id(task_id)
+        task_segment = _task_path_segment(task_id)
         body: dict[str, Any] = {
             "schema_version": RUNNER_PROTOCOL_V1,
             "runner_id": runner_id,
@@ -477,7 +497,7 @@ class OrmasMinerClient:
             "renew": bool(renew),
             "event": None if event is None else event.to_wire(),
         }
-        resp = self._post(f"/api/runner/v1/leases/{task_id}/heartbeat", body)
+        resp = self._post(f"/api/runner/v1/leases/{task_segment}/heartbeat", body)
         self._raise_for_status(resp)
         return resp.json()
 
@@ -486,24 +506,24 @@ class OrmasMinerClient:
     ) -> dict[str, Any]:
         """POST /api/runner/v1/leases/{task_id}/repo-credential — ``{repo_credential}``
         for the live lease. It does not renew the lease."""
-        task_id = require_task_id(task_id)
+        task_segment = _task_path_segment(task_id)
         body: dict[str, Any] = {
             "schema_version": RUNNER_PROTOCOL_V1,
             "runner_id": runner_id,
             "lease_token": lease_token,
         }
-        resp = self._post(f"/api/runner/v1/leases/{task_id}/repo-credential", body)
+        resp = self._post(f"/api/runner/v1/leases/{task_segment}/repo-credential", body)
         self._raise_for_status(resp)
         return resp.json()
 
     def publish_result(self, task_id: str, runner_id: str, lease_token: str, *, source, length: int) -> dict[str, Any]:
         """Upload the bounded public artifact automatically, without repository keys."""
-        task_id = require_task_id(task_id)
+        task_segment = _task_path_segment(task_id)
         headers = dict(self._headers() or {})
         headers.update({'X-Ormas-Runner-Id': runner_id, 'X-Ormas-Lease-Token': lease_token,
             'Content-Type': 'application/vnd.ormas.public-artifact.v1', 'Content-Length': str(length)})
         source.seek(0)
-        response = self._client.post(f'/api/runner/v1/leases/{task_id}/publication',
+        response = self._client.post(f'/api/runner/v1/leases/{task_segment}/publication',
             content=iter(lambda: source.read(65536), b''), headers=headers, timeout=180.0)
         self._raise_for_status(response)
         return response.json()
@@ -528,7 +548,7 @@ class OrmasMinerClient:
         ``model_turns``, ``models_used``, ``output_tokens``, ``total_tokens``);
         it is validated locally and sent only when supplied.
         """
-        task_id = require_task_id(task_id)
+        task_segment = _task_path_segment(task_id)
         wire_effort = _validate_effort(effort) if effort is not None else None
         body: dict[str, Any] = {
             "schema_version": RUNNER_PROTOCOL_V1,
@@ -547,7 +567,7 @@ class OrmasMinerClient:
             body["pr_url"] = pr_url
         if pr_error is not None:
             body["pr_error"] = pr_error
-        resp = self._post(f"/api/runner/v1/leases/{task_id}/complete", body)
+        resp = self._post(f"/api/runner/v1/leases/{task_segment}/complete", body)
         status = getattr(resp, "status_code", None)
         if status in (202, 410):
             return resp.json()

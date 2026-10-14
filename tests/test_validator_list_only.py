@@ -38,7 +38,6 @@ def _run(monkeypatch, tmp_path, capsys, assignments):
     monkeypatch.setattr(validator, "OrmasValidatorClient", Client)
     monkeypatch.setattr(validator, "make_ed25519_signer",
                         lambda _key: (lambda _digest: "ab" * 64, "cd" * 32))
-    monkeypatch.setattr(validator, "review_assignment", no_review)
     monkeypatch.setattr(validator.ValidatorDaemon, "run_once", no_review)
     monkeypatch.setattr(validator.ValidatorDaemon, "serve", no_review)
     monkeypatch.delenv("ORMAS_PROTECTED_EVIDENCE_SOURCE", raising=False)

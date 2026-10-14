@@ -9,14 +9,33 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
 import tempfile
 
+from .protocol import require_task_id
+
 
 class RecoveryRequired(RuntimeError):
     """Retain evidence and refuse new work when recovery cannot be proved."""
+
+
+_COMPLETION_CAPTURE_VERSION = 2
+_LEGACY_FAILURE_CAPTURE_KEYS = frozenset({
+    "status",
+    "scope_ok",
+    "file_count",
+    "changed_paths",
+    "wall_s",
+    "failure_class",
+    "error",
+})
+_LEGACY_PUBLIC_FAILURE_STATES = {
+    "public_execution_interrupted": "aborted",
+    "base_preflight_non_red": "failed",
+}
 
 
 def _encoded(value):
@@ -81,12 +100,29 @@ class PublicRecovery:
                     raise RecoveryRequired("public recovery record is unsafe")
                 envelope = json.loads(source.read(1_048_577))
             body = envelope["record"]
-            if (envelope["sha256"] != hashlib.sha256(_encoded(body)).hexdigest()
+            capture_version = (
+                body.get("completion_capture_version") if isinstance(body, dict) else None
+            )
+            if (not isinstance(body, dict)
+                    or envelope["sha256"] != hashlib.sha256(_encoded(body)).hexdigest()
                     or body["version"] not in {1, 2} or body["gateway"] != self.namespace
                     or body["runner_id"] != self.runner_id
+                    or (capture_version is not None and (
+                        type(capture_version) is not int
+                        or capture_version != _COMPLETION_CAPTURE_VERSION
+                    ))
                     or body["stage"] not in {"claimed", "artifact", "completion"}
                     or any(not isinstance(body[key], str) or not body[key]
                            for key in ("task_id", "lease_id", "packet_hash", "base_commit"))):
+                raise RecoveryRequired("public recovery identity mismatch")
+            try:
+                require_task_id(body["task_id"])
+            except ValueError:
+                raise RecoveryRequired("public recovery identity mismatch") from None
+            lease = body.get("lease")
+            if lease is not None and (
+                not isinstance(lease, Mapping) or lease.get("task_id") != body["task_id"]
+            ):
                 raise RecoveryRequired("public recovery identity mismatch")
             return body
         except (ValueError, KeyError, TypeError):
@@ -115,6 +151,21 @@ class PublicRecovery:
         return self.root / (hashlib.sha256(_encoded([task_id, lease_id])).hexdigest() + ".json")
 
     def begin(self, lease, draft):
+        try:
+            draft_task_id = require_task_id(draft.task_id)
+        except (AttributeError, ValueError):
+            raise RecoveryRequired("public recovery identity mismatch") from None
+        # Version-1 recovery callers predate TaskLease.task_id. The live skeleton
+        # validates every decoded lease before this call; when an id is present
+        # here, bind it again before writing the durable journal.
+        lease_task_id = getattr(lease, "task_id", None)
+        if lease_task_id is not None:
+            try:
+                lease_task_id = require_task_id(lease_task_id)
+            except ValueError:
+                raise RecoveryRequired("public recovery identity mismatch") from None
+            if lease_task_id != draft_task_id:
+                raise RecoveryRequired("public recovery identity mismatch")
         if self.pending() is not None:
             raise RecoveryRequired("public recovery must finish before a new claim")
         previous = self._read(self._history(draft.task_id, lease.lease_id))
@@ -127,7 +178,8 @@ class PublicRecovery:
         body = {"version": 2, "gateway": self.namespace, "runner_id": self.runner_id,
                 "task_id": draft.task_id, "lease_id": lease.lease_id,
                 "packet_hash": draft.work_packet_sha256, "base_commit": draft.base_commit,
-                "repo_url": draft.repo_url, "stage": "claimed"}
+                "repo_url": draft.repo_url, "stage": "claimed",
+                "completion_capture_version": _COMPLETION_CAPTURE_VERSION}
         if getattr(lease, "offer_kind", None) == "limit":
             body["lease"] = lease.to_wire()
         self.save(body)
@@ -182,9 +234,67 @@ class PublicRecovery:
             if _encoded(body["completion"]) != _encoded(kwargs):
                 raise RecoveryRequired("ambiguous public completion cannot be replaced")
             return body
+        if body.get("completion_capture_version") is None and "error" not in capture:
+            body["completion_capture_version"] = _COMPLETION_CAPTURE_VERSION
         body.update(stage="completion", completion=kwargs)
         self.save(body)
         return body
+
+    def completion_for_wire(self, body=None):
+        """Return a completion body safe for replay without rewriting its journal.
+
+        Releases before ``completion_capture_version=2`` persisted the local
+        exception string as ``capture.error`` even though the gateway has never
+        accepted that field.  Only the exact failure shape emitted by those
+        releases may be projected: the exception is omitted from the derived
+        request while the checksummed journal bytes remain untouched.  Other
+        unknown capture shapes stay fail-closed for operator inspection.
+        """
+        body = self.pending() if body is None else body
+        if body is None or body.get("stage") != "completion":
+            raise RecoveryRequired("public completion recovery record is missing")
+        completion = body.get("completion")
+        if not isinstance(completion, dict):
+            raise RecoveryRequired("public completion recovery record is corrupt")
+        capture = completion.get("capture")
+        if body.get("completion_capture_version") == _COMPLETION_CAPTURE_VERSION:
+            if isinstance(capture, dict) and "error" in capture:
+                raise RecoveryRequired("versioned public capture contains local diagnostics")
+            return completion
+        if not isinstance(capture, dict) or "error" not in capture:
+            if body.get("version") == 1:
+                raise RecoveryRequired(
+                    "legacy public recovery lacks frozen publication scope authorization"
+                )
+            return completion
+        terminal = completion.get("terminal")
+        failure_class = capture.get("failure_class")
+        wall_s = capture.get("wall_s")
+        expected_state = _LEGACY_PUBLIC_FAILURE_STATES.get(failure_class)
+        if (
+            set(capture) != _LEGACY_FAILURE_CAPTURE_KEYS
+            or capture.get("status") != "failed"
+            or capture.get("scope_ok") is not False
+            or type(capture.get("file_count")) is not int
+            or capture.get("file_count") != 0
+            or capture.get("changed_paths") != []
+            or not isinstance(wall_s, (int, float))
+            or isinstance(wall_s, bool)
+            or not math.isfinite(float(wall_s))
+            or float(wall_s) < 0
+            or not isinstance(capture.get("error"), str)
+            or len(capture["error"]) > 500
+            or expected_state is None
+            or not isinstance(terminal, dict)
+            or terminal.get("lease_id") != body.get("lease_id")
+            or terminal.get("verification_state") != expected_state
+            or terminal.get("result_ref") is not None
+            or terminal.get("result_commit") != ""
+        ):
+            raise RecoveryRequired("legacy public failure capture is not canonical")
+        projected = dict(completion)
+        projected["capture"] = {key: value for key, value in capture.items() if key != "error"}
+        return projected
 
     def acknowledge(self):
         body = self.pending()

@@ -48,7 +48,7 @@ mining logic.
 | 400 | `invalid_request_error` | Missing/unknown/forbidden field, bad DTO value, `failure_class_mismatch` |
 | 401 | `authentication_error` | Missing/invalid token, device mismatch, rate-limited by repeated auth failures |
 | 404 | `not_found_error` | Unknown runner/repo/task, or the tenant's runner feature is off |
-| 409 | `conflict_error` | `lease_lost` — the lease no longer belongs to you; `validator_rekey_proof_required` — decision-key replacement lacks valid current-key proof |
+| 409 | `conflict_error` | `lease_lost`; `validator_rekey_proof_required`; `validator_rekey_mint_fence_pending`; `validator_rekey_cleanup_pending`; or `validator_decision_v2_required` |
 | 429 | `rate_limited` | Daily per-token claim cap exceeded (message `"daily_claim_cap"`) |
 | 503 | `service_unavailable` | Pricing/quoting subsystem unavailable (message `"runner_pricing_unavailable"`) |
 | 500 | `internal_error` | Settlement produced no receipt (should not happen; report it) |
@@ -60,7 +60,12 @@ same shape as a `200`, replay-safe).
 ## Validator decision-key registration and re-key
 
 `POST /api/validator/v1/registrations` uses the validator bearer token and
-`{"schema_version":"ormas-validator-v1","pubkey_hex":"<Ed25519 key hex>"}`.
+`{"schema_version":"ormas-validator-v1","pubkey_hex":"<Ed25519 key hex>",
+"decision_protocol_versions":["ormas-validator-decision-v1",
+"ormas-validator-decision-v2"]}`. Patched validators advertise both decision
+protocols. An omitted advertisement identifies a legacy v1-only binary during
+the compatibility phase. Once v2 is activated, legacy registrations fail with
+409 `validator_decision_v2_required`.
 First registration (including a CVM rebind with no current key) and same-key
 registration are unchanged. Replacing an existing key without valid proof returns
 409 `conflict_error`, message `validator_rekey_proof_required`.
@@ -79,11 +84,103 @@ The lifetime reuses the Protected validator gate's existing
 in the shared Outcomes table `outcomes_validator_rekey_challenges`; miner hotkey
 nonces have a different identity/key binding and are not reused.
 
+Re-key has two distinct retryable 409 states:
+
+- `validator_rekey_mint_fence_pending` means an old-key repository-token mint may
+  still be in flight. The registry compare-and-swap did not run, so key A and its
+  generation remain the registry anchor, but a durable verified re-key intent has
+  already removed A's assignment, decision, and credential-release authority.
+  Retry the exact key-B registration after ordinary custody cleanup or attended
+  fence clearance. The original A-signed proof remains valid for that immutable
+  intent even after its challenge expires. If a restart lost the original request
+  body, the authenticated validator may omit the proof only for the intent's exact
+  key-B target; any supplied proof must exactly match the stored proof identity.
+  A new challenge cannot replace the intent. The response never includes
+  reservation, assignment, repository-token, or credential ids.
+- `validator_rekey_cleanup_pending` means key B and its generation are already
+  current, while a delivered old-assignment repository token is being revoked.
+  Old-key decisions and replacement-assignment polling remain unavailable. Retry
+  an ordinary same-key registration for B with the same bearer; no A-signed proof
+  is required or accepted for this resume step.
+
+Callers must branch on the fixed message instead of interpreting every 409 as an
+atomic rollback. Neither state permits a fallback to the old assignment or nonce.
+The pending key-B intent never expires, cancels, or retargets automatically. Losing
+or subsequently distrusting B's private key is therefore a fail-closed availability
+incident that requires an owner-reviewed recovery; do not delete the intent or restore
+A's authority as an application retry.
+
 The reference client's `register(current_sign_fn=...)` performs the challenge step
 only on that fixed 409 and retries registration once. The CLI accepts the retained
 key via `--current-private-key-env` or `--current-private-key-file`; the ordinary
 `--private-key-*` input is the new decision key. Never put either key in argv.
 Protected assignment release remains bound to its attested decision key.
+A validator started with a Protected attestor processes only rows whose
+`service_level` is exactly `protected`; it never clones or signs a Standard or
+unlabeled row with the Protected process identity.
+
+## Validator decision signatures
+
+Every assignment carries `decision_protocol_version`. In the explicit
+`compat-v1` deployment phase, the patched gateway creates v1 assignments so
+old and patched validators can both drain work while the fleet is upgraded.
+After the gateway proves that the configured validator count is registered and
+every active validator affirmatively advertises v2, changing the gateway mode
+to `v2` writes a durable activation marker and all newly created or moved
+assignments use v2.
+
+For v2, the validator signs the UTF-8 bytes of the
+`ormas-validator-decision-v2` domain, a NUL byte, and compact sorted-key JSON
+with exactly `protocol_version`, `validator_id`, `assignment_id`, `decision_nonce`,
+`validator_key_generation`, `validator_pubkey_hex`, `decision_expires_at`,
+`decision`, and `evidence_digest_sha256`. `validator_pubkey_hex` is the exact
+normalized lowercase 32-byte Ed25519 public key snapshotted at assignment
+issuance. `decision_nonce` is a fresh 256-bit value for each review attempt;
+the assignment id also binds the wire operation. Public work freezes the public
+acceptance deadline as `decision_expires_at`; ordinary work uses the configured
+`OUTCOMES_VALIDATOR_DECISION_TTL_S` (with the existing positive public-acceptance
+timeout as the compatibility fallback). Expiry is exclusive: a decision created
+at or after that timestamp is refused. The gateway rebuilds this message from the
+authenticated validator and its stored assignment; none of those binding fields
+is accepted from the request.
+
+Verification uses the assignment's snapshotted key. The atomic decision INSERT
+also requires that exact key and generation to remain the validator registry's
+current authority and that the stored expiry still equals the signed expiry. A
+proven re-key increments the generation. Every live undecided v2 assignment from
+an older generation is replaced with a fresh assignment id and nonce for the new
+key; interruption can leave the old attempt unavailable, never transferable to
+the new key. V1 rows are bound to their snapshotted key where the gateway can
+reconstruct it. Rekey therefore invalidates an outstanding v1 drain row instead
+of letting the new key inherit its digest-only authority.
+
+A successfully inserted decision, its assignment marker, and its recovery event
+are one durable database operation. Finalization evaluates the assignment,
+qualification contract, quorum, and deadlines at each persisted decision's
+`created_at`, so a timely vote remains authoritative if recovery runs after the
+deadline or after a later re-key/revocation. The event stays pending until its
+history row, retry or settlement, receipt-keyed debit handoff, terminal job state,
+and webhook outbox handoff are durable. Exact POST replay and the periodic sweep
+resume that same event.
+
+The activation statement atomically snapshots the finite set of v1 assignment
+IDs permitted to drain. Only those exact IDs retain digest-only verification;
+their signed identity cannot be recycled into new v1 work. A retry after an
+`error` or a stale reassignment after activation is a fresh v2 attempt with a
+fresh nonce. Missing or unknown versions fail closed, and v2 never falls back
+to v1 after a signature mismatch. The gateway rejects old-binary registrations
+and old-gateway NULL/v1 writes after activation.
+
+`OUTCOMES_VALIDATOR_DECISION_PROTOCOL` is required and has two values:
+
+- `compat-v1`: gateway-first compatibility phase; legal only before activation
+  and before any v2 row exists.
+- `v2`: require full fleet proof, atomically activate once, and stay on v2.
+
+After the activation marker or any v2 row exists, configuring `compat-v1`
+fails startup. Application rollback is therefore roll-forward only. Preserve
+the database, activation marker, v1 drain snapshot, assignments, and decision
+events while replacing a bad binary with a fixed v2-capable build.
 
 ## Lifecycle
 
@@ -453,6 +550,11 @@ id; on a re-served lease the value is the original stored id, or null), `bid_id`
 for firm), `limit_usd` (nullable; the accepted ceiling for a limit offer, null for
 firm). Legacy leases without offer fields decode with `bid_id=null`,
 `offer_kind="firm"`, `estimate_usd=null` and `limit_usd=null`.
+
+`task_id` is one bounded ASCII path component: 1–128 characters, starts and
+ends with an ASCII letter or digit, and otherwise contains only letters,
+digits, `.`, `_`, or `-`. The lease and draft in one successful claim must
+carry the same `task_id`; clients reject the whole response when they differ.
 
 **`TaskDraft`**: `task_id`, `runner_id`, `repo_id`, `base_commit`, `brief` (the
 task description), `verify_command`, `allowed_paths`, `budget_usd`,

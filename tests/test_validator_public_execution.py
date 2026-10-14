@@ -46,7 +46,11 @@ def assignment(tmp_path):
         verify_command=command, allowed_paths=['cli.cjs'],
         immutable_paths=['package.json', 'package-lock.json', 'value.test.cjs'],
         execution_contract=contract)
-    return {'assignment_id': 'asgn_public', **fields,
+    return {'assignment_id': 'asgn_public', 'validator_id': 'val_test',
+            'decision_protocol_version': module.VALIDATOR_DECISION_PROTOCOL_V2,
+            'decision_nonce': '3' * 64,
+            'validator_key_generation': 1, 'validator_pubkey_hex': 'ab' * 32,
+            'decision_expires_at': '2099-01-01T00:00:00Z', **fields,
             'evidence_digest_sha256': module.evidence_digest_hex(fields)}
 
 
