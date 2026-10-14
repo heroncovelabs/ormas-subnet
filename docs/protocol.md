@@ -455,13 +455,15 @@ as HTTP 409:
 
 Only this typed refusal, with `message` equal to `window_closed`, `not_offering`
 or `request_limit` and every binding field equal to the journal, lets the
-reference miner clear a pending request. The gateway persists an immutable
-per-window saturation marker before returning `request_limit`; this prevents a
-delayed handler from accepting any request that the client treats as terminal.
-The miner archives the complete validated refusal in the same durable state
-replacement that clears pending. Transport errors, generic HTTP errors, malformed
-acknowledgements, authority-epoch mismatches and binding mismatches retain it for
-exact replay or manual reconciliation.
+reference miner resolve a pending request. The current Ormas gateway emits no
+guessed numeric request cap: its authoritative terminal fence covers
+`window_closed` and `not_offering`. The client recognizes `request_limit` only
+for compatibility with a gateway that durably materializes the same immutable
+per-window terminal marker before replying. The miner archives the complete
+validated refusal in the same durable state replacement that returns the journal
+to its protocol sentinel. Transport errors, generic HTTP errors, malformed
+acknowledgements, authority-epoch mismatches and binding mismatches retain the
+exact request for replay or manual reconciliation.
 
 ### `GET /api/runner/v1/offers?runner_id=...&job_id=...`
 
@@ -494,8 +496,19 @@ explicit status; other award identity mismatches require recovery. Pending offer
 POSTs and execution start/completion records retain their existing fences.
 Losing offers become `not_awarded`. If the earlier winner
 fails to claim, the gateway may reopen a `not_awarded` bid and award it at its
-frozen terms. The gateway owns these status transitions. This route exposes
-no competitor book, reserve, model identity or provider cost.
+frozen terms. The miner accepts that historical award only when its saved prior
+state was `not_awarded` and its epoch and window match the current saved v1 bid.
+It rejects historical awards from a different generation and bids already saved
+as withdrawn, replaced, no-capacity or award-lapsed. The gateway owns the valid
+status transitions. This route exposes no competitor book, reserve, model
+identity or provider cost.
+
+When the current queue page contains the job, every request-ID-bearing lease must
+match that page's authority epoch and window even if the bid is still the local
+`current` pointer or the queue omits `awarded_to_you`. An exact replay for an older
+generation is archived without becoming current, and the newer row is processed in
+the same poll. Saved `withdrawn`, `replaced`, `no_capacity` and `award_lapsed`
+states are locally terminal; only `not_awarded` retains the documented reopen path.
 
 ### `DELETE /api/runner/v1/offers/{bid_id}`
 
@@ -553,19 +566,25 @@ remain required for every window award returned by either claim path.
 
 Recovery limits: idempotent replay requires a gateway version that advertises the
 protocol and durably binds success and refusal to the request id, authority epoch,
-window, job and terms digest. A saved request is replayed only while the capability
-retains its authority epoch. It may recover an immutable outcome after the queue
+window, job and terms digest. The first accepted capability pins one authority
+epoch for the whole local journal, including completed and refused requests. An
+epoch change fails before pricing, POST or claim activity and requires operator
+reconciliation. A saved request may recover an immutable outcome after the queue
 advances or omits the old window row. A fresh request always uses the current row's
 exact window id. Missing or malformed window identity blocks that request.
 
 The miner persists a protocol floor after observing v1. Later capability loss or
 downgrade writes a sticky rollback poison and refuses further offer and claim
 activity until manual reconciliation; capability restoration does not silently
-clear that poison. An inconsistent fleet that rejects already journalled identity
-fields also leaves the request pending. Rollout therefore installs the schema and
-id-aware code on the whole gateway fleet before advertising the capability or
-releasing this miner behavior. Once an id-bearing request may have reached the
-gateway, downgrade to an id-unaware gateway is unsupported.
+clear that poison. While idle it stores the protocol name in the legacy `pending`
+slot, which makes the pre-request-id reference miner fail closed on the same
+journal. It persists inferred protocol, epoch and rollback state from prerelease
+journals before queue or pricing I/O. An inconsistent fleet that rejects already
+journalled identity fields also leaves the exact request pending. Rollout therefore
+installs the schema and id-aware code on the whole gateway fleet before advertising
+the capability or releasing this miner behavior. Once an id-bearing request may
+have reached the gateway, application rollback is roll-forward only unless the
+journal is explicitly reconciled.
 
 The reference miner retains unchanged bid records and reconciles gateway-owned
 reopening and awards at saved terms. Explicitly changed terms submit with a new
