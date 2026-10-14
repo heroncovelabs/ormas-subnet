@@ -1102,14 +1102,14 @@ class MinerSkeleton:
             "acceptance_capacity", "award_lapsed",
         }
         prior_bid = (isinstance(bid, Mapping) and bid.get("status") in terminal
-                     and (remote_terms != self._normalized_offer_terms(intent)
+                     and (remote_terms != intent_terms
                           or bid.get("bid_id") in state["bids"]))
         if bid is None or prior_bid:
             if not response["window_closed"]:
                 self._pending_offer_refusal()
         else:
             bid_id, status = bid["bid_id"], bid["status"]
-            if (bid_id in state["bids"] or remote_terms != self._normalized_offer_terms(intent)
+            if (bid_id in state["bids"] or remote_terms != intent_terms
                     or (status in {"open", "awarded"} and (
                         not isinstance(bid.get("ack_by_at"), str) or not bid["ack_by_at"]
                         or not isinstance(bid.get("window_closes_at"), str)
