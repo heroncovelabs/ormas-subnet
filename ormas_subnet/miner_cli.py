@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import __version__
+from ._gateway_url import require_secure_gateway_url
 from ._private_file import read_private_text
 from .client import OrmasGatewayError, OrmasMinerClient, load_token
 from .protected_env import (
@@ -58,13 +59,7 @@ def _read_credentials() -> dict[str, str]:
 
 
 def _gateway(value: str) -> str:
-    url = urlsplit(value)
-    if (url.scheme not in ("http", "https") or not url.hostname or url.username
-            or url.password or url.query or url.fragment):
-        raise ValueError("gateway must be an HTTP or HTTPS URL without credentials")
-    if url.scheme == "http" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
-        raise ValueError("gateway must use HTTPS; HTTP is allowed only for loopback hosts")
-    return value.rstrip("/")
+    return require_secure_gateway_url(value)
 
 
 def _validate_token(token: str) -> str:
@@ -194,7 +189,9 @@ def _doctor(args: argparse.Namespace) -> int:
     health_ok = False
     try:
         gateway = _gateway(gateway)
-        with httpx.Client(base_url=gateway) as client:
+        with httpx.Client(
+            base_url=gateway, follow_redirects=False, trust_env=False,
+        ) as client:
             response = client.get("/health")
             response.raise_for_status()
             if not isinstance(response.json(), dict):
@@ -207,7 +204,8 @@ def _doctor(args: argparse.Namespace) -> int:
     if token is not None and health_ok:
         try:
             with httpx.Client(base_url=gateway, headers={"Authorization": f"Bearer {token}"},
-                              timeout=10.0) as transport:
+                              timeout=10.0, follow_redirects=False,
+                              trust_env=False) as transport:
                 with OrmasMinerClient(gateway, token, http_client=transport,
                                       device_nonce=args.device_nonce) as client:
                     try:
@@ -384,7 +382,8 @@ def _doctor_protected(args: argparse.Namespace) -> int:
         return 1
     try:
         with httpx.Client(base_url=gateway, headers={"Authorization": f"Bearer {token}"},
-                          timeout=10.0) as transport:
+                          timeout=10.0, follow_redirects=False,
+                          trust_env=False) as transport:
             with OrmasMinerClient(gateway, token, http_client=transport,
                                   device_nonce=args.device_nonce) as client:
                 registration = client.get_registration(args.runner_id)

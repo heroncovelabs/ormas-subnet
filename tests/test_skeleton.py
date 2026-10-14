@@ -332,7 +332,17 @@ def _validator_assignment(*, repo: Path, base_commit: str, result_commit: str,
         allowed_paths=allowed_paths or ["out.txt"],
         immutable_paths=immutable_paths or [],
     )
-    return {"assignment_id": "asgn_1", **fields, "evidence_digest_sha256": evidence_digest_hex(fields)}
+    return {
+        "assignment_id": "asgn_1",
+        "validator_id": "val_test",
+        "decision_protocol_version": "ormas-validator-decision-v2",
+        "decision_nonce": "1" * 64,
+        "validator_key_generation": 1,
+        "validator_pubkey_hex": "ab" * 32,
+        "decision_expires_at": "2099-01-01T00:00:00Z",
+        **fields,
+        "evidence_digest_sha256": evidence_digest_hex(fields),
+    }
 
 
 def _run_validator_once(tmp_path: Path, *, assignment: dict[str, Any]) -> _FakeValidatorGateway:

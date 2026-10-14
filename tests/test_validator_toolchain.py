@@ -56,7 +56,12 @@ def _assignment(repo: Path, base: str, result: str, verify: str, toolchain: dict
         repo_url=str(repo), verify_command=verify, allowed_paths=["out.txt", "check.py"],
         immutable_paths=[], toolchain=toolchain,
     )
-    a = {"assignment_id": "asgn_tc", **fields, "evidence_digest_sha256": evidence_digest_hex(fields)}
+    a = {"assignment_id": "asgn_tc", "validator_id": "val_test",
+         "decision_protocol_version": "ormas-validator-decision-v2",
+         "decision_nonce": "c" * 64,
+         "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
+         "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
+         "evidence_digest_sha256": evidence_digest_hex(fields)}
     if toolchain is None:
         a["toolchain"] = None
     return a

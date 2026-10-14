@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 
 from ormas_subnet import MinerConfig, MinerSkeleton, OrmasMinerClient, load_token
+from ormas_subnet._gateway_url import require_secure_gateway_url
 from ormas_subnet.client import OrmasGatewayError
 from ormas_subnet.reference_solver import make_shell_solver
 
@@ -160,6 +161,11 @@ def _parse(
             ap.error("the following arguments are required: " + ", ".join(missing))
         if not credential_defaults and not (ns.token_env or ns.token_file):
             ap.error("one of the arguments --token-env --token-file is required")
+    if ns.gateway is not None:
+        try:
+            ns.gateway = require_secure_gateway_url(ns.gateway)
+        except ValueError as exc:
+            ap.error(str(exc))
     return ns
 
 
