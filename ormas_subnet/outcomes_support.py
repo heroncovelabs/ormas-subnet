@@ -43,6 +43,9 @@ PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
 # the exact embedded verifier source and coordinated gateway/SDK rollout.
 _ACTIVE_VERIFIER_COMPILERS = frozenset({
     '2ba990540ac8653f130efe5ed132a0dfdca6048db18386352719d3a317ae2c00',
+    # 2026-10-14.6 compatibility. This build keeps the current public .4
+    # catalog/runtime, but can execute a packet frozen by the activation build.
+    'bffacd5331642f9515f21ac8fd0ac634c24ea7f1f4ac1e50c655617c1c63124f',
 })
 
 # 2026-10-14.4 (ff7c1e51…): the deployed verifier plus download resilience.

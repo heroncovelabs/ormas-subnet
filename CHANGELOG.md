@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.3 — 2026-10-14
+
+- Keep the current public `.4` catalog and verifier as the emitted packet
+  identity while accepting the separately reviewed `.6` catalog and compiler.
+- Retain the deployed `ff7c1e51…` / `214eadfb…` pair only through its scoped
+  draining exception. Private catalogs and the unreleased `.5` candidate remain
+  unauthorized.
+- Document the staged activation, rollback, qualification, and finalization
+  gates. This version does not activate `.6` packet production.
+
 ## 0.0.2 — 2026-10-14
 
 - Accept frozen packets on the deployed `2026-10-14.4` catalog
