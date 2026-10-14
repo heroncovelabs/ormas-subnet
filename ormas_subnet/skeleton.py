@@ -45,6 +45,7 @@ from .client import (
     _positive_usd,
     _validate_offer_authority_epoch,
     _validate_offer_request_id,
+    _validate_offer_window_id,
     _validate_window_offer,
 )
 from ._recovery import PublicRecovery, RecoveryRequired
@@ -78,6 +79,8 @@ _RESULT_REF_LOCAL = "local:ormas/job/"
 # /api/runner/v1/registrations (runner_api.py: POLL_INTERVAL_S, LEASE_TTL_S,
 # HEARTBEAT_S). Used only until the first registration response arrives.
 DEFAULT_POLL_INTERVAL_S = 15
+_OFFER_IDEMPOTENCY_PROTOCOL = "ormas-offer-request-v1"
+_OFFER_TERMINAL_REASONS = frozenset({"window_closed", "not_offering", "request_limit"})
 DEFAULT_LEASE_TTL_S = 300
 DEFAULT_HEARTBEAT_S = 90
 
@@ -1007,6 +1010,42 @@ class MinerSkeleton:
                 return self.client.claim_task(self.config.runner_id, offers=offers)
         return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
 
+    @staticmethod
+    def _empty_offer_state(gateway: str, runner_id: str) -> dict[str, Any]:
+        return {
+            "gateway": gateway,
+            "runner_id": runner_id,
+            "bids": {},
+            "current": {},
+            "pending": None,
+            "offer_protocol_floor": None,
+            "offer_protocol_poisoned": False,
+            "request_outcomes": {},
+            "window_markers": {},
+        }
+
+    @staticmethod
+    def _validate_offer_request_envelope(envelope: Any) -> None:
+        if (not isinstance(envelope, dict) or type(envelope.get("version")) is not int
+                or envelope["version"] != 2 or set(envelope) != {
+                    "version", "offer_request_id", "offer_authority_epoch",
+                    "offer_window_id", "offer_terms_sha256", "terms",
+                }):
+            raise ValueError("invalid offer request envelope")
+        epoch = _validate_offer_authority_epoch(envelope["offer_authority_epoch"])
+        window_id = _validate_offer_window_id(envelope["offer_window_id"])
+        _validate_window_offer(envelope["terms"])
+        terms_sha256 = _offer_terms_sha256(envelope["terms"])
+        if envelope["offer_terms_sha256"] != terms_sha256:
+            raise ValueError("invalid offer terms digest")
+        _validate_offer_request_id(
+            envelope["offer_request_id"],
+            offer_window_id=window_id,
+            offer_terms_sha256=terms_sha256,
+        )
+        if epoch != envelope["offer_authority_epoch"]:
+            raise ValueError("invalid offer authority epoch")
+
     def _offer_state(self) -> dict[str, Any]:
         store = self._public_recovery
         if store is None:
@@ -1015,8 +1054,7 @@ class MinerSkeleton:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
-            return {"gateway": store.namespace, "runner_id": store.runner_id,
-                    "bids": {}, "current": {}, "pending": None}
+            return self._empty_offer_state(store.namespace, store.runner_id)
         try:
             with os.fdopen(fd, "r", encoding="utf-8") as source:
                 metadata = os.fstat(source.fileno())
@@ -1025,39 +1063,87 @@ class MinerSkeleton:
                     raise RecoveryRequired("offer recovery record is unsafe")
                 state = json.load(source)
             if (state["gateway"] != store.namespace or state["runner_id"] != store.runner_id
-                    or not isinstance(state["bids"], dict) or not isinstance(state["current"], dict)):
+                    or not isinstance(state["bids"], dict)
+                    or not isinstance(state["current"], dict)):
                 raise RecoveryRequired("offer recovery identity mismatch")
+            state.setdefault("offer_protocol_floor", None)
+            state.setdefault("offer_protocol_poisoned", False)
+            state.setdefault("request_outcomes", {})
+            state.setdefault("window_markers", {})
+            if (state["offer_protocol_floor"] not in {None, _OFFER_IDEMPOTENCY_PROTOCOL}
+                    or type(state["offer_protocol_poisoned"]) is not bool
+                    or not isinstance(state["request_outcomes"], dict)
+                    or not isinstance(state["window_markers"], dict)):
+                raise ValueError("invalid offer protocol state")
+            has_v2_evidence = False
             for bid_id, bid in state["bids"].items():
                 if not isinstance(bid_id, str) or not bid_id:
                     raise ValueError("invalid bid identity")
                 _validate_window_offer(bid["terms"])
                 if "offer_request_id" in bid:
-                    _validate_offer_request_id(bid["offer_request_id"])
+                    has_v2_evidence = True
+                    terms_sha256 = _offer_terms_sha256(bid["terms"])
+                    window_id = _validate_offer_window_id(bid["offer_window_id"])
                     _validate_offer_authority_epoch(bid["offer_authority_epoch"])
-                    if bid["offer_terms_sha256"] != _offer_terms_sha256(bid["terms"]):
+                    _validate_offer_request_id(
+                        bid["offer_request_id"],
+                        offer_window_id=window_id,
+                        offer_terms_sha256=terms_sha256,
+                    )
+                    if bid["offer_terms_sha256"] != terms_sha256:
                         raise ValueError("invalid offer terms digest")
             for job_id, bid_id in state["current"].items():
                 if state["bids"][bid_id]["terms"]["job_id"] != job_id:
                     raise ValueError("invalid bid job identity")
             pending = state["pending"]
             if pending is not None:
-                if (isinstance(pending, dict) and type(pending.get("version")) is int
-                        and pending["version"] == 2 and set(pending) == {
-                            "version", "offer_request_id", "offer_authority_epoch",
-                            "offer_terms_sha256", "terms",
-                        }):
-                    _validate_offer_request_id(pending["offer_request_id"])
-                    _validate_offer_authority_epoch(pending["offer_authority_epoch"])
-                    _validate_window_offer(pending["terms"])
-                    if pending["offer_terms_sha256"] != _offer_terms_sha256(pending["terms"]):
-                        raise ValueError("invalid offer terms digest")
+                if isinstance(pending, dict) and pending.get("version") == 2:
+                    self._validate_offer_request_envelope(pending)
+                    has_v2_evidence = True
                 else:
                     # Journals written before offer request ids contained the
-                    # offer terms directly. They remain readable for a narrow
-                    # fail-closed recovery path, but are never POSTed again.
+                    # offer terms directly. They remain byte-for-byte available
+                    # for manual reconciliation and are never attributed by GET.
                     _validate_window_offer(pending)
+            for request_id, outcome in state["request_outcomes"].items():
+                if (not isinstance(outcome, dict) or set(outcome) != {
+                        "version", "offer_request_id", "offer_authority_epoch",
+                        "offer_window_id", "offer_terms_sha256", "terms",
+                        "outcome", "http_status", "error_type", "message",
+                } or outcome.get("outcome") != "refused"
+                        or type(outcome.get("http_status")) is not int
+                        or outcome["http_status"] != 409
+                        or outcome.get("error_type") != "offer_request_refused"
+                        or outcome.get("message") not in _OFFER_TERMINAL_REASONS):
+                    raise ValueError("invalid archived offer outcome")
+                envelope = {key: value for key, value in outcome.items()
+                            if key not in {"outcome", "http_status", "error_type", "message"}}
+                self._validate_offer_request_envelope(envelope)
+                if request_id != outcome["offer_request_id"]:
+                    raise ValueError("invalid archived request identity")
+                has_v2_evidence = True
+            for job_id, marker in state["window_markers"].items():
+                if (not isinstance(job_id, str) or not job_id
+                        or not isinstance(marker, dict) or set(marker) != {
+                            "offer_request_id", "offer_authority_epoch",
+                            "offer_window_id", "reason",
+                        } or marker.get("reason") not in _OFFER_TERMINAL_REASONS):
+                    raise ValueError("invalid offer window marker")
+                outcome = state["request_outcomes"][marker["offer_request_id"]]
+                if (outcome["terms"]["job_id"] != job_id
+                        or outcome["offer_authority_epoch"]
+                        != marker["offer_authority_epoch"]
+                        or outcome["offer_window_id"] != marker["offer_window_id"]
+                        or outcome["message"] != marker["reason"]):
+                    raise ValueError("offer window marker does not match its outcome")
+                has_v2_evidence = True
+            if has_v2_evidence and state["offer_protocol_floor"] is None:
+                # Read-compatible migration for a request-ID journal written by
+                # a prerelease candidate. The inferred floor becomes durable on
+                # the next state transition.
+                state["offer_protocol_floor"] = _OFFER_IDEMPOTENCY_PROTOCOL
             return state
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             raise RecoveryRequired("offer recovery record is corrupt") from None
 
     def _save_offers(self, state: dict[str, Any]) -> None:
@@ -1089,21 +1175,50 @@ class MinerSkeleton:
         return normalized
 
     @staticmethod
-    def _new_offer_request_id() -> str:
-        """Generate a bounded 128-bit idempotency identity for one offer intent."""
-        return _validate_offer_request_id(f"ofr_{secrets.token_hex(16)}")
+    def _new_offer_request_id(offer_window_id: str, offer_terms_sha256: str) -> str:
+        """Generate a random request key that embeds its window and terms bindings."""
+        request_id = f"ofr_{offer_window_id}{offer_terms_sha256}{secrets.token_hex(16)}"
+        return _validate_offer_request_id(
+            request_id,
+            offer_window_id=offer_window_id,
+            offer_terms_sha256=offer_terms_sha256,
+        )
 
     @staticmethod
     def _offer_authority_epoch(queue: Mapping[str, Any]) -> str | None:
         capability = queue.get("offer_idempotency")
         if not isinstance(capability, Mapping):
             return None
-        if capability.get("protocol") != "ormas-offer-request-v1":
+        if capability.get("protocol") != _OFFER_IDEMPOTENCY_PROTOCOL:
             return None
         try:
             return _validate_offer_authority_epoch(capability.get("authority_epoch"))
         except ValueError:
             return None
+
+    @staticmethod
+    def _offer_window_id(entry: Mapping[str, Any]) -> str:
+        try:
+            return _validate_offer_window_id(entry.get("offer_window_id"))
+        except ValueError as exc:
+            raise RecoveryRequired("queue job has no usable offer window identity") from exc
+
+    def _bind_offer_protocol(
+        self, state: dict[str, Any], authority_epoch: str | None,
+    ) -> None:
+        """Persist a v1 floor and permanently poison an observed rollback."""
+        if state["offer_protocol_poisoned"]:
+            raise RecoveryRequired("offer idempotency protocol rollback requires reconciliation")
+        floor = state["offer_protocol_floor"]
+        if authority_epoch is None:
+            if floor == _OFFER_IDEMPOTENCY_PROTOCOL:
+                state["offer_protocol_poisoned"] = True
+                self._save_offers(state)
+                raise RecoveryRequired("offer idempotency protocol rollback requires reconciliation")
+            return
+        if floor is None:
+            state["offer_protocol_floor"] = _OFFER_IDEMPOTENCY_PROTOCOL
+            self._save_offers(state)
 
     @staticmethod
     def _pending_offer_refusal(cause: BaseException | None = None) -> NoReturn:
@@ -1117,12 +1232,13 @@ class MinerSkeleton:
         """Recognize only the gateway's persisted, request-bound refusal."""
         return (exc.status_code == 409
                 and exc.error_type == "offer_request_refused"
-                and exc.message in {"window_closed", "not_offering"}
+                and exc.message in _OFFER_TERMINAL_REASONS
                 and exc.details.get("offer_request_id") == pending["offer_request_id"]
                 and exc.details.get("job_id") == pending["terms"]["job_id"]
                 and exc.details.get("offer_terms_sha256") == pending["offer_terms_sha256"]
                 and exc.details.get("offer_authority_epoch")
-                == pending["offer_authority_epoch"])
+                == pending["offer_authority_epoch"]
+                and exc.details.get("offer_window_id") == pending["offer_window_id"])
 
     def _resolve_offer_request(
         self, state: dict[str, Any], pending: dict[str, Any],
@@ -1130,6 +1246,7 @@ class MinerSkeleton:
         """Replay one exact request and durably record its success or refusal."""
         request_id = pending["offer_request_id"]
         authority_epoch = pending["offer_authority_epoch"]
+        window_id = pending["offer_window_id"]
         terms_sha256 = pending["offer_terms_sha256"]
         terms = pending["terms"]
         try:
@@ -1137,6 +1254,7 @@ class MinerSkeleton:
                 self.config.runner_id, terms,
                 offer_request_id=request_id,
                 offer_authority_epoch=authority_epoch,
+                offer_window_id=window_id,
             )
         except OrmasGatewayError as exc:
             if not self._durable_offer_refusal(exc, pending):
@@ -1147,6 +1265,23 @@ class MinerSkeleton:
                         or exc.status_code >= 500):
                     raise
                 self._pending_offer_refusal(exc)
+            outcome = {
+                **pending,
+                "outcome": "refused",
+                "http_status": exc.status_code,
+                "error_type": exc.error_type,
+                "message": exc.message,
+            }
+            archived = state["request_outcomes"].get(request_id)
+            if archived is not None and archived != outcome:
+                self._pending_offer_refusal()
+            state["request_outcomes"][request_id] = outcome
+            state["window_markers"][terms["job_id"]] = {
+                "offer_request_id": request_id,
+                "offer_authority_epoch": authority_epoch,
+                "offer_window_id": window_id,
+                "reason": exc.message,
+            }
             state["pending"] = None
             self._save_offers(state)
             return "refused", exc.message
@@ -1160,6 +1295,7 @@ class MinerSkeleton:
         closes = response.get("window_closes_at")
         if (response.get("offer_request_id") != request_id
                 or response.get("offer_authority_epoch") != authority_epoch
+                or response.get("offer_window_id") != window_id
                 or response.get("offer_terms_sha256") != terms_sha256
                 or response.get("job_id") != terms["job_id"]
                 or not isinstance(new_id, str) or not new_id or new_id in state["bids"]
@@ -1172,72 +1308,26 @@ class MinerSkeleton:
             "window_closes_at": closes,
             "offer_request_id": request_id,
             "offer_authority_epoch": authority_epoch,
+            "offer_window_id": window_id,
             "offer_terms_sha256": terms_sha256,
             "ack_by_at": ack_by_at,
         }
         state["pending"] = None
         state["bids"][new_id] = bid
         state["current"][terms["job_id"]] = new_id
+        state["window_markers"].pop(terms["job_id"], None)
         self._save_offers(state)
         return "accepted", None
 
     def _recover_legacy_pending_offer(
         self, state: dict[str, Any], intent: dict[str, Any],
     ) -> set[str]:
-        """Adopt only an exact new own bid; negative GET evidence never clears."""
-        job_id = intent["job_id"]
-        try:
-            response = self.client.get_offer_for_job(self.config.runner_id, job_id)
-        except Exception as exc:  # transport/auth/old gateway all remain fail closed
-            self._pending_offer_refusal(exc)
-        if (not isinstance(response, Mapping) or response.get("job_id") != job_id
-                or type(response.get("window_closed")) is not bool or "bid" not in response):
-            self._pending_offer_refusal()
-        bid = response["bid"]
-        remote_terms = None
-        if bid is not None:
-            if (not isinstance(bid, Mapping) or not isinstance(bid.get("bid_id"), str)
-                    or not bid["bid_id"] or bid.get("status") not in {
-                        "open", "awarded", "not_awarded", "withdrawn", "replaced",
-                        "no_capacity", "acceptance_capacity", "award_lapsed",
-                    }):
-                self._pending_offer_refusal()
-            try:
-                _validate_window_offer(bid.get("terms"))
-                remote_terms = self._normalized_offer_terms(bid["terms"])
-                intent_terms = self._normalized_offer_terms(intent)
-            except (ValueError, TypeError, KeyError, OverflowError):
-                self._pending_offer_refusal()
-        # A locally known identity or different terms proves this is a prior
-        # bid regardless of status. Neither a prior bid nor absence proves an
-        # unkeyed POST can no longer commit, even after a reported close.
-        prior_bid = (isinstance(bid, Mapping)
-                     and (remote_terms != intent_terms
-                          or bid.get("bid_id") in state["bids"]))
-        if bid is None or prior_bid:
-            self._pending_offer_refusal()
-        bid_id, status = bid["bid_id"], bid["status"]
-        if ((status in {"open", "awarded"} and (
-                not isinstance(bid.get("ack_by_at"), str) or not bid["ack_by_at"]
-                or not isinstance(bid.get("window_closes_at"), str)
-                or not bid["window_closes_at"]))
-                or (status == "awarded" and (
-                    not isinstance(bid.get("award_id"), str) or not bid["award_id"]))):
-            self._pending_offer_refusal()
-        state["bids"][bid_id] = {
-            "terms": intent,
-            "status": status,
-            "ack_by_at": bid.get("ack_by_at"),
-            "window_closes_at": bid.get("window_closes_at"),
-            "award_id": bid.get("award_id"),
-        }
-        state["current"][job_id] = bid_id
-        state["pending"] = None
-        self._save_offers(state)
-        return {job_id}
+        """A latest-bid read cannot causally attribute an unkeyed ambiguous POST."""
+        del state, intent
+        self._pending_offer_refusal()
 
     def _recover_pending_offer(
-        self, state: dict[str, Any],
+        self, state: dict[str, Any], authority_epoch: str | None,
     ) -> tuple[set[str], list[dict[str, Any]]]:
         """Resolve one saved intent before any queue, pricing or claim action."""
         pending = state["pending"]
@@ -1246,9 +1336,14 @@ class MinerSkeleton:
         if not (isinstance(pending, dict) and type(pending.get("version")) is int
                 and pending["version"] == 2):
             return self._recover_legacy_pending_offer(state, pending), []
+        if authority_epoch != pending["offer_authority_epoch"]:
+            self._pending_offer_refusal()
         outcome, reason = self._resolve_offer_request(state, pending)
         terms = pending["terms"]
-        legacy = [terms] if outcome == "refused" and reason == "not_offering" else []
+        bid_id = state["current"].get(terms["job_id"])
+        bid = state["bids"].get(bid_id)
+        legacy = ([terms] if outcome == "refused" and reason == "not_offering"
+                  and (bid is None or bid.get("legacy")) else [])
         # Do not reprice or repost this job in the same tick. A later poll may
         # create a fresh request identity after this one is conclusively done.
         return {terms["job_id"]}, legacy
@@ -1311,8 +1406,17 @@ class MinerSkeleton:
 
     def _claim_offer_window(self) -> tuple[TaskLease, TaskDraft] | None:
         state = self._offer_state()
-        recovered_jobs, legacy_offers = self._recover_pending_offer(state)
+        pending = state["pending"]
+        if pending is not None and not (
+            isinstance(pending, dict) and type(pending.get("version")) is int
+            and pending["version"] == 2
+        ):
+            self._pending_offer_refusal()
+        if state["offer_protocol_poisoned"]:
+            raise RecoveryRequired("offer idempotency protocol rollback requires reconciliation")
         if self._queue_unsupported:
+            if state["offer_protocol_floor"] == _OFFER_IDEMPOTENCY_PROTOCOL:
+                self._bind_offer_protocol(state, None)
             if state["bids"]:
                 raise RecoveryRequired("own offer bids require gateway queue support")
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
@@ -1321,14 +1425,19 @@ class MinerSkeleton:
         except OrmasGatewayError as exc:
             if exc.status_code != 404 or exc.error_type is not None:
                 raise
+            if state["offer_protocol_floor"] == _OFFER_IDEMPOTENCY_PROTOCOL:
+                self._bind_offer_protocol(state, None)
             if state["bids"]:
                 raise RecoveryRequired("own offer bids require gateway queue support") from exc
             self._queue_unsupported = True
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
         authority_epoch = self._offer_authority_epoch(queue)
+        self._bind_offer_protocol(state, authority_epoch)
+        recovered_jobs, legacy_offers = self._recover_pending_offer(state, authority_epoch)
         missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
         for entry in queue.get("jobs", []):
             job_id = entry["job_id"]
+            window_id = self._offer_window_id(entry)
             if job_id in recovered_jobs:
                 continue
             bid_id = state["current"].get(job_id)
@@ -1342,6 +1451,22 @@ class MinerSkeleton:
             if bid is not None and not bid.get("legacy"):
                 bid = self._read_bid(state, bid_id)
                 if bid["status"] == "awarded":
+                    continue
+            marker = state["window_markers"].get(job_id)
+            marker_reason = None
+            if marker is not None:
+                if (marker["reason"] == "not_offering"
+                        and marker["offer_authority_epoch"] != authority_epoch):
+                    raise RecoveryRequired(
+                        "offer authority changed for a classified offer window",
+                    )
+            if marker is not None and marker["offer_window_id"] == window_id:
+                if marker["offer_authority_epoch"] != authority_epoch:
+                    raise RecoveryRequired(
+                        "offer authority changed for a terminal offer window",
+                    )
+                marker_reason = marker["reason"]
+                if marker_reason in {"window_closed", "request_limit"}:
                     continue
             if self.config.offer_fn is not None:
                 offer = self.config.offer_fn(entry)
@@ -1367,6 +1492,10 @@ class MinerSkeleton:
             if offer["job_id"] != job_id:
                 raise ValueError("offer job_id must match its queue entry")
             offer = dict(offer)
+            if marker_reason == "not_offering":
+                if bid is None or bid.get("legacy"):
+                    legacy_offers.append(offer)
+                continue
             if (bid is not None and not bid.get("legacy") and bid["terms"] == offer
                     and bid["status"] == "open"):
                 continue
@@ -1374,11 +1503,13 @@ class MinerSkeleton:
                 raise RecoveryRequired("gateway has no usable offer idempotency capability")
             # Save the request identity and exact terms before the first POST.
             # Any ambiguous outcome replays this envelope with the same id.
+            terms_sha256 = _offer_terms_sha256(offer)
             pending = {
                 "version": 2,
-                "offer_request_id": self._new_offer_request_id(),
+                "offer_request_id": self._new_offer_request_id(window_id, terms_sha256),
                 "offer_authority_epoch": authority_epoch,
-                "offer_terms_sha256": _offer_terms_sha256(offer),
+                "offer_window_id": window_id,
+                "offer_terms_sha256": terms_sha256,
                 "terms": offer,
             }
             state["pending"] = pending
