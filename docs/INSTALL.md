@@ -192,6 +192,14 @@ ormas-validator --gateway https://api.ormas.ai \
 Both files must be private to the service account. The decision key is separate
 from a Bittensor chain hotkey. `--once` reviews at most one assignment and returns
 3 when idle. The old `python neurons/validator.py` script delegates to this command.
+The checker accepts exactly one review slot. Parallel children share the service
+account's credential and signing boundary, so `--slots` values above one fail before
+the token or decision key is read. This lowers per-process throughput. Restore
+capacity only with additional validator identities that the gateway has separately
+registered and qualified, each running one process with its own service account or
+VM, token, decision key and work directory. Do not run those identities under a
+shared UID or filesystem namespace; when no separately qualified identity is
+available, process one assignment at a time.
 Public task checks need a qualified nonroot Linux/amd64 OCI environment. Keep the
 checker account, container authority, work directory and credentials separate from
 the wallet-bearing weight submission service. A rootful Docker socket can access

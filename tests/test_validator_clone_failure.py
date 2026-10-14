@@ -28,7 +28,17 @@ def _unclonable_assignment(tmp_path: Path) -> dict[str, Any]:
         allowed_paths=["out.txt"],
         immutable_paths=[],
     )
-    return {"assignment_id": "asgn_unclonable", **fields, "evidence_digest_sha256": evidence_digest_hex(fields)}
+    return {
+        "assignment_id": "asgn_unclonable",
+        "validator_id": "val_test",
+        "decision_protocol_version": "ormas-validator-decision-v2",
+        "decision_nonce": "2" * 64,
+        "validator_key_generation": 1,
+        "validator_pubkey_hex": "ab" * 32,
+        "decision_expires_at": "2099-01-01T00:00:00Z",
+        **fields,
+        "evidence_digest_sha256": evidence_digest_hex(fields),
+    }
 
 
 @requires_git
