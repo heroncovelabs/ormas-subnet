@@ -373,38 +373,74 @@ miners introduce no local bidding deadlines or reserve estimates.
 
 ### `POST /api/runner/v1/offers`
 
-`submit_offer(runner_id, offer)` sends exactly one of these bodies, with no
-`schema_version`:
+`submit_offer(runner_id, offer, offer_request_id=None,
+offer_authority_epoch=None)` sends one of these bodies, with no `schema_version`.
+Direct callers that omit both identity fields retain the legacy wire body. The
+reference miner uses the idempotent form only when the queue advertises:
 
 ```json
-{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "firm", "price_usd": 0.20}
+{"offer_idempotency": {"protocol": "ormas-offer-request-v1", "authority_epoch": "0123456789abcdef0123456789abcdef"}}
+```
+
+It journals the exact terms, request id, advertised authority epoch and expected
+terms digest before its first POST:
+
+```json
+{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "firm", "price_usd": 0.20, "offer_request_id": "ofr_0123456789abcdef0123456789abcdef", "offer_authority_epoch": "0123456789abcdef0123456789abcdef"}
 ```
 
 ```json
-{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30}
+{"runner_id": "runr_0123456789ab", "job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30, "offer_request_id": "ofr_0123456789abcdef0123456789abcdef", "offer_authority_epoch": "0123456789abcdef0123456789abcdef"}
 ```
 
 Firm prices are positive finite numbers. Limit amounts satisfy
 `0 < estimate_usd <= limit_usd` and are finite. Booleans are refused locally.
-The response contains `bid_id` and `window_closes_at`; a gateway may also include
-`job_id` and `ack_by_at`. An over-reserve POST receives the same acknowledgement
-shape, with no reserve feedback. Replacing terms uses a new POST and returns a
-new `bid_id`; the old open bid becomes `replaced`.
+An `offer_request_id` is exactly `ofr_` followed by 32 lowercase hexadecimal
+characters. `offer_authority_epoch` is exactly 32 lowercase hexadecimal
+characters. The gateway compares the supplied epoch with its current durable
+epoch before any authority or bid mutation. An epoch mismatch creates no request
+or bid record and returns HTTP 409 `conflict_error` with message
+`offer_authority_epoch_mismatch`; the miner retains its journal for manual
+reconciliation.
+
+The success response contains the exact echoed `offer_request_id`,
+`offer_authority_epoch`, `job_id`, gateway-computed `offer_terms_sha256`, `bid_id`,
+`ack_by_at` and frozen `window_closes_at`. The terms digest is SHA-256 of compact,
+key-sorted JSON after the gateway normalizes all price fields to JSON floats; it
+is an acknowledgement field and is not sent in the POST. The miner computes it
+independently and requires an exact match. An over-reserve POST receives the same
+acknowledgement shape, with no reserve feedback. Replacing terms uses a new
+request identity and returns a new `bid_id`; the old open bid becomes `replaced`.
+
+An exact replay of the same runner, request id and terms returns the original
+frozen acknowledgement without creating or replacing another bid. Reusing an id
+with different terms returns HTTP 409 `offer_request_conflict`. A final refusal
+is stored by the gateway and returned as HTTP 409:
+
+```json
+{"error": {"type": "offer_request_refused", "message": "window_closed", "offer_request_id": "ofr_0123456789abcdef0123456789abcdef", "job_id": "job-1", "offer_terms_sha256": "1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602", "offer_authority_epoch": "0123456789abcdef0123456789abcdef"}}
+```
+
+Only this typed refusal, with `message` equal to `window_closed` or `not_offering`
+and every binding field equal to the journal, lets the reference miner clear a
+pending request. Transport errors, generic HTTP errors, malformed
+acknowledgements, authority-epoch mismatches and binding mismatches retain it for
+exact replay or manual reconciliation.
 
 ### `GET /api/runner/v1/offers?runner_id=...&job_id=...`
 
-`get_offer_for_job(runner_id, job_id)` reconciles a saved POST intent when the
-gateway may have committed an offer but its acknowledgement was lost. The
-authenticated runner and device can read only their latest own bid for that
+`get_offer_for_job(runner_id, job_id)` is the legacy read-only recovery route.
+The authenticated runner and device can read only their latest own bid for that
 job. The response is `{"job_id": str, "window_closed": bool, "bid": object|null}`;
-an included bid carries its immutable `terms`, status and bid identity. This is
-a read only lookup: it does not evaluate a window, update liveness or award work.
-The reference miner validates the response against its saved intent and never
-replays the ambiguous POST. A missing bid, a locally known bid identity, or a
-bid with different immutable terms is conclusive only after `window_closed`
-becomes true; otherwise the miner remains fail closed and tries the read again
-on a later poll. A known prior award keeps its original frozen terms and can
-still be claimed after the pending replacement is resolved.
+an included bid carries its immutable `terms`, status and bid identity. This
+route does not evaluate a window, update liveness or award work.
+
+New reference-miner journals replay their saved idempotent POST instead. A
+pre-id journal may adopt one exact matching own bid that is not already in its
+local bid records. Absence, a locally known bid or different immutable terms can
+never prove the outcome of an unkeyed POST, including when `window_closed` is
+true; those journals stay fail closed for manual reconciliation. Known prior
+open and awarded bids keep their original frozen terms and identities.
 
 ### `GET /api/runner/v1/offers/{bid_id}`
 
@@ -432,16 +468,22 @@ no competitor book, reserve, model identity or provider cost.
 award. Award commits the miner to its frozen terms; it must then claim and
 execute without repricing or withdrawal. A nonopen withdrawal returns HTTP 409
 with `error.type: "conflict_error"` and `error.message: "not_open"`.
-A submission racing a closed window returns the same error type with
-`error.message: "window_closed"`. Reconcile own status after either race.
-Authentication and transport errors propagate.
+An idempotent submission racing a closed window returns the durable
+`offer_request_refused` shape above. A legacy submission may return
+`conflict_error` with `error.message: "window_closed"`. Reconcile own status
+after either race. Authentication and transport errors propagate.
 
 Tested submit/read/withdraw example (`tests/test_offer_window.py` exercises these
 calls through a standalone transport, including the device header):
 
 ```python
 offer = {"job_id": "job-1", "kind": "limit", "estimate_usd": 0.20, "limit_usd": 0.30}
-posted = client.submit_offer(runner_id, offer)
+posted = client.submit_offer(
+    runner_id,
+    offer,
+    offer_request_id=journalled_request_id,
+    offer_authority_epoch=journalled_authority_epoch,
+)
 bid = client.get_offer(posted["bid_id"])
 if bid["status"] == "open":
     client.withdraw_offer(posted["bid_id"])
@@ -469,15 +511,21 @@ has reconciled awards. The default legacy route accepts on arrival within the
 client's undisclosed spending limit. Saved window identities remain required
 for every window award returned by either claim path.
 
-Recovery limits: the gateway provides no general own-offer listing or POST
-idempotency key. A lost POST acknowledgement leaves a durable unresolved intent;
-the miner refuses claims until the runner/job recovery read returns the matching
-own bid or proves the window closed without it. The queue also omits a window
-identity for reopened jobs. The reference miner
-retains unchanged bid records and avoids automatic same-price resubmission
-for such a job. It reconciles gateway-owned reopening and awards at the saved
-terms. Explicitly changed terms can submit a new bid through the gateway;
-the miner executes only an own award bound to its saved terms.
+Recovery limits: idempotent replay requires a gateway version that advertises the
+protocol and durably binds success and refusal to the request id, authority epoch,
+job and terms digest. The reference miner does not start a new POST without that
+capability. If an inconsistent fleet advertises it and then rejects the identity
+fields, the miner retains the request and refuses claims rather than retrying
+without its identity. Rollout therefore installs the schema and id-aware code on
+the whole gateway fleet before advertising the capability or releasing this miner
+behavior. Once an id-bearing request may have reached the gateway, downgrade to
+an id-unaware gateway is unsupported until that request is reconciled.
+
+The queue omits a window identity for reopened jobs. The reference miner retains
+unchanged bid records and avoids automatic same-price resubmission for such a
+job. It reconciles gateway-owned reopening and awards at the saved terms.
+Explicitly changed terms submit with a new request identity; the miner executes
+only an own award bound to its saved terms.
 
 Offer windows preserve reserve privacy, task-shape-only queue disclosure,
 Standard/Protected admission, public/private repository boundaries and miner
