@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
-from urllib.parse import unquote
+import json
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -27,6 +29,9 @@ class OfferTransport:
         self.award_on_claim = False
         self.race = None
         self.error = None
+        self.lose_offer_before_commit = False
+        self.lose_offer_ack = False
+        self.window_closed = False
         self.legacy = set()
         self.queue_response = None
         self.lease_response = None
@@ -43,6 +48,9 @@ class OfferTransport:
                 raise self.error
             return self.error
         if path.endswith("/offers"):
+            if self.lose_offer_before_commit:
+                self.lose_offer_before_commit = False
+                raise RuntimeError("replacement outcome unknown")
             if body["job_id"] in self.legacy:
                 return self.conflict("not_offering")
             if self.race == "window_closed":
@@ -57,6 +65,9 @@ class OfferTransport:
             bid_id = f"bid_{len(self.bids) + 1}"
             self.bids[bid_id] = {"terms": {k: v for k, v in body.items() if k != "runner_id"},
                                  "status": "open"}
+            if self.lose_offer_ack:
+                self.lose_offer_ack = False
+                raise RuntimeError("response lost after commit")
             return _FakeResponse(200, {"bid_id": bid_id, "window_closes_at": "2026-10-08T00:10:00Z"})
         if path.endswith("/leases"):
             if self.lease_response is not None:
@@ -95,6 +106,29 @@ class OfferTransport:
                     if job["job_id"] == self.bids[self.award]["terms"]["job_id"]:
                         job.update(awarded_to_you=True, bid_id=self.award, award_id="awd_1")
             return _FakeResponse(200, {"jobs": jobs})
+        if "/offers?" in path:
+            if self.error is not None:
+                if isinstance(self.error, BaseException):
+                    raise self.error
+                return self.error
+            query = parse_qs(urlsplit(path).query)
+            job_id = query.get("job_id", [None])[0]
+            matches = [(bid_id, bid) for bid_id, bid in self.bids.items()
+                       if bid["terms"]["job_id"] == job_id]
+            bid_payload = None
+            if matches:
+                bid_id, bid = matches[-1]
+                bid_payload = {
+                    "bid_id": bid_id,
+                    "status": bid["status"],
+                    "terms": deepcopy(bid["terms"]),
+                    "ack_by_at": "2026-10-08T00:01:00Z",
+                    "window_closes_at": "2026-10-08T00:10:00Z",
+                }
+                if bid["status"] == "awarded":
+                    bid_payload["award_id"] = "awd_1"
+            return _FakeResponse(200, {"job_id": job_id,
+                "window_closed": self.window_closed, "bid": bid_payload})
         bid_id = unquote(path.rsplit("/", 1)[1])
         if self.error is not None:
             if isinstance(self.error, BaseException):
@@ -131,7 +165,7 @@ def client_for(transport, **kwargs):
 
 
 def require_offer_api(client):
-    for method in ("submit_offer", "get_offer", "withdraw_offer"):
+    for method in ("submit_offer", "get_offer_for_job", "get_offer", "withdraw_offer"):
         assert callable(getattr(client, method, None)), f"public client needs {method} behavior"
 
 
@@ -146,11 +180,13 @@ def test_documented_submit_read_withdraw_exact_wire(terms, device):
     require_offer_api(client)
     posted = client.submit_offer("runner-1", terms)
     assert posted == {"bid_id": "bid_1", "window_closes_at": "2026-10-08T00:10:00Z"}
+    assert client.get_offer_for_job("runner-1", terms["job_id"])["bid"]["bid_id"] == "bid_1"
     assert client.get_offer(posted["bid_id"]) == {"bid_id": "bid_1", "status": "open"}
     assert client.withdraw_offer(posted["bid_id"]) == {"bid_id": "bid_1", "status": "withdrawn"}
     headers = None if device is None else {RUNNER_DEVICE_HEADER: device}
     assert transport.calls == [
         ("POST", "/api/runner/v1/offers", {"runner_id": "runner-1", **terms}, headers),
+        ("GET", "/api/runner/v1/offers?runner_id=runner-1&job_id=task_1", None, headers),
         ("GET", "/api/runner/v1/offers/bid_1", None, headers),
         ("DELETE", "/api/runner/v1/offers/bid_1", None, headers),
     ]
@@ -176,6 +212,8 @@ def test_offer_identities_validate_locally(identity):
     client = client_for(transport)
     require_offer_api(client)
     for operation in [lambda: client.submit_offer(identity, {"job_id": "task_1", "kind": "firm", "price_usd": 1}),
+                      lambda: client.get_offer_for_job(identity, "task_1"),
+                      lambda: client.get_offer_for_job("runner-1", identity),
                       lambda: client.get_offer(identity), lambda: client.withdraw_offer(identity)]:
         with pytest.raises(ValueError):
             operation()
@@ -206,7 +244,7 @@ def test_bid_identity_is_one_url_segment():
         assert path.count("/") == 5
 
 
-@pytest.mark.parametrize("method", ["submit_offer", "get_offer", "withdraw_offer"])
+@pytest.mark.parametrize("method", ["submit_offer", "get_offer_for_job", "get_offer", "withdraw_offer"])
 @pytest.mark.parametrize("code,kind,message", [(409, "conflict_error", "not_open"),
     (409, "conflict_error", "window_closed"), (401, "authentication_error", "device mismatch"),
     (503, "service_unavailable", "unavailable")])
@@ -215,7 +253,12 @@ def test_offer_structured_errors(method, code, kind, message):
     transport.error = _FakeResponse(code, {"error": {"type": kind, "message": message}})
     client = client_for(transport, device_nonce="device-1")
     require_offer_api(client)
-    args = ("runner-1", {"job_id": "task_1", "kind": "firm", "price_usd": 1}) if method == "submit_offer" else ("bid_1",)
+    if method == "submit_offer":
+        args = ("runner-1", {"job_id": "task_1", "kind": "firm", "price_usd": 1})
+    elif method == "get_offer_for_job":
+        args = ("runner-1", "task_1")
+    else:
+        args = ("bid_1",)
     with pytest.raises(OrmasGatewayError) as raised:
         getattr(client, method)(*args)
     assert (raised.value.status_code, raised.value.error_type, raised.value.message) == (code, kind, message)
@@ -281,6 +324,12 @@ def test_httpx_offer_wire_preserves_bearer_and_device():
     import httpx
     requests = []
     responses = [{"bid_id": "bid_1", "window_closes_at": "2026-10-08T00:10:00Z"},
+                 {"job_id": "job-1", "window_closed": False, "bid": {
+                     "bid_id": "bid_1", "status": "open",
+                     "terms": {"job_id": "job-1", "kind": "limit",
+                               "estimate_usd": 0.2, "limit_usd": 0.3},
+                     "ack_by_at": "2026-10-08T00:01:00Z",
+                     "window_closes_at": "2026-10-08T00:10:00Z"}},
                  {"bid_id": "bid_1", "status": "open"}, {"bid_id": "bid_1", "status": "withdrawn"}]
 
     def handle(request):
@@ -292,10 +341,12 @@ def test_httpx_offer_wire_preserves_bearer_and_device():
         client = client_for(transport, device_nonce="device-1")
         posted = client.submit_offer("runner-1", {"job_id": "job-1", "kind": "limit",
                                                 "estimate_usd": 0.20, "limit_usd": 0.30})
+        assert client.get_offer_for_job("runner-1", "job-1")["bid"]["bid_id"] == "bid_1"
         assert client.get_offer(posted["bid_id"])["status"] == "open"
         assert client.withdraw_offer(posted["bid_id"])["status"] == "withdrawn"
-    assert [request.method for request in requests] == ["POST", "GET", "DELETE"]
+    assert [request.method for request in requests] == ["POST", "GET", "GET", "DELETE"]
     assert requests[0].content == b'{"runner_id":"runner-1","job_id":"job-1","kind":"limit","estimate_usd":0.2,"limit_usd":0.3}'
+    assert requests[1].url.query == b"runner_id=runner-1&job_id=job-1"
     for request in requests:
         assert request.headers["Authorization"] == "Bearer ormr_test"
         assert request.headers[RUNNER_DEVICE_HEADER] == "device-1"
@@ -548,16 +599,100 @@ def test_window_ordinary_errors_propagate(tmp_path, error):
     assert claims(transport) == []
 
 
-def test_ambiguous_post_restart_refuses_unbound_execution(tmp_path):
+def test_ambiguous_post_restart_recovers_committed_bid_without_replay(tmp_path):
     transport, miner = window_miner(tmp_path)
-    transport.error = RuntimeError("response lost")
-    with pytest.raises(RuntimeError, match="response lost"):
+    transport.lose_offer_ack = True
+    with pytest.raises(RuntimeError, match="response lost after commit"):
+        miner.run_once()
+    restarted = MinerSkeleton(miner.client, miner.config, miner.solve_fn)
+    assert restarted.run_once() is False
+    assert len(offers(transport)) == 1
+    journal = next(Path(tmp_path).rglob("offers.json"))
+    state = json.loads(journal.read_text())
+    assert state["pending"] is None
+    assert state["current"] == {"task_1": "bid_1"}
+    assert state["bids"]["bid_1"]["terms"] == {
+        "job_id": "task_1", "kind": "firm", "price_usd": 1.25}
+    assert sum(call[0] == "GET" and "/offers?" in call[1] for call in transport.calls) == 1
+
+
+def test_ambiguous_post_without_commit_never_replays_and_clears_only_after_close(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.error = RuntimeError("request outcome unknown")
+    with pytest.raises(RuntimeError, match="request outcome unknown"):
         miner.run_once()
     transport.error = None
     restarted = MinerSkeleton(miner.client, miner.config, miner.solve_fn)
     with pytest.raises(RecoveryRequired, match="offer|bid"):
         restarted.run_once()
+    assert len(offers(transport)) == 1
+    transport.window_closed = True
+    assert restarted.run_once() is False
+    assert len(offers(transport)) == 1
+    journal = next(Path(tmp_path).rglob("offers.json"))
+    assert json.loads(journal.read_text())["pending"] is None
+
+
+def test_ambiguous_post_recovery_preserves_award_identity_before_execution(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.lose_offer_ack = True
+    with pytest.raises(RuntimeError, match="response lost after commit"):
+        miner.run_once()
+    transport.set_award("bid_1")
+    restarted = MinerSkeleton(miner.client, miner.config, miner.solve_fn)
+    assert restarted.run_once() is True
+    assert len(offers(transport)) == 1
+    assert transport.source.completed["terminal"]["verification_state"] == "verified"
+    journal = next(Path(tmp_path).rglob("offers.json"))
+    state = json.loads(journal.read_text())
+    assert state["bids"]["bid_1"]["award_id"] == "awd_1"
+
+
+@pytest.mark.parametrize("recovery", [
+    {"job_id": "other", "window_closed": False, "bid": None},
+    {"job_id": "task_1", "window_closed": "false", "bid": None},
+    {"job_id": "task_1", "window_closed": False},
+    {"job_id": "task_1", "window_closed": False, "bid": {
+        "bid_id": "bid_1", "status": "open",
+        "terms": {"job_id": "task_1", "kind": "firm", "price_usd": 9},
+        "ack_by_at": "2026-10-08T00:01:00Z", "window_closes_at": "2026-10-08T00:10:00Z",
+    }},
+    {"job_id": "task_1", "window_closed": False, "bid": {
+        "bid_id": "bid_1", "status": "awarded",
+        "terms": {"job_id": "task_1", "kind": "firm", "price_usd": 1.25},
+        "ack_by_at": "2026-10-08T00:01:00Z", "window_closes_at": "2026-10-08T00:10:00Z",
+    }},
+])
+def test_ambiguous_post_malformed_or_mismatched_recovery_stays_pending(tmp_path, monkeypatch, recovery):
+    transport, miner = window_miner(tmp_path)
+    transport.error = RuntimeError("request outcome unknown")
+    with pytest.raises(RuntimeError):
+        miner.run_once()
+    transport.error = None
+    monkeypatch.setattr(miner.client, "get_offer_for_job", lambda *_: recovery)
+    restarted = MinerSkeleton(miner.client, miner.config, miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        restarted.run_once()
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is not None
     assert claims(transport) == []
+    assert len(offers(transport)) == 1
+
+
+def test_ambiguous_replacement_does_not_bind_or_replay_prior_open_bid(tmp_path):
+    desired = [{"job_id": "task_1", "kind": "firm", "price_usd": 1.25}]
+    transport, miner = window_miner(tmp_path, lambda _: desired[0])
+    assert miner.run_once() is False
+    desired[0] = {"job_id": "task_1", "kind": "firm", "price_usd": 2.5}
+    transport.lose_offer_before_commit = True
+    with pytest.raises(RuntimeError):
+        miner.run_once()
+    with pytest.raises(RecoveryRequired, match="offer POST outcome unknown"):
+        miner.run_once()
+    assert len(offers(transport)) == 2
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] == desired[0]
+    assert state["current"] == {"task_1": "bid_1"}
 
 
 def test_public_recovery_precedes_all_offer_calls(tmp_path, monkeypatch):

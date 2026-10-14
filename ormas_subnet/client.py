@@ -394,6 +394,28 @@ class OrmasMinerClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def get_offer_for_job(self, runner_id: str, job_id: str) -> dict[str, Any]:
+        """Read the latest own offer after an ambiguous POST acknowledgement.
+
+        This endpoint is read only. Callers use it to recover the gateway's bid
+        identity and must never replay an ambiguously acknowledged POST.
+        """
+        from urllib.parse import urlencode
+
+        if not isinstance(runner_id, str) or not runner_id.strip():
+            raise ValueError("runner_id must be a non-empty string")
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job_id must be a non-empty string")
+        query = urlencode({"runner_id": runner_id, "job_id": job_id})
+        path = f"/api/runner/v1/offers?{query}"
+        headers = self._headers()
+        resp = self._client.get(path) if headers is None else self._client.get(path, headers=headers)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("invalid offer recovery payload")
+        return payload
+
     @staticmethod
     def _offer_path(bid_id: str) -> str:
         from urllib.parse import quote
