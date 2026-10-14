@@ -41,7 +41,7 @@ PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
 # selecting its old catalog digest.  Updating this allowlist requires review of
 # the exact embedded verifier source and coordinated gateway/SDK rollout.
 _ACTIVE_VERIFIER_COMPILERS = frozenset({
-    'd609ed993b3bda292cc93e5e995699da1175ca995d4226d17cb8794a8ab89151',
+    '2c80182959d5f5f67dc9e7bc1389f532e8199be1880c1af5f7fb50ff9d272690',
 })
 
 
@@ -383,8 +383,8 @@ def validate_public_execution_packet(packet):
         raise ValueError('dependency_locks_must_be_immutable')
     if any(not any(path == rule or path.startswith(rule.rstrip('/') + '/') for rule in immutable) for path in files):
         raise ValueError('acceptance_files_must_be_immutable')
-    # Card 70cd3006: v2 (proven locally by the preparer) is byte-compatible
-    # with the original closed shape; v3 (card 70cd3006's remote/deferred
+    # v2 (proven locally by the preparer) is byte-compatible with the
+    # original closed shape; v3's remote/deferred
     # preflight) is a SEPARATE closed shape asserting only that the miner has
     # not yet run the base — never treated as red/failing evidence, and never
     # accepted with any extra, missing, or mismatched key.

@@ -1,9 +1,8 @@
 """The reference validator provisions the assignment's declared toolchain before it
-re-runs the verify command (Ormas card 2dde8b88, unit 4 — public twin).
+re-runs the verify command.
 
-Why: on 2026-09-13 the validator false-rejected 2/2 correct deliveries because its fresh
-clone had no project dependencies. The gateway now serves an optional ``toolchain`` block on
-the assignment and signs over it in the evidence digest:
+The gateway serves an optional ``toolchain`` block on the assignment and signs over it in
+the evidence digest:
 
     {"kind": "python", "python": "3.12", "pip_install": ["-e", ".", "pytest"], "lock_paths": [...]}
 
@@ -152,7 +151,7 @@ def test_malformed_toolchain_is_error_never_provisioned(tmp_path: Path) -> None:
 def test_missing_verifier_executable_is_a_signed_error_not_a_reject(tmp_path: Path) -> None:
     repo, base = _init_repo(tmp_path)
     result = _commit_result(repo, "raise SystemExit(0)\n")
-    assignment = _assignment(repo, base, result, "ormas-nonexistent-verifier-709e2a53", None)
+    assignment = _assignment(repo, base, result, "ormas-nonexistent-verifier-synthetic", None)
     gateway = _run_once(tmp_path, assignment)
     assert gateway.decisions[0]["decision"] == "error", "launch failure became miner overclaim"
     assert len(gateway.decisions[0]["signature_hex"]) == 128

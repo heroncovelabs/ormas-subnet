@@ -8,7 +8,6 @@ import os
 import platform
 from datetime import datetime
 import shutil
-import stat
 import sys
 import tempfile
 import warnings
@@ -18,6 +17,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import __version__
+from ._private_file import read_private_text
 from .client import OrmasGatewayError, OrmasMinerClient, load_token
 from .protected_env import (
     MINER_ID, SPLIT_ALLOWED_ENVS, WORKER_DIGEST, json_object, parse_worker_env, provider_host,
@@ -34,17 +34,22 @@ def _credentials_path() -> Path:
 
 def _read_credentials() -> dict[str, str]:
     path = _credentials_path()
-    if path.is_symlink():
-        raise ValueError("credentials must be a regular file with mode 0600")
-    try:
-        mode = path.stat().st_mode
-    except FileNotFoundError:
+    if not path.exists():
         return {}
-    if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
-        raise ValueError("credentials must be a regular file with mode 0600")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        raw = read_private_text(
+            path, label="credentials with mode 0400 or 0600", max_bytes=8192,
+        )
+    except ValueError as exc:
+        # A disappearance after the advisory existence check is a harmless
+        # missing configuration.  Every successful read is still validated
+        # and consumed through one no-follow descriptor.
+        if not path.exists():
+            return {}
+        raise ValueError(str(exc)) from None
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
         raise ValueError("credentials file is unreadable or invalid JSON") from exc
     if not isinstance(data, dict) or not all(isinstance(data.get(k), str)
                                             for k in ("gateway", "token")):

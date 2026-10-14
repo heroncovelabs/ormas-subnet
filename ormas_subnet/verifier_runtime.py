@@ -350,22 +350,169 @@ if os.path.isdir(scratch):
     shutil.rmtree(scratch,ignore_errors=True)
 '''
 
-# A candidate call whose process spawn failed (a program the image does not
-# provide, or an OS refusal) shows pytest's failing frame inside the standard
-# library's subprocess.py raising the OSError. The error type is tied to that
-# frame: in the long/auto/line tracebacks it follows the frame on the same
-# line, in the short traceback its ``E`` line follows the frame's source. A
-# test that itself raises FileNotFoundError on a data file, or a
-# CalledProcessError beside another test's unrelated OSError, is a plain red.
-_SPAWN_TYPES = rb'(?:FileNotFoundError|PermissionError|BlockingIOError|ProcessLookupError|OSError)\b'
-_SPAWN = re.compile(
-    rb'^\S*/python3\.\d+/subprocess\.py:\d+: (?:' + _SPAWN_TYPES
-    + rb'|in \w+\n(?:[ \t].*\n|\n)*?E\s+' + _SPAWN_TYPES + rb')', re.M)
+# These host-selected wrappers launch the requested process without a shell,
+# capture its untrusted output as data, and report spawn errors separately.
+# They run as container root only long enough to create a child with the
+# candidate uid/gid.  The child has no capabilities and cannot signal or read
+# the privileged parent; no candidate-controlled bytes become wrapper code.
+_PYTHON_CANDIDATE_OBSERVER = r'''
+import base64,json,os,selectors,signal,subprocess,sys,time
+cfg=json.loads(base64.b64decode(sys.argv[1],validate=True))
+proc=None
+output=bytearray()
+result=None
+try:
+    try:
+        identity={'user':cfg['uid'],'group':cfg['gid']}
+        if os.geteuid()==0: identity['extra_groups']=()
+        elif cfg['uid']!=os.geteuid() or cfg['gid']!=os.getegid():
+            raise PermissionError('candidate identity drop unavailable')
+        proc=subprocess.Popen(cfg['argv'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,start_new_session=True,**identity)
+    except OSError:
+        result={'returncode':127,'output':'','spawn_failure':True}
+    if proc is not None:
+        deadline=time.monotonic()+cfg['timeout_s']
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout,selectors.EVENT_READ)
+            while selector.get_map():
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    result={'error':'candidate_observation_timeout'}
+                    break
+                for key,_ in selector.select(min(.1,remaining)):
+                    block=os.read(key.fileobj.fileno(),65536)
+                    if not block:
+                        selector.unregister(key.fileobj)
+                    elif len(output)+len(block)>cfg['cap']:
+                        result={'error':'candidate_observation_output_limit'}
+                        break
+                    else:
+                        output.extend(block)
+                if result is not None:
+                    break
+        if result is None:
+            try: code=proc.wait(timeout=max(.001,deadline-time.monotonic()))
+            except subprocess.TimeoutExpired: result={'error':'candidate_observation_timeout'}
+            else:
+                if code<0: code=min(255,128-code)
+                result={'returncode':code,'output':base64.b64encode(output).decode(),
+                        'spawn_failure':False}
+finally:
+    if proc is not None and proc.poll() is None:
+        try: os.killpg(proc.pid,signal.SIGKILL)
+        except ProcessLookupError: pass
+        proc.wait()
+    if proc is not None and proc.stdout is not None: proc.stdout.close()
+sys.stdout.write(json.dumps(result,separators=(',',':')))
+'''
+
+_NODE_CANDIDATE_OBSERVER = r'''
+const crypto=require('node:crypto');
+const fs=require('node:fs');
+const signalNumbers=require('node:os').constants.signals;
+const {spawnSync}=require('node:child_process');
+const cfg=JSON.parse(Buffer.from(process.argv[1],'base64').toString('utf8'));
+if(process.getuid()===0) process.setgroups([]);
+else if(cfg.uid!==process.getuid()||cfg.gid!==process.getgid()) throw new Error('candidate identity drop unavailable');
+const nonce=crypto.randomBytes(32).toString('hex');
+fs.writeSync(1,'\0ormas-observe-v1:'+nonce+'\0');
+const value=spawnSync(cfg.argv[0],cfg.argv.slice(1),{
+  env:process.env,stdio:['ignore',1,1],
+  timeout:cfg.timeout_s*1000,killSignal:'SIGKILL',
+  uid:cfg.uid,gid:cfg.gid
+});
+let code=125,spawnFailure=false,error='';
+if(value.error){
+  if(['ENOENT','EACCES','ENOEXEC'].includes(value.error.code))
+    {code=127;spawnFailure=true;}
+  else if(value.error.code==='ETIMEDOUT') error='candidate_observation_timeout';
+  else error='candidate_observation_failed';
+}else if(Number.isInteger(value.status)) code=value.status;
+else if(signalNumbers[value.signal]) code=Math.min(255,128+signalNumbers[value.signal]);
+fs.writeSync(1,'\0ormas-observe-v1:'+nonce+':'+code+':'+(spawnFailure?'1':'0')+':'+error+'\0');
+'''
+
+_CANDIDATE_OBSERVER_RUNTIMES = {
+    'linux-python-stdlib-v1': '/usr/local/bin/python3',
+    'linux-python-pytest-v1': '/usr/local/bin/python3',
+    'linux-node-test-v1': '/usr/local/bin/node',
+    'linux-node-browser-v1': '/usr/bin/node',
+    'linux-node-browser-http-v1': '/usr/bin/node',
+}
 
 
-def candidate_spawn_failure(output):
-    """True when a failed candidate call's output shows a process spawn that failed."""
-    return bool(_SPAWN.search(output))
+def _candidate_observer_wrapper(profile_id, argument):
+    runtime = _CANDIDATE_OBSERVER_RUNTIMES.get(profile_id)
+    if runtime is None:
+        raise RuntimeRefusal('unsupported_candidate_observer_runtime')
+    if profile_id.startswith('linux-python-'):
+        return [runtime, '-I', '-S', '-c', _PYTHON_CANDIDATE_OBSERVER, argument]
+    return [runtime, '-e', _NODE_CANDIDATE_OBSERVER, argument]
+
+
+def _candidate_observer_result(raw, cap):
+    try:
+        value = json.loads(raw)
+        if isinstance(value, dict) and set(value) == {'error'}:
+            if value['error'] not in {
+                'candidate_observation_timeout',
+                'candidate_observation_output_limit',
+                'candidate_observation_failed',
+            }:
+                raise ValueError
+            raise RuntimeRefusal(value['error'])
+        if not isinstance(value, dict) or set(value) != {
+            'returncode', 'output', 'spawn_failure',
+        }:
+            raise ValueError
+        code = value['returncode']
+        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
+            raise ValueError
+        if not isinstance(value['spawn_failure'], bool) or not isinstance(value['output'], str):
+            raise ValueError
+        output = base64.b64decode(value['output'], validate=True)
+        if len(output) > cap:
+            raise ValueError
+        return code, output, value['spawn_failure']
+    except RuntimeRefusal:
+        raise
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise RuntimeRefusal('candidate_observation_invalid') from None
+
+
+def _node_candidate_observer_result(raw, cap):
+    prefix = b'\0ormas-observe-v1:'
+    if not raw.startswith(prefix):
+        raise RuntimeRefusal('candidate_observation_invalid')
+    header_end = raw.find(b'\0', len(prefix))
+    if header_end < 0:
+        raise RuntimeRefusal('candidate_observation_invalid')
+    nonce = raw[len(prefix):header_end]
+    if re.fullmatch(rb'[0-9a-f]{64}', nonce) is None:
+        raise RuntimeRefusal('candidate_observation_invalid')
+    trailer = prefix + nonce + b':'
+    trailer_start = raw.rfind(trailer, header_end + 1)
+    if trailer_start < 0 or not raw.endswith(b'\0'):
+        raise RuntimeRefusal('candidate_observation_invalid')
+    metadata = raw[trailer_start + len(trailer):-1].split(b':', 2)
+    if len(metadata) != 3:
+        raise RuntimeRefusal('candidate_observation_invalid')
+    try:
+        code = int(metadata[0].decode('ascii'))
+    except (UnicodeError, ValueError):
+        raise RuntimeRefusal('candidate_observation_invalid') from None
+    if not 0 <= code <= 255 or metadata[1] not in {b'0', b'1'}:
+        raise RuntimeRefusal('candidate_observation_invalid')
+    error = metadata[2].decode('ascii', errors='replace')
+    if error:
+        if error not in {'candidate_observation_timeout', 'candidate_observation_failed'}:
+            raise RuntimeRefusal('candidate_observation_invalid')
+        raise RuntimeRefusal(error)
+    output = raw[header_end + 1:trailer_start]
+    if len(output) > cap:
+        raise RuntimeRefusal('candidate_observation_output_limit')
+    return code, output, metadata[1] == b'1'
 
 
 class CandidateBridge:
@@ -444,9 +591,11 @@ class CandidateBridge:
                         self.used += size
                         self.http_observations += 1
                     else:
-                        code, output = self.execute(argv, call_deadline, self.cap - self.used)
+                        code, output, spawn_failure = self.execute(
+                            argv, call_deadline, self.cap - self.used,
+                        )
                         self.used += len(output)
-                        if code and candidate_spawn_failure(output):
+                        if spawn_failure:
                             self.spawn_failure = True
                         result = {'returncode': code, 'output': base64.b64encode(output).decode()}
                 except Exception as exc:
@@ -1236,16 +1385,37 @@ def run_verifier(cfg, *, cwd=None):
         (helpers / 'ormas_acceptance.js').write_text(NODE_HTTP_HELPER if 'service' in cfg else NODE_ACCEPTANCE_HELPER)
         def observe(argv, call_deadline, call_cap):
             # CLI options end at the fixed container id. Client argv never reaches
-            # the host shell or controls Docker options/container selection.
-            return _bounded([docker, 'exec', '--user', f'{uid}:{gid}', candidate_container, '/usr/bin/timeout', '--signal=KILL',
-                             str(max(1, int(call_deadline - time.monotonic())))] + argv,
-                            cwd=scratch, deadline=call_deadline, cap=call_cap, env=host_env)
+            # the host shell or controls Docker options/container selection.  A
+            # root wrapper drops to the candidate identity before launch and
+            # frames output so candidate text cannot forge spawn metadata.
+            timeout_s = max(1, int(call_deadline - time.monotonic()))
+            argument = base64.b64encode(json.dumps({
+                'argv': argv, 'uid': uid, 'gid': gid,
+                'timeout_s': timeout_s, 'cap': call_cap,
+            }, separators=(',', ':')).encode()).decode()
+            wrapper = _candidate_observer_wrapper(cfg['profile_id'], argument)
+            code, raw = _bounded(
+                [docker, 'exec', '--user', '0:0', candidate_container,
+                 '/usr/bin/timeout', '--signal=KILL', str(timeout_s + 1), *wrapper],
+                cwd=scratch, deadline=call_deadline,
+                cap=max(16384, call_cap * 2 + 16384), env=host_env,
+            )
+            if code:
+                raise RuntimeRefusal('candidate_observation_wrapper_failed')
+            if cfg['profile_id'].startswith('linux-python-'):
+                return _candidate_observer_result(raw, call_cap)
+            return _node_candidate_observer_result(raw, call_cap)
         bridge = CandidateBridge(bridge_root / 'socket', observe, deadline=deadline, cap=cap)
         bridge.start()
         for name, data_volume, projection in ((candidate_container, volume, candidate), (verifier, driver_volume, driver)):
             options = common + ['--mount', f'type=volume,source={data_volume},target=/work,volume-nocopy']
             driver_options = []
-            if name == verifier:
+            if name == candidate_container:
+                # The trusted observer needs only these two capabilities to
+                # create the unprivileged candidate child. no-new-privileges
+                # prevents the child from regaining them through exec.
+                options += ['--cap-add', 'SETUID', '--cap-add', 'SETGID']
+            else:
                 driver_options = ['--mount', f'type=bind,source={bridge_root},target=/ormas/bridge,readonly',
                                   '--mount', f'type=bind,source={helpers},target=/ormas/helpers,readonly',
                                   '-e', 'PYTHONPATH=/ormas/helpers', '-e', 'NODE_PATH=/ormas/helpers',

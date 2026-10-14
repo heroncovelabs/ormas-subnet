@@ -894,6 +894,11 @@ consumed exactly once.
 | `hotkey_ss58` | str | SS58 address of the hotkey to register |
 
 **Response**: `{"challenge": str, "expires_at": str, "now": str, "miner_identity": str}`.
+The challenge is the canonical UTF-8 statement
+`ormas-hotkey:v1:{miner_identity}:{hotkey_ss58}:{32-lowercase-hex nonce}:{expires_at}`.
+Clients must reconstruct and validate that statement, require a lifetime of at most
+300 seconds, compare the gateway clock to a local clock, and refuse malformed or
+oversized statements before invoking a hotkey signer.
 
 ### `POST /api/runner/v1/hotkey`
 

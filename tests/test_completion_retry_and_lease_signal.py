@@ -1,17 +1,14 @@
-"""Card 63982bd8 (miner side): the day Jake did the work and was not paid.
+"""Synthetic completion-outage regression for lease renewal and exact retries.
 
-Evidence, job_c978f3fe82be (2026-09-16): claimed 12:58:33Z, result branch pushed
-and recorded, completion POST at 12:59:23Z failed on his side, the wrapper
-discarded the HTTP status and body into a bare ``completion_request_failed``, the
-crash-report completion failed seconds later too, **0 lease renewals**, lease
-expired 13:03:33Z. Reading ``skeleton.py`` shows why the renewal count was zero
-and why it would have been zero even with a working network:
+The vulnerable sequence pushed a result, lost a completion response, collapsed
+the failure into ``completion_request_failed``, and performed zero lease renewals.
+Reading ``skeleton.py`` showed why the renewal count was zero:
 
   * ``_heartbeat_loop`` catches every exception and ``return``s — the thread dies
     silently on the FIRST failure, with nothing logged.
   * ``stop.set()`` runs in the ``finally`` of ``solve_fn``, so the heartbeat is
-    already shut down before publish, verify and complete — exactly the phase
-    Jake's job died in. Nothing renews the lease there at all.
+    already shut down before publish, verify and complete. Nothing renewed the
+    lease there at all.
   * ``complete_task`` is called once. A transient refusal loses the job.
 
 What this file pins:
@@ -151,15 +148,14 @@ def test_a_transient_completion_refusal_is_retried(tmp_path):
 
 
 def test_the_lease_is_renewed_across_completion_retries(tmp_path):
-    """Jake's zero renewals. The heartbeat must still be alive at complete time."""
+    """The heartbeat must still be alive at completion time."""
     gateway, skeleton = _wire(tmp_path, _solve_pass, _FlakyCompleteGateway)
     skeleton.run_once()
     counts = gateway.heartbeats_at_attempt
     assert len(counts) >= 2
     assert counts[-1] > counts[0], (
         "no heartbeat reached the gateway between the first refused completion and "
-        f"the retry (counts={counts}) — the lease was unrenewed exactly where "
-        "job_c978f3fe82be died"
+        f"the retry (counts={counts}) — the lease was left unrenewed"
     )
     assert skeleton.last_run["renewals"] > 0
 
@@ -198,7 +194,7 @@ def test_a_transient_heartbeat_failure_is_logged_and_the_loop_continues(tmp_path
         skeleton.run_once()
     assert gateway.renew_calls >= 2, (
         "the heartbeat thread returned on its first failure — the current "
-        "`except Exception: return` is why Jake's renewal count was 0"
+        "`except Exception: return` would silently stop lease renewal"
     )
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("503" in m for m in warnings), f"status not logged: {warnings}"

@@ -1,9 +1,9 @@
 """The reference validator clones with the READ credential served on its assignment
 (Ormas launch item 2, validator half; public twin).
 
-Live 2026-09-14: newcomer rehearsal ``job_3feef4be1e83`` — the miner delivered via its
-credential; the validator posted ``error`` because its host key could not read the client's
-repository. The gateway now serves ``repo_credential {kind: ssh_deploy_key, private_key,
+The synthetic regression models a miner that can deliver while the validator lacks
+read authority and therefore posts ``error``. The gateway serves
+``repo_credential {kind: ssh_deploy_key, private_key,
 fingerprint, scope: "read"}`` on each undecided assignment whose project has a read key.
 
 Contract: ``_clone`` runs ``git clone`` under ``_credential_git_env(assignment.get("repo_credential"))``

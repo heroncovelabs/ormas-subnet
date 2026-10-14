@@ -22,3 +22,9 @@ Tokens, keys, customer repository names, or private deployment details. The clie
 from an environment variable or a file only (`ormas_subnet.client.load_token`); tests use the fixed
 fixture `ormr_test`. If you find a real credential in the history, report it to the address above
 before anything else.
+
+Use synthetic identities and timestamps in tests, examples, and public issue reports. Treat live
+operational incident timestamps and job/task, lease, runner/miner, repository, project, account,
+deployment, and release identifiers as sensitive correlation data even when they are not bearer
+credentials. Reviewed public protocol versions and release documentation may retain their dates and
+identifiers.

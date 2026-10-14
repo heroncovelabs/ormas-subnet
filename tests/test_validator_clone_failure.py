@@ -1,12 +1,4 @@
-"""A clone the validator cannot perform is an ``error`` decision, never a crash.
-
-Found live 2026-09-13 (Ormas battery, card dae5396c): a private ``repo_url`` the
-validator host had no key for raised ``GitError`` out of ``run_once``; the daemon
-died, systemd restarted it 26 times, and the assignment sat undecided for ~9 min.
-Quorum already excludes ``error`` (``outcomes_validators.resolve_quorum``), so the
-right move is to sign and post ``error`` over the assignment's evidence digest and
-keep polling.
-"""
+"""A synthetic clone failure produces ``error`` and leaves the daemon available."""
 from __future__ import annotations
 
 from pathlib import Path

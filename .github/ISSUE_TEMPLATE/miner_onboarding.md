@@ -10,7 +10,10 @@ Install, token and URL, running the skeleton with the reference solver, or plugg
 
 **What the skeleton printed**
 
-The output of `python miner.py` (or `python neurons/miner.py`), with your token redacted. Include the last lines before things went wrong.
+Describe the stage and error using synthetic identifiers. Do not post logs containing tokens,
+signing material, customer source, repository names or URLs, job/task IDs, lease IDs,
+miner/runner IDs, project IDs, account IDs, or private deployment identifiers. Send a report
+that needs live identifiers to `ops@ormas.ai`.
 
 **Did the reference solver run end to end?**
 
