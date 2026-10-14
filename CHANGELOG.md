@@ -13,7 +13,9 @@
   including `6208cd15…`, and revoked acceptance drivers remain refused.
 - Before restarting on this version, finish running leases and confirm delivery,
   complete or let outstanding awards lapse, and resolve recovery-pending work on
-  the old build. Keep polling while draining; queued jobs never offered on need
-  no action. Back up state; do not delete unresolved recovery records. After
-  upgrading, run `ormas-miner doctor` and re-register for qualification on the
-  deployed catalog digest. This release does not add other future catalogs.
+  the old build. Keep polling while draining. Queued jobs with no offer from your
+  miner need no migration. Back up state; do not delete unresolved recovery records.
+  After upgrading, register again and run `ormas-miner doctor` as described in the
+  [install guide](docs/INSTALL.md#log-in-register-then-check-the-host). Registration
+  requests qualification from the gateway; doctor alone does not prove it. Check
+  your qualification status before resuming offers. This release adds no future catalogs.
