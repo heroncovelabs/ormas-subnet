@@ -78,3 +78,108 @@ def test_main_exit_code_reflects_expected_settlement(tmp_path: Path, demo: Modul
     assert demo.main(["--workdir", str(tmp_path / "cli-pass"), "--scenario", "pass"]) == 0
     assert demo.main(["--workdir", str(tmp_path / "cli-noop"), "--scenario", "noop"]) == 0
     assert demo.main(["--workdir", str(tmp_path / "cli-oos"), "--scenario", "out-of-scope"]) == 0
+
+
+@requires_git
+def test_existing_unmarked_directory_is_never_deleted(tmp_path: Path, demo: ModuleType) -> None:
+    workdir = tmp_path / "unrelated"
+    workdir.mkdir(mode=0o700)
+    sentinel = workdir / "keep.txt"
+    sentinel.write_text("keep")
+    with pytest.raises(ValueError, match="unowned"):
+        demo.run_demo(workdir, "pass")
+    assert sentinel.read_text() == "keep"
+
+
+@requires_git
+def test_custom_owned_directory_can_be_safely_reset(tmp_path: Path, demo: ModuleType) -> None:
+    workdir = tmp_path / "custom"
+    first = demo.run_demo(workdir, "pass")
+    assert first["settlement"] == "paid"
+    assert workdir.stat().st_mode & 0o777 == 0o700
+    marker = workdir / demo._OWNER_MARKER
+    assert marker.stat().st_mode & 0o777 == 0o600
+    assert marker.read_text() == demo._owner_marker_text(workdir.resolve())
+    second = demo.run_demo(workdir, "pass")
+    assert second["settlement"] == "paid"
+
+
+@requires_git
+def test_default_owned_directory_can_be_reset(
+    tmp_path: Path, demo: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workdir = tmp_path / "default"
+    monkeypatch.setattr(demo, "DEFAULT_WORKDIR", workdir)
+    assert demo.run_demo(workdir, "pass")["settlement"] == "paid"
+    assert demo.run_demo(workdir, "pass")["settlement"] == "paid"
+
+
+def test_dangerous_or_symlinked_paths_are_refused(
+    tmp_path: Path, demo: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = tmp_path / "cwd" / "child"
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    for path in (Path("/"), Path.home(), Path(__file__).resolve().parents[1], cwd, cwd.parent):
+        with pytest.raises(ValueError, match="unsafe"):
+            demo._prepare_workdir(path)
+
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinked"):
+        demo._prepare_workdir(link)
+
+
+@pytest.mark.parametrize("marker_kind", ["symlink", "corrupt", "copied"])
+def test_marker_cannot_authorize_another_directory(
+    tmp_path: Path, demo: ModuleType, marker_kind: str,
+) -> None:
+    source = demo._prepare_workdir(tmp_path / "source")
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    marker = target / demo._OWNER_MARKER
+    if marker_kind == "symlink":
+        marker.symlink_to(source / demo._OWNER_MARKER)
+    elif marker_kind == "corrupt":
+        marker.write_text("ormas-localnet-demo:v2:wrong\n")
+        marker.chmod(0o600)
+    else:
+        marker.write_bytes((source / demo._OWNER_MARKER).read_bytes())
+        marker.chmod(0o600)
+    sentinel = target / "keep.txt"
+    sentinel.write_text("keep")
+    with pytest.raises(ValueError, match="unowned"):
+        demo._prepare_workdir(target)
+    assert sentinel.read_text() == "keep"
+
+
+def test_reset_race_never_deletes_a_replacement_directory(
+    tmp_path: Path, demo: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = demo._prepare_workdir(tmp_path / "owned")
+    (target / "old.txt").write_text("owned")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir(mode=0o700)
+    replacement_sentinel = replacement / "keep.txt"
+    replacement_sentinel.write_text("keep")
+    parked = tmp_path / "parked-owned"
+    suffix = "a" * 32
+    quarantine = tmp_path / f".ormas-localnet-demo-reset-{suffix}"
+    real_clear = demo._clear_open_directory
+
+    monkeypatch.setattr(demo.secrets, "token_hex", lambda _size: suffix)
+
+    def swap_after_quarantine(directory_fd: int) -> None:
+        quarantine.rename(parked)
+        replacement.rename(quarantine)
+        real_clear(directory_fd)
+
+    monkeypatch.setattr(demo, "_clear_open_directory", swap_after_quarantine)
+
+    with pytest.raises(ValueError, match="changed during reset"):
+        demo._prepare_workdir(target)
+
+    assert (quarantine / "keep.txt").read_text() == "keep"
+    assert parked.is_dir()

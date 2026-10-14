@@ -8,6 +8,8 @@ import socket
 import tempfile
 from pathlib import Path
 
+from ._private_file import read_private_text
+
 # Ordered duplicate of protected/miner/compose_hash.py, checked by PW-5 parity tests.
 # The CLI must also work from a wheel without the deployment recipe attached.
 SPLIT_ALLOWED_ENVS = (
@@ -91,10 +93,7 @@ def sealed_json(key: str, value: dict) -> str:
 
 
 def read_input(path: str, key: str) -> str:
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except (OSError, ValueError):
-        raise ValueError(f"{key}: cannot read input file") from None
+    return read_private_text(path, label=f"{key}: input file", max_bytes=1024 * 1024)
 
 
 def provider_host(value: str) -> str:

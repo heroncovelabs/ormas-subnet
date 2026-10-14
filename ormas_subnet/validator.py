@@ -1,6 +1,6 @@
 """Reference validator daemon — poll assignments, independently re-verify, sign, post.
 
-Card 25ff6188 (Validator 2/2). Same untrusted-perimeter shape as ``skeleton.py``'s
+Reference validator. Same untrusted-perimeter shape as ``skeleton.py``'s
 miner loop (``docs/design/miner_delivers_outcomes_decision_2026_09_10.md`` decision
 8: a validator inherits the miner's own repository-access model) — it clones the
 same ``repo_url``, runs the same ``verify_command`` the miner ran, and reaches its
@@ -67,7 +67,7 @@ SignFn = Callable[[str | bytes], str]
 REKEY_SIGNATURE_DOMAIN = b"ormas-validator-rekey-v1"
 
 
-# ── execution contract (card 709e2a53) ───────────────────────────────────────
+# ── execution contract ────────────────────────────────────────────────────────
 # COPY of ``tensorbox_spec.customer_api.outcomes_validators``'s shape check
 # (see module docstring — this package never imports tensorbox_spec). Keep the
 # two byte-identical: same key set, same schema_version literal, same
@@ -659,8 +659,14 @@ def _dispatch_reviews(
     """Start reviews while a slot is free. Never-attempted rows go first."""
     fresh: list[Any] = []
     again: list[Any] = []
+    seen: set[str] = set()
     for assignment in assignments:
-        aid = assignment["assignment_id"]
+        if not isinstance(assignment, Mapping):
+            continue
+        aid = assignment.get("assignment_id")
+        if not isinstance(aid, str) or not aid or aid in seen:
+            continue
+        seen.add(aid)
         if aid in in_flight or aid in posted or aid in pending or aid in deferred:
             continue
         if aid in crashed:
@@ -672,6 +678,10 @@ def _dispatch_reviews(
         if len(in_flight) >= slots:
             break
         aid = assignment["assignment_id"]
+        # Earlier rows in this same response may have become pending or started.
+        # Never overwrite a live handle or create two children for one identity.
+        if aid in in_flight or aid in posted or aid in pending or aid in deferred:
+            continue
         kind, digest = daemon._preface(assignment)
         if kind == "skip" or digest is None:
             continue
@@ -1152,31 +1162,15 @@ class ValidatorDaemon:
 
 def _load_cli_secret(*, token_env: str | None, token_path: str | None) -> str:
     """Read a service credential without following links or exposing its bytes."""
-    import os
-    import stat
-
     from .client import load_token
+    from ._private_file import read_private_text
 
     if token_path is None:
         return load_token(token_env=token_env)
-    error = "validator credential must be a private regular file owned by the service user"
-    if not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"):
-        raise ValueError(error)
-    try:
-        fd = os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or stat.S_IMODE(info.st_mode) not in (0o400, 0o600) or info.st_size > 8192):
-                raise ValueError(error)
-            value = os.read(fd, 8193).decode("utf-8").strip()
-            if not value or len(value) > 8192:
-                raise ValueError(error)
-            return value
-        finally:
-            os.close(fd)
-    except (OSError, UnicodeError):
-        raise ValueError(error) from None
+    value = read_private_text(token_path, label="validator credential", strip=True)
+    if not value:
+        raise ValueError("validator credential must be a private regular file owned by the service user")
+    return value
 
 
 def _positive_slot_count(value: str) -> int:

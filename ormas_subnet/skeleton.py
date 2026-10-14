@@ -617,7 +617,7 @@ class MinerSkeleton:
             cells.append('task:publication/github-artifact-v1')
             cells.append('task:acceptance/independent-v1')
             cells.append('task:acceptance/independent-v3')
-            # Card 70cd3006: a public-execution miner already runs the real
+            # A public-execution miner already runs the real
             # (Docker) base check for every packet it claims regardless of
             # whether the client proved it locally (v2) or deferred it
             # (v3) — no new infrastructure, so it advertises this cell too.
@@ -855,10 +855,8 @@ class MinerSkeleton:
 
         Runs for as long as the lease is held by the caller — the caller (see
         :meth:`_run_leased_task`) only signals ``stop`` once the completion has
-        been resolved, not merely once ``solve_fn`` returns; that is the fix for
-        job_c978f3fe82be, whose lease had zero renewals because the heartbeat
-        thread was already dead during exactly the publish/verify/complete
-        window it died in.
+        been resolved, not merely once ``solve_fn`` returns. This prevents the
+        lease from going unrenewed during publish, verify, and completion.
 
         A transient renewal failure is logged at WARNING (with the gateway's
         HTTP status and message when it is an :class:`OrmasGatewayError`) and
@@ -1302,8 +1300,8 @@ class MinerSkeleton:
 
         The heartbeat thread keeps renewing across the ENTIRE lease hold — not
         just through ``solve_fn`` — and is only stopped once the completion is
-        resolved: accepted, terminally refused, or the lease already lost. That
-        is what job_c978f3fe82be needed and did not get. ``self.last_run`` is
+        resolved: accepted, terminally refused, or the lease already lost.
+        ``self.last_run`` is
         always set before this method returns or an exception leaves it (see
         the ``finally`` below), so a caller can read the summary of even a
         failed run.

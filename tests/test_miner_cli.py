@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import stat
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "ormr_test_private_abcd"
 GATEWAY = "https://api.ormas.ai"
+HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 STANDARD_CELLS = [
     "task:code", "task:code/small", "task:lang/python",
     "task:publication/github-artifact-v1", "task:acceptance/operator-run-v3",
@@ -491,6 +493,54 @@ def test_unsafe_credentials_fail_without_disclosure(cli, gateway, capsys):
     assert TOKEN not in output
 
 
+def test_saved_credentials_symlink_is_rejected(cli, capsys, tmp_path):
+    target = tmp_path / "private-credentials"
+    target.write_text(json.dumps({"gateway": GATEWAY, "token": TOKEN}))
+    target.chmod(0o600)
+    path = Path.home() / ".ormas-miner" / "credentials.json"
+    path.parent.mkdir(mode=0o700)
+    path.symlink_to(target)
+
+    assert cli.main(["doctor"]) != 0
+    output = capsys.readouterr().out
+    assert "FAIL credentials:" in output
+    assert TOKEN not in output
+
+
+def test_saved_credentials_wrong_owner_is_rejected(cli, monkeypatch):
+    credentials()
+    path = Path.home() / ".ormas-miner" / "credentials.json"
+    monkeypatch.setattr(
+        "ormas_subnet._private_file.os.geteuid", lambda: path.stat().st_uid + 1,
+    )
+    with pytest.raises(ValueError, match="private regular file"):
+        cli._read_credentials()
+
+
+def test_saved_credentials_path_swap_reads_opened_descriptor(cli, monkeypatch):
+    path = credentials(token=TOKEN)
+    replacement = path.with_name("replacement.json")
+    replacement_token = "ormr_replacement_private_efgh"
+    replacement.write_text(json.dumps({"gateway": GATEWAY, "token": replacement_token}))
+    replacement.chmod(0o600)
+    original = path.with_name("original.json")
+
+    real_fstat = os.fstat
+    swapped = False
+
+    def swap_after_open(fd):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            path.rename(original)
+            replacement.rename(path)
+        return real_fstat(fd)
+
+    monkeypatch.setattr("ormas_subnet._private_file.os.fstat", swap_after_open)
+    assert cli._read_credentials() == {"gateway": GATEWAY, "token": TOKEN}
+    assert json.loads(path.read_text())["token"] == replacement_token
+
+
 def test_gateway_override_requires_independent_key(cli, gateway, capsys):
     credentials()
     assert cli.main(["register", "--gateway", "https://other.example", "--cell", "task:code"]) == 1
@@ -629,9 +679,24 @@ def test_installed_hotkey_uses_in_process_key(cli, gateway, monkeypatch, capsys,
     from neurons import miner
 
     credentials()
-    challenge = "test challenge"
-    gateway[1]["/api/runner/v1/hotkey/challenge"] = 200, {"challenge": challenge}
-    gateway[1]["/api/runner/v1/hotkey"] = 200, {"verified": True}
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now_text = now.isoformat().replace("+00:00", "Z")
+    expires_text = (now + timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
+    challenge = (
+        f"ormas-hotkey:v1:miner:t1:{HOTKEY}:{'de' * 16}:{expires_text}"
+    )
+    gateway[1]["/api/runner/v1/hotkey/challenge"] = 200, {
+        "challenge": challenge,
+        "expires_at": expires_text,
+        "now": now_text,
+        "miner_identity": "miner:t1",
+    }
+    gateway[1]["/api/runner/v1/hotkey"] = 200, {
+        "verified": True,
+        "miner_identity": "miner:t1",
+        "hotkey_ss58": HOTKEY,
+        "signature_scheme": "sr25519",
+    }
 
     def sign(command, *, input, **_kwargs):
         assert command == ["signer"]
@@ -643,7 +708,7 @@ def test_installed_hotkey_uses_in_process_key(cli, gateway, monkeypatch, capsys,
 
     monkeypatch.setattr(miner.subprocess, "run", sign)
     result = cli.main(["register-hotkey", "--runner-id", "runr_test",
-                       "--hotkey-ss58", "address", "--sign-command", "signer"])
+                       "--hotkey-ss58", HOTKEY, "--sign-command", "signer"])
     assert result == (0 if signer_ok else 1)
     requests = gateway[0]
     assert all(request.headers["Authorization"] == f"Bearer {TOKEN}" for request in requests)

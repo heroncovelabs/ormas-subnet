@@ -44,11 +44,11 @@ def _contract() -> dict:
         "schema_version": "ormas.public-acceptance-contract.v1",
         "policy": _policy(),
         "miner": {
-            "subject_id": "runr_jake",
-            "operator_id": "operator:jake",
-            "qualification_id": "qual_miner_jake_v1",
-            "credential_id": "rtok_jake",
-            "miner_id": "miner:jake",
+            "subject_id": "runr_example",
+            "operator_id": "operator:example",
+            "qualification_id": "qual_miner_example_v1",
+            "credential_id": "rtok_example",
+            "miner_id": "miner:example",
         },
         "validators": [
             {
@@ -71,7 +71,7 @@ def _contract() -> dict:
 def _draft_kwargs() -> dict:
     return {
         "task_id": "job_public",
-        "runner_id": "runr_jake",
+        "runner_id": "runr_example",
         "repo_id": "",
         "base_commit": "b" * 40,
         "brief": "repair the public check",
@@ -89,7 +89,7 @@ def _draft_kwargs() -> dict:
 def _evidence(contract: dict) -> dict:
     return canonical_evidence_fields(
         job_id="job_public",
-        miner_id="miner:jake",
+        miner_id="miner:example",
         base_commit="b" * 40,
         result_commit="c" * 40,
         repo_url="https://github.com/example/public.git",
@@ -181,7 +181,7 @@ def test_operator_run_alpha_refuses_missing_or_changed_terms(mutate) -> None:
         lambda value: value["validators"][1].update(subject_id="val_1"),
         lambda value: value["validators"][1].update(credential_id="1" * 64),
         lambda value: value["validators"][1].update(operator_id="operator:validator-1"),
-        lambda value: value["validators"][0].update(operator_id="operator:jake"),
+        lambda value: value["validators"][0].update(operator_id="operator:example"),
         lambda value: value.update(claim_nonce=" "),
     ],
 )
@@ -271,7 +271,7 @@ def test_gateway_and_public_validator_canonical_evidence_match() -> None:
     public_fields = _evidence(contract)
     gateway_fields = gateway.canonical_evidence_fields(
         job_id="job_public",
-        miner_id="miner:jake",
+        miner_id="miner:example",
         base_commit="b" * 40,
         result_commit="c" * 40,
         repo_url="https://github.com/example/public.git",
