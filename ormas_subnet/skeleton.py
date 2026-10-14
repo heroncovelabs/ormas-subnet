@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from httpx import HTTPError
 
+from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
 from .client import OrmasGatewayError, OrmasMinerClient, _positive_usd, _validate_window_offer
 from ._recovery import PublicRecovery, RecoveryRequired
 from .verification_context import verification_call
@@ -166,9 +167,25 @@ SolveFn = Callable[[TaskDraft, Path], SolveResult]
 
 
 def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None) -> str:
-    git_env = os.environ.copy()
-    if env is not None:
-        git_env.update(env)
+    try:
+        git = trusted_executable("git")
+    except TrustedExecutableUnavailable as exc:
+        raise GitError("trusted git executable unavailable") from exc
+    overrides = dict(env or {})
+    if set(overrides) - {"GIT_SSH_COMMAND"}:
+        raise GitError("unsupported git environment override")
+    # Git receives no ambient service secrets, user configuration, proxy or
+    # executable search path.  The single call-site override is a generated,
+    # job-scoped SSH command whose executable is independently vetted below.
+    git_env = {
+        "PATH": str(git.parent),
+        "HOME": "/nonexistent",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        **overrides,
+    }
     # Repository code runs between trusted Git operations.  Never let a verifier
     # install replacement refs or hooks that change the object view or execute
     # again when the validator checks out the result.  GIT_SSH_COMMAND and other
@@ -178,7 +195,7 @@ def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
     git_env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
     git_env["GIT_CONFIG_VALUE_0"] = os.devnull
     proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+        [str(git), *args], cwd=str(cwd), capture_output=True, text=True,
         encoding="utf-8", errors="surrogateescape", check=False, env=git_env,
     )
     if proc.returncode != 0:
@@ -249,6 +266,10 @@ def _credential_git_env(credential: Mapping[str, Any] | None) -> Iterator[dict[s
     key_dir = tempfile.mkdtemp(prefix="ormas-job-key-")
     path = os.path.join(key_dir, "id_job")
     try:
+        try:
+            ssh = trusted_executable("ssh")
+        except TrustedExecutableUnavailable as exc:
+            raise GitError("trusted ssh executable unavailable") from exc
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             payload = private_key if private_key.endswith("\n") else private_key + "\n"
@@ -256,13 +277,10 @@ def _credential_git_env(credential: Mapping[str, Any] | None) -> Iterator[dict[s
         finally:
             os.close(fd)
         os.chmod(path, 0o600)
-        yield {
-            **os.environ,
-            "GIT_SSH_COMMAND": (
-                f"ssh -i {path} -o IdentitiesOnly=yes "
-                f"-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-            ),
-        }
+        yield {"GIT_SSH_COMMAND": shlex.join([
+            str(ssh), "-i", path, "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+        ])}
     finally:
         try:
             os.remove(path)
