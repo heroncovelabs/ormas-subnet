@@ -35,6 +35,21 @@ class RuntimeRefusal(Exception):
     pass
 
 
+# These two historical acceptance cards delegated the verdict to pytest in the
+# candidate container.  A candidate import could call os._exit(0) before the
+# required assertions ran, and each card treated that status as acceptance.
+# PR #37 changed their docstrings only, so both byte identities for each card
+# remain revoked as immutable audit evidence.
+REVOKED_ACCEPTANCE_DRIVER_SHA256 = frozenset({
+    # claim_refusal_backoff_external.py: original, then PR #37 docstring variant
+    '545411aeba3d5ac8db574a733ed7d2cf21bec012b19a73a8de5c6a6cbbe6f442',
+    'e032021de2cda990e4a8656376932efd2c9e48c565aab8a008688a9acb2f2b88',
+    # validator_list_only_external.py: original, then PR #37 docstring variant
+    'af06a6db0a155f703848d916f2fef53c22fec1ac2b3147fd5f1bf438744d404a',
+    '36e853b3f76fbc41550404d731564091a7659d1a98f2d6871a30fc46a043b361',
+})
+
+
 _SYSTEM_EXECUTABLE_DIRS = (Path('/usr/bin'), Path('/bin'), Path('/usr/local/bin'))
 
 
@@ -1241,6 +1256,8 @@ def _validate_config(cfg):
             or any(p in ('', '.', '..', '.git', '.venv', 'node_modules') for p in name.split('/'))
             or not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha) for name, sha in files.items()):
         raise RuntimeRefusal('invalid_acceptance_files')
+    if REVOKED_ACCEPTANCE_DRIVER_SHA256.intersection(files.values()):
+        raise RuntimeRefusal('acceptance_driver_revoked')
     if not cfg["argv"]:
         raise RuntimeRefusal("invalid_runtime_argv")
     if not isinstance(cfg["env"], dict) or set(cfg["env"]) - {"LANG", "LC_ALL", "TZ", "PYTHONDONTWRITEBYTECODE"}:
