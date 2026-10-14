@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -10,12 +12,14 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install --upgrade pip
-      - run: pip install -e . pytest ruff
+      - run: python -m pip install --require-hashes -r requirements-ci.lock
+      - run: python -m pip install --no-deps --no-build-isolation -e .
       - run: ruff check .
       # Parity tests against the private gateway code skip here by design; they run in the private monorepo.
       - run: PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests

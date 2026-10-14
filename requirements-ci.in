@@ -1,0 +1,7 @@
+# CI bootstrap and test dependencies. Keep the two runtime bounds in sync with
+# pyproject.toml; requirements-ci.lock is the reviewed, hash-pinned resolution.
+cryptography>=41
+httpx>=0.24
+pytest
+ruff
+setuptools>=68
