@@ -20,7 +20,14 @@ import pytest
 from ormas_subnet.client import OrmasMinerClient
 from ormas_subnet.localnet import LocalGateway as FakeGateway
 from ormas_subnet.reference_solver import make_shell_solver
-from ormas_subnet.skeleton import MinerConfig, MinerSkeleton, SolveResult
+from ormas_subnet.skeleton import (
+    GitError,
+    MinerConfig,
+    MinerSkeleton,
+    SolveResult,
+    _nul_git_paths,
+    _run_git,
+)
 from ormas_subnet.validator import (
     OrmasValidatorClient,
     ValidatorConfig,
@@ -236,6 +243,36 @@ def test_solve_outside_allowed_paths_yields_scope_violation(tmp_path: Path) -> N
 
 
 @requires_git
+def test_skeleton_scope_preserves_leading_whitespace_in_paths(tmp_path: Path) -> None:
+    repo, base_commit = _init_repo(tmp_path)
+
+    def solve(draft, workdir: Path) -> SolveResult:
+        (workdir / "\tout.txt").write_text("out of scope\n")
+        subprocess.run(["git", "add", "-A"], cwd=workdir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "whitespace path"], cwd=workdir,
+                       check=True, capture_output=True)
+        result_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return SolveResult(result_commit=result_commit, changed_paths=("\tout.txt",))
+
+    gateway, _ = _run_one_task(
+        tmp_path, repo=repo, base_commit=base_commit, verify_command="true", solve_fn=solve,
+        allowed_paths=["out.txt"],
+    )
+
+    assert gateway.completed["capture"]["scope_ok"] is False
+    assert gateway.completed["capture"]["changed_paths"] == [{"path": "\tout.txt"}]
+    assert gateway.completed["terminal"]["verification_state"] == "failed"
+
+
+def test_scope_parser_rejects_invalid_utf8_git_path() -> None:
+    with pytest.raises(GitError, match="not valid UTF-8"):
+        _nul_git_paths("\udcff\0")
+
+
+@requires_git
 def test_verify_command_failure_yields_failed(tmp_path: Path) -> None:
     """verification_state must reflect ACTUALLY running verify_command — a
     solve that stays in scope still fails completion if the verifier itself
@@ -282,7 +319,9 @@ class _FakeValidatorGateway:
         raise AssertionError(f"unexpected GET: {path}")
 
 
-def _validator_assignment(*, repo: Path, base_commit: str, result_commit: str, verify_command: str) -> dict[str, Any]:
+def _validator_assignment(*, repo: Path, base_commit: str, result_commit: str,
+                          verify_command: str, immutable_paths: list[str] | None = None,
+                          allowed_paths: list[str] | None = None) -> dict[str, Any]:
     fields = canonical_evidence_fields(
         job_id="job_1",
         miner_id="miner:other-tenant",
@@ -290,8 +329,8 @@ def _validator_assignment(*, repo: Path, base_commit: str, result_commit: str, v
         result_commit=result_commit,
         repo_url=str(repo),
         verify_command=verify_command,
-        allowed_paths=["out.txt"],
-        immutable_paths=[],
+        allowed_paths=allowed_paths or ["out.txt"],
+        immutable_paths=immutable_paths or [],
     )
     return {"assignment_id": "asgn_1", **fields, "evidence_digest_sha256": evidence_digest_hex(fields)}
 
@@ -344,6 +383,118 @@ def test_validator_daemon_rejects_when_result_still_fails_verify(tmp_path: Path)
     assignment = _validator_assignment(
         repo=repo, base_commit=base_commit, result_commit=result_commit, verify_command="grep -q mined out.txt",
     )
+    gateway = _run_validator_once(tmp_path, assignment=assignment)
+
+    assert gateway.decisions[0]["decision"] == "reject"
+
+
+@requires_git
+def test_validator_rejects_forbidden_scope_before_result_can_install_replace_ref(
+    tmp_path: Path,
+) -> None:
+    """A result verifier cannot hide an out-of-scope file with ``git replace``.
+
+    The vulnerable ordering ran the result first and only then asked Git for the
+    scope.  This command reproduces that primitive: it fails on base, but on the
+    result it maps the base object to the result and exits successfully.
+    """
+    repo, base_commit = _init_repo(tmp_path)
+    (repo / "out.txt").write_text("base\nmined\n")
+    (repo / "forbidden.txt").write_text("must not be signed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "malicious result"], cwd=repo,
+                   check=True, capture_output=True)
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    script = repo / "replace_on_result.py"
+    script.write_text(
+        "import pathlib, subprocess, sys\n"
+        "if 'mined' not in pathlib.Path('out.txt').read_text():\n"
+        "    raise SystemExit(1)\n"
+        f"subprocess.run(['git', 'replace', {base_commit!r}, {result_commit!r}], check=True)\n"
+    )
+    assignment = _validator_assignment(
+        repo=repo, base_commit=base_commit, result_commit=result_commit,
+        verify_command=f"{shutil.which('python3')} {script}",
+    )
+
+    gateway = _run_validator_once(tmp_path, assignment=assignment)
+
+    assert gateway.decisions[0]["decision"] == "reject"
+    checkout = tmp_path / "validator-work" / "asgn_1"
+    assert not (checkout / ".git" / "refs" / "replace" / base_commit).exists()
+
+
+@requires_git
+def test_trusted_git_ignores_existing_replacement_refs(tmp_path: Path) -> None:
+    repo, base_commit = _init_repo(tmp_path)
+    (repo / "forbidden.txt").write_text("changed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "result"], cwd=repo,
+                   check=True, capture_output=True)
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "replace", base_commit, result_commit], cwd=repo,
+                   check=True, capture_output=True)
+
+    assert _run_git(["diff", "--name-only", base_commit, result_commit], cwd=repo) == "forbidden.txt"
+
+
+@requires_git
+def test_validator_preserves_leading_whitespace_in_scope_paths(tmp_path: Path) -> None:
+    repo, base_commit = _init_repo(tmp_path)
+    forbidden = repo / "\tallowed.txt"
+    forbidden.write_text("outside literal allowlist\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "whitespace path"], cwd=repo,
+                   check=True, capture_output=True)
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assignment = _validator_assignment(
+        repo=repo, base_commit=base_commit, result_commit=result_commit,
+        verify_command="true", allowed_paths=["allowed.txt"],
+    )
+
+    gateway = _run_validator_once(tmp_path, assignment=assignment)
+
+    assert gateway.decisions[0]["decision"] == "reject"
+
+
+@requires_git
+def test_validator_rejects_immutable_file_renamed_to_allowed_path(tmp_path: Path) -> None:
+    repo, base_commit = _init_repo(tmp_path)
+    immutable = repo / "immutable.txt"
+    immutable.write_text("must remain\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=repo,
+                   check=True, capture_output=True)
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    immutable.rename(repo / "allowed.txt")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "hide immutable deletion as rename"], cwd=repo,
+                   check=True, capture_output=True)
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    verify = (
+        f"{shutil.which('python3')} -c "
+        "\"import pathlib,sys;sys.exit(1 if pathlib.Path('immutable.txt').exists() else 0)\""
+    )
+    assignment = _validator_assignment(
+        repo=repo, base_commit=base_commit, result_commit=result_commit,
+        verify_command=verify, immutable_paths=["immutable.txt"], allowed_paths=["allowed.txt"],
+    )
+
     gateway = _run_validator_once(tmp_path, assignment=assignment)
 
     assert gateway.decisions[0]["decision"] == "reject"
