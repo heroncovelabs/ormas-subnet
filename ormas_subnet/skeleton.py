@@ -166,13 +166,42 @@ SolveFn = Callable[[TaskDraft, Path], SolveResult]
 
 
 def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None) -> str:
+    git_env = os.environ.copy()
+    if env is not None:
+        git_env.update(env)
+    # Repository code runs between trusted Git operations.  Never let a verifier
+    # install replacement refs or hooks that change the object view or execute
+    # again when the validator checks out the result.  GIT_SSH_COMMAND and other
+    # explicit call-site settings are preserved above.
+    git_env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    git_env["GIT_CONFIG_COUNT"] = "1"
+    git_env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
+    git_env["GIT_CONFIG_VALUE_0"] = os.devnull
     proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False,
-        env=dict(env) if env is not None else None,
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+        encoding="utf-8", errors="surrogateescape", check=False, env=git_env,
     )
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
+    # Preserve path bytes represented as text.  In particular, ``git ... -z``
+    # may begin with whitespace that is part of the first filename; ``strip``
+    # would silently turn that into a different path during scope checks.
+    return proc.stdout.rstrip("\r\n")
+
+
+def _nul_git_paths(output: str) -> tuple[str, ...]:
+    """Parse a ``git ... -z`` path list without changing path identity.
+
+    Git paths are byte strings.  The protocol and completion JSON require UTF-8,
+    so reject undecodable names as a review error instead of crashing or signing
+    evidence for a differently decoded path.
+    """
+    if output and not output.endswith("\0"):
+        raise GitError("git path output was not NUL terminated")
+    paths = tuple(output[:-1].split("\0")) if output else ()
+    if any(any(0xD800 <= ord(char) <= 0xDFFF for char in path) for path in paths):
+        raise GitError("git path is not valid UTF-8")
+    return paths
 
 
 def _public_git(args, *, cwd):
@@ -729,7 +758,8 @@ class MinerSkeleton:
     ) -> tuple[bool, tuple[str, ...]]:
         """Compute ``scope_ok``/``changed_paths`` for real, from git — not the solver's say-so.
 
-        ``changed_paths`` = ``git diff --name-only <base_commit> <result_commit>``
+        ``changed_paths`` is the literal, rename-disabled path union between
+        ``base_commit`` and ``result_commit``.
         in the workdir: the ground truth of what actually landed. The solver's
         own ``SolveResult.changed_paths`` is used only as a cross-check; a
         mismatch is warned (never silently trusted over git — a solver could be
@@ -741,11 +771,12 @@ class MinerSkeleton:
         """
         try:
             diff_out = _run_git(
-                ["diff", "--name-only", draft.base_commit, result.result_commit], cwd=workdir,
+                ["diff", "--name-only", "--no-renames", "-z",
+                 draft.base_commit, result.result_commit, "--"], cwd=workdir,
             )
+            changed_paths = _nul_git_paths(diff_out)
         except GitError:
-            diff_out = ""
-        changed_paths = tuple(p for p in diff_out.splitlines() if p)
+            raise
         reported = set(result.changed_paths)
         actual = set(changed_paths)
         if reported != actual:

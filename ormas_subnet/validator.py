@@ -43,6 +43,7 @@ from .skeleton import (
     _credential_git_env,
     _refreshed_app_read,
     _path_covered_by_allowed,
+    _nul_git_paths,
     _run_git,
     _run_verify_command,
 )
@@ -904,8 +905,7 @@ class ValidatorDaemon:
         """
         try:
             public_execution = validate_assignment_execution(assignment)
-            prefix = None if public_execution else provision_toolchain(assignment.get("toolchain"), workdir)
-        except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError) as exc:
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
             return self._review_error(assignment, exc)
         base_commit = str(assignment["base_commit"])
         result_commit = str(assignment["result_commit"])
@@ -914,18 +914,35 @@ class ValidatorDaemon:
         immutable = list(assignment.get("immutable_paths") or [])
         validation_run_id = uuid.uuid4().hex
 
-        def scope_valid():
-            diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
-            changed = [p for p in diff_out.splitlines() if p]
-            return not any(_path_covered_by_allowed(p, immutable) for p in changed) and (
-                not allowed or all(_path_covered_by_allowed(p, allowed) for p in changed))
+        try:
+            diff_out = _run_git(
+                ["diff", "--name-only", "--no-renames", "-z",
+                 base_commit, result_commit, "--"],
+                cwd=workdir,
+            )
+        except GitError as exc:
+            return self._review_error(assignment, exc)
+        # Decide scope before toolchain provisioning or either verifier can run
+        # repository-controlled code.  Keep this result rather than consulting
+        # mutable Git metadata after an untrusted process has started.
+        try:
+            changed = list(_nul_git_paths(diff_out))
+        except GitError as exc:
+            return self._review_error(assignment, exc)
+        touches_immutable = bool(immutable) and any(
+            _path_covered_by_allowed(p, immutable) for p in changed
+        )
+        scope_ok = (not allowed) or all(_path_covered_by_allowed(p, allowed) for p in changed)
 
-        if public_execution:
-            try:
-                if not scope_valid():
-                    return "reject"
-            except GitError as exc:
-                return self._review_error(assignment, exc)
+        if touches_immutable or not scope_ok:
+            return "reject"
+
+        try:
+            prefix = None if public_execution else provision_toolchain(
+                assignment.get("toolchain"), workdir
+            )
+        except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError) as exc:
+            return self._review_error(assignment, exc)
 
         try:
             _run_git(["checkout", base_commit], cwd=workdir)
@@ -968,17 +985,6 @@ class ValidatorDaemon:
             return {0: "accept", 86: "reject"}[result_exit]
         if evidence_root(verify_command) is not None and result_exit in (74, 127):
             return self._review_error(assignment, f"result verifier setup failed: exit {result_exit}")
-
-        try:
-            diff_out = _run_git(["diff", "--name-only", base_commit, result_commit], cwd=workdir)
-        except GitError as exc:
-            return self._review_error(assignment, exc)
-        changed = [p for p in diff_out.splitlines() if p]
-
-        touches_immutable = bool(immutable) and any(
-            _path_covered_by_allowed(p, immutable) for p in changed
-        )
-        scope_ok = (not allowed) or all(_path_covered_by_allowed(p, allowed) for p in changed)
 
         if base_exit == 0:
             # The fail-on-base contract is broken (the base already passes) —

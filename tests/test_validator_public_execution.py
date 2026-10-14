@@ -63,7 +63,7 @@ def test_public_decision_distinguishes_assertion_from_environment_failure(
         tmp_path, monkeypatch, assignment, base_exit, result_exit, expected):
     exits = iter([base_exit, result_exit])
     calls = []
-    monkeypatch.setattr(module, '_run_git', lambda argv, **kw: 'cli.cjs\n' if argv[0] == 'diff' else '')
+    monkeypatch.setattr(module, '_run_git', lambda argv, **kw: 'cli.cjs\0' if argv[0] == 'diff' else '')
     def verify(command, **kwargs):
         assert command == assignment['verify_command']
         assert kwargs.get('path_prefix') is None
@@ -78,7 +78,7 @@ def test_public_contract_never_provisions_an_ambient_host_toolchain(tmp_path, mo
     def forbidden(*args, **kwargs):
         pytest.fail('public OCI assignment attempted legacy host provisioning')
     monkeypatch.setattr(module, 'provision_toolchain', forbidden)
-    monkeypatch.setattr(module, '_run_git', lambda argv, **kw: 'cli.cjs\n' if argv[0] == 'diff' else '')
+    monkeypatch.setattr(module, '_run_git', lambda argv, **kw: 'cli.cjs\0' if argv[0] == 'diff' else '')
     exits = iter([86, 0])
     monkeypatch.setattr(module, '_run_verify_command', lambda *args, **kw: next(exits))
     assert daemon(tmp_path)._decide(assignment, tmp_path) == 'accept'
@@ -106,11 +106,51 @@ def test_invalid_public_contract_never_executes(tmp_path, monkeypatch, assignmen
 
 @pytest.mark.parametrize('changed', ['value.test.cjs', 'outside.cjs', 'package-lock.json'])
 def test_public_scope_violation_refuses_before_verification(tmp_path, monkeypatch, assignment, changed):
-    monkeypatch.setattr(module, '_run_git', lambda argv, **kw: changed + '\n' if argv[0] == 'diff' else '')
+    monkeypatch.setattr(module, '_run_git', lambda argv, **kw: changed + '\0' if argv[0] == 'diff' else '')
     def forbidden(*args, **kwargs):
         pytest.fail('out-of-scope candidate was executed')
     monkeypatch.setattr(module, '_run_verify_command', forbidden)
     assert daemon(tmp_path)._decide(assignment, tmp_path) == 'reject'
+
+
+def test_legacy_scope_violation_refuses_before_editable_toolchain_install(
+        tmp_path, monkeypatch, assignment):
+    """Legacy ``pip install -e .`` can execute repository build hooks.
+
+    An out-of-scope result must be rejected before provisioning reaches any of
+    that result-controlled code.
+    """
+    value = copy.deepcopy(assignment)
+    value.pop('execution_contract')
+    value['toolchain'] = {
+        'kind': 'python', 'python': '3.12', 'pip_install': ['-e', '.'], 'lock_paths': [],
+    }
+    monkeypatch.setattr(
+        module, '_run_git',
+        lambda argv, **kw: 'outside.cjs\0' if argv[0] == 'diff' else '',
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('out-of-scope candidate reached result-controlled toolchain install')
+
+    monkeypatch.setattr(module, 'provision_toolchain', forbidden)
+    monkeypatch.setattr(module, '_run_verify_command', forbidden)
+    assert daemon(tmp_path)._decide(value, tmp_path) == 'reject'
+
+
+def test_invalid_utf8_git_path_is_review_error_before_execution(
+        tmp_path, monkeypatch, assignment):
+    monkeypatch.setattr(
+        module, '_run_git',
+        lambda argv, **kw: '\udcff\0' if argv[0] == 'diff' else '',
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('undecodable scope path reached execution')
+
+    monkeypatch.setattr(module, 'provision_toolchain', forbidden)
+    monkeypatch.setattr(module, '_run_verify_command', forbidden)
+    assert daemon(tmp_path)._decide(assignment, tmp_path) == 'error'
 
 
 def test_run_once_checks_contract_and_evidence_before_cloning(tmp_path, monkeypatch, assignment):

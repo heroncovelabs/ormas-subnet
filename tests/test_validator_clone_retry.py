@@ -169,7 +169,7 @@ def test_decision_error_logs_exception_diagnostics(tmp_path, monkeypatch, caplog
     def git(argv, **kwargs):
         if argv[0] == step:
             raise GitError(stderr)
-        return "out.txt" if argv[0] == "diff" else ""
+        return "out.txt\0" if argv[0] == "diff" else ""
 
     def verify(*args, **kwargs):
         if step == "verify":
