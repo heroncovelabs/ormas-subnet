@@ -425,9 +425,11 @@ def test_verifier_catalog_history_loads_after_compiler_revocation() -> None:
         "outcomes_support_history", "2026-10-14.1-aebcdc4a64d5.json").read_text())
     previous_current = json.loads(assets.joinpath(
         "outcomes_support_history", "2026-10-14.2-9251253a5dc1.json").read_text())
+    revoked_current = json.loads(assets.joinpath(
+        "outcomes_support_history", "2026-10-14.3-4f945739b4de.json").read_text())
     source = Path(runtime.__file__).read_text()
 
-    assert current["revision"] == "2026-10-14.3"
+    assert current["revision"] == "2026-10-14.4"
     assert current["verifier_compiler_sha256"] == hashlib.sha256(source.encode()).hexdigest()
     assert support.digest(previous) == (
         "sha256:e4511421b6b2d459810e31cf50338c12bd91b02cee054a98d69d602cd9b0717f"
@@ -441,3 +443,7 @@ def test_verifier_catalog_history_loads_after_compiler_revocation() -> None:
         "sha256:9251253a5dc1c1a4fd5947f0b1190a27393bf499f30c325d6345a0db98b946a9"
     )
     assert support.load_support_catalog(support.digest(previous_current)) == previous_current
+    assert support.digest(revoked_current) == (
+        "sha256:4f945739b4de965b264192cd9cf96368eb12a02246336d58489365ac317cbafe"
+    )
+    assert support.load_support_catalog(support.digest(revoked_current)) == revoked_current

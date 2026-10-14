@@ -54,6 +54,22 @@ Every failing case must fail at a plain assert (AssertionError). An exception,
 an import error, or extra output mixed into the result is refused as not an
 assertion, and the miner does no work.
 
+The historical `claim_refusal_backoff_external.py` and
+`validator_list_only_external.py` cards ran pytest inside the candidate and
+accepted its process status. A candidate-controlled import could terminate
+that process with status zero before the required assertions ran. The exact
+digests of both cards, including their later docstring-only variants, are
+revoked during preparation, packet validation and verifier startup. Preserve
+an affected frozen packet as audit evidence, drain or expire it, and create a
+new agreement with a separately reviewed acceptance driver; do not rewrite or
+accept the existing packet in place.
+
+This revocation is intentionally byte-specific. It closes execution of the
+known cards but does not prove that every other external driver interprets
+candidate-controlled status or output safely. A new driver remains privileged
+acceptance logic and requires semantic review of every candidate observation
+before its digest is admitted.
+
 The client names `python3 -m pytest tests/test_cli.py`. Its agent supplies the
 committed lock and profile selection. Ormas installs the helper in the isolated
 driver. A relative Python interpreter still requires the existing explicit toolchain
