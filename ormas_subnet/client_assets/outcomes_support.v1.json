@@ -1,6 +1,6 @@
 {
   "schema_version": "outcomes.support-catalog.v1",
-  "revision": "2026-10-14.3",
+  "revision": "2026-10-14.4",
   "repository_visibility": [
     "public",
     "private"
@@ -313,5 +313,5 @@
       }
     }
   ],
-  "verifier_compiler_sha256": "2c80182959d5f5f67dc9e7bc1389f532e8199be1880c1af5f7fb50ff9d272690"
+  "verifier_compiler_sha256": "2ba990540ac8653f130efe5ed132a0dfdca6048db18386352719d3a317ae2c00"
 }
