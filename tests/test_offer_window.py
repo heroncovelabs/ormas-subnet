@@ -694,6 +694,36 @@ def test_ambiguous_replacement_does_not_bind_or_replay_prior_open_bid(tmp_path):
     assert state["pending"] == desired[0]
     assert state["current"] == {"task_1": "bid_1"}
 
+    transport.window_closed = True
+    assert miner.run_once() is False
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is None
+    assert state["current"] == {"task_1": "bid_1"}
+    assert len(offers(transport)) == 2
+
+
+def test_ambiguous_replacement_preserves_prior_award_after_window_close(tmp_path):
+    desired = [{"job_id": "task_1", "kind": "limit",
+                "estimate_usd": 0.9, "limit_usd": 1.25}]
+    transport, miner = window_miner(tmp_path, lambda _: desired[0])
+    assert miner.run_once() is False
+    desired[0] = {"job_id": "task_1", "kind": "limit",
+                  "estimate_usd": 1.8, "limit_usd": 2.5}
+    transport.lose_offer_before_commit = True
+    with pytest.raises(RuntimeError):
+        miner.run_once()
+
+    transport.window_closed = True
+    transport.set_award("bid_1")
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    assert restarted.run_once() is True
+    assert transport.source.completed["terminal"]["settled_price_usd"] == 1.25
+    state = json.loads(next(Path(tmp_path).rglob("offers.json")).read_text())
+    assert state["pending"] is None
+    assert state["bids"]["bid_1"]["status"] == "awarded"
+    assert state["bids"]["bid_1"]["award_id"] == "awd_1"
+    assert len(offers(transport)) == 2
+
 
 def test_public_recovery_precedes_all_offer_calls(tmp_path, monkeypatch):
     transport, miner = window_miner(tmp_path)
