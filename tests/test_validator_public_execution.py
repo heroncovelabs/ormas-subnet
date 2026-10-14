@@ -90,6 +90,8 @@ def test_public_contract_never_provisions_an_ambient_host_toolchain(tmp_path, mo
      '2026-10-04.1'),
     ('sha256:aebcdc4a64d54b94c27a1eae933144290abe82f0062626f0187ad33d7a8195e7',
      '2026-10-14.1'),
+    ('sha256:9251253a5dc1c1a4fd5947f0b1190a27393bf499f30c325d6345a0db98b946a9',
+     '2026-10-14.2'),
 ])
 def test_historical_catalog_loads_but_revoked_compiler_cannot_execute(
         assignment, previous_digest, revision):

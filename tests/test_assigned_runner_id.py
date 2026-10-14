@@ -1,10 +1,8 @@
 """First registration: the gateway ASSIGNS the runner id; the skeleton must adopt it.
 
-Found live on api.ormas.ai (gateway-2026.09.13) during the Loop A acceptance rehearsal:
-``runner_api`` registration with a self-chosen, never-seen ``runner_id`` returns 404
-(``outcomes_runners.upsert_runner`` refuses an unknown assigned id); an EMPTY ``runner_id``
-makes the gateway mint ``runr_<12hex>`` and return it. The skeleton sent the configured id
-verbatim and never read ``runner_id`` back, so a newcomer could not register at all.
+Synthetic regression: registration with a self-chosen, never-seen ``runner_id`` returns
+404, while an empty ``runner_id`` makes the gateway mint ``runr_<12hex>`` and return it.
+The skeleton must read that assigned identity rather than keep the empty configured value.
 Rule: ``MinerSkeleton.register`` adopts the response's ``runner_id`` into ``config.runner_id``
 (so claim/heartbeat/complete use it), and the miner CLI accepts a missing ``--runner-id``
 (first run) and prints the assigned id so the operator can pass it next time.

@@ -33,7 +33,10 @@ No network host is contacted anywhere in this script.
 from __future__ import annotations
 
 import argparse
+import os
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -42,12 +45,85 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ormas_subnet.localnet import LocalGateway  # noqa: E402
 from ormas_subnet.client import OrmasMinerClient  # noqa: E402
+from ormas_subnet._private_file import read_private_text  # noqa: E402
 from ormas_subnet.skeleton import MinerConfig, MinerSkeleton, SolveResult  # noqa: E402
 
 # Never /tmp: it is world-readable, periodically purged, and shared with every
 # other user on the box — the wrong place for even a throwaway "client repo".
 # See docs/QUICKSTART_LOCAL.md.
 DEFAULT_WORKDIR = Path.home() / ".ormas" / "localnet-demo"
+_OWNER_MARKER = ".ormas-localnet-demo"
+
+
+def _owner_marker_text(target: Path) -> str:
+    """Bind the reset authority marker to one canonical directory."""
+    return f"ormas-localnet-demo:v2:{target}\n"
+
+
+def _write_owner_marker(target_fd: int, target: Path) -> None:
+    """Create the marker once with private mode; never follow an injected link."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("ownership marker requires no-follow file support")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(_OWNER_MARKER, flags, 0o600, dir_fd=target_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        remaining = _owner_marker_text(target).encode("utf-8")
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("short ownership marker write")
+            remaining = remaining[written:]
+    finally:
+        os.close(fd)
+
+
+def _clear_open_directory(directory_fd: int) -> None:
+    """Remove one directory tree through already-open, no-follow descriptors."""
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(before.st_mode):
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if not os.path.samestat(before, opened):
+                    raise ValueError("localnet demo directory changed during reset")
+                _clear_open_directory(child_fd)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not os.path.samestat(opened, current):
+                    raise ValueError("localnet demo directory changed during reset")
+                os.rmdir(name, dir_fd=directory_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _remove_owned_directory(
+    parent_fd: int,
+    target_name: str,
+    target_fd: int,
+    target_info: os.stat_result,
+) -> None:
+    """Quarantine then remove only the directory represented by ``target_fd``."""
+    quarantine = f".ormas-localnet-demo-reset-{secrets.token_hex(16)}"
+    os.rename(
+        target_name, quarantine,
+        src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+    )
+    moved = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+    if not os.path.samestat(target_info, moved):
+        raise ValueError("localnet demo directory changed during reset")
+    _clear_open_directory(target_fd)
+    current = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+    if not os.path.samestat(target_info, current):
+        raise ValueError("localnet demo directory changed during reset")
+    os.rmdir(quarantine, dir_fd=parent_fd)
 
 TASK_ID = "local-demo-task"
 VERIFY_COMMAND = "grep -q mined out.txt"
@@ -162,11 +238,87 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def _prepare_workdir(workdir: Path) -> Path:
+    """Create or safely reset a directory owned by this demo."""
+    if workdir.is_symlink():
+        raise ValueError("refusing to reset a symlinked localnet demo directory")
+    target = workdir.resolve()
+    home = Path.home().resolve()
+    repository = Path(__file__).resolve().parents[1]
+    current = Path.cwd().resolve()
+    filesystem_root = Path(target.anchor)
+    protected = (home, repository, current)
+    if target == filesystem_root or any(target == item or target in item.parents for item in protected):
+        raise ValueError("refusing an unsafe localnet demo directory")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise ValueError("localnet demo reset requires no-follow directory support")
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(target.parent, parent_flags)
+    except OSError:
+        raise ValueError("refusing an unsafe localnet demo parent directory") from None
+    try:
+        parent_info = os.fstat(parent_fd)
+        if (
+            parent_info.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o022
+        ):
+            raise ValueError("refusing an unsafe localnet demo parent directory")
+
+        try:
+            target_fd = os.open(target.name, parent_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            target_fd = -1
+        except OSError:
+            raise ValueError("refusing to reset an unowned localnet demo directory") from None
+
+        if target_fd >= 0:
+            try:
+                info = os.fstat(target_fd)
+                named_info = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    not os.path.samestat(info, named_info)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                ):
+                    raise ValueError("refusing to reset an unowned localnet demo directory")
+                try:
+                    marker_text = read_private_text(
+                        _OWNER_MARKER,
+                        label="localnet demo ownership marker",
+                        max_bytes=4096,
+                        dir_fd=target_fd,
+                    )
+                except ValueError:
+                    raise ValueError("refusing to reset an unowned localnet demo directory") from None
+                if marker_text != _owner_marker_text(target):
+                    raise ValueError("refusing to reset an unowned localnet demo directory")
+                _remove_owned_directory(parent_fd, target.name, target_fd, info)
+            finally:
+                os.close(target_fd)
+
+        try:
+            os.mkdir(target.name, 0o700, dir_fd=parent_fd)
+            target_fd = os.open(target.name, parent_flags, dir_fd=parent_fd)
+            try:
+                os.fchmod(target_fd, 0o700)
+                _write_owner_marker(target_fd, target)
+            finally:
+                os.close(target_fd)
+        except FileExistsError:
+            raise ValueError("localnet demo directory changed during reset") from None
+    finally:
+        os.close(parent_fd)
+    return target
+
+
 def run_demo(workdir: Path, scenario: str) -> dict:
     """Run one scenario end to end; returns the recorded receipt dict."""
-    if workdir.exists():
-        shutil.rmtree(workdir)
-    workdir.mkdir(parents=True, mode=0o700)
+    workdir = _prepare_workdir(workdir)
 
     bare_repo, base_commit = _make_client_bare_repo(workdir)
 

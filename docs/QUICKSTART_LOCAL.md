@@ -46,6 +46,10 @@ python neurons/localnet_demo.py
 Default `--workdir` is `~/.ormas/localnet-demo/` (created `0700`) — never
 `/tmp`, which is world-readable, periodically purged, and shared with every
 other user on the box; the wrong place even for a throwaway demo repo.
+The demo writes an owner-only marker bound to the directory's canonical path
+before it can reset that directory on a later run. A directory created by a
+release without this marker is refused. Inspect and rename that old directory,
+or choose a new `--workdir`; the demo will initialize the replacement safely.
 
 Expected output (commit shas will differ). Settlement uses the same wire
 vocabulary as the real gateway (`docs/protocol.md` § "Settlement

@@ -1,4 +1,4 @@
-"""Parallel assignment review for the reference checker (card ac0967ba).
+"""Parallel assignment review for the reference checker.
 
 Child reviews are fakes: they sleep, raise, or exit. Overlap is measured with
 timestamps and an exclusive in-flight file, not a wall-clock cutoff.
@@ -17,6 +17,7 @@ from ormas_subnet.validator import (
     OrmasValidatorClient,
     ValidatorConfig,
     ValidatorDaemon,
+    _dispatch_reviews,
     canonical_evidence_fields,
     evidence_digest_hex,
 )
@@ -150,6 +151,115 @@ def _daemon(tmp_path: Path, gateway: _MultiGateway, sign_log: list[dict[str, Any
         return "ab" * 64
 
     return ValidatorDaemon(client, ValidatorConfig(workdir_root=tmp_path / "validator-work"), sign_fn)
+
+
+class _CountingConnection:
+    def close(self) -> None:
+        pass
+
+
+class _CountingProcess:
+    def __init__(self, starts: list[str], name: str) -> None:
+        self._starts = starts
+        self._name = name
+
+    def start(self) -> None:
+        self._starts.append(self._name)
+
+
+class _CountingContext:
+    def __init__(self) -> None:
+        self.starts: list[str] = []
+
+    def Pipe(self, *, duplex: bool):
+        assert duplex is False
+        return _CountingConnection(), _CountingConnection()
+
+    def Process(self, *, name: str, **_kwargs: Any):
+        return _CountingProcess(self.starts, name)
+
+
+class _DispatchDaemon:
+    client = None
+
+    def __init__(self, root: Path, *, error: bool = False) -> None:
+        self.config = ValidatorConfig(workdir_root=root)
+        self.error = error
+        self.signatures: list[str] = []
+        self.prefaced: list[dict[str, Any]] = []
+
+    def sign_fn(self, digest: str) -> str:
+        self.signatures.append(digest)
+        return "ab" * 64
+
+    def _preface(self, assignment: dict[str, Any]) -> tuple[str, str]:
+        self.prefaced.append(assignment)
+        return ("error" if self.error else "review"), assignment.get("digest", "d" * 64)
+
+
+def test_duplicate_assignment_rows_start_only_one_child(tmp_path: Path) -> None:
+    ctx = _CountingContext()
+    in_flight: dict[Any, Any] = {}
+    duplicate = {"assignment_id": "asgn_duplicate"}
+    started = _dispatch_reviews(
+        _DispatchDaemon(tmp_path), ctx, in_flight, {}, set(), set(), set(),
+        [dict(duplicate) for _ in range(1000)], 2,
+    )
+    assert started == 1
+    assert ctx.starts == ["ormas-validator-asgn_duplicate"]
+    assert set(in_flight) == {"asgn_duplicate"}
+
+
+def test_duplicate_error_row_cannot_repeat_or_spawn(tmp_path: Path) -> None:
+    ctx = _CountingContext()
+    pending: dict[Any, Any] = {}
+    daemon = _DispatchDaemon(tmp_path, error=True)
+    duplicate = {"assignment_id": "asgn_duplicate"}
+    started = _dispatch_reviews(
+        daemon, ctx, {}, pending, set(), set(), set(),
+        [duplicate, dict(duplicate)], 2,
+    )
+    assert started == 1
+    assert set(pending) == {"asgn_duplicate"}
+    assert daemon.signatures == ["d" * 64]
+    assert ctx.starts == []
+
+
+def test_malformed_assignment_rows_are_refused_before_process_creation(tmp_path: Path) -> None:
+    ctx = _CountingContext()
+    in_flight: dict[Any, Any] = {}
+    started = _dispatch_reviews(
+        _DispatchDaemon(tmp_path), ctx, in_flight, {}, set(), set(), set(),
+        [None, {}, {"assignment_id": ""}, {"assignment_id": 1}], 2,
+    )
+    assert started == 0
+    assert in_flight == {}
+    assert ctx.starts == []
+
+
+def test_conflicting_duplicate_assignment_uses_first_row_only(tmp_path: Path) -> None:
+    daemon = _DispatchDaemon(tmp_path, error=True)
+    pending: dict[Any, Any] = {}
+    first = {"assignment_id": "asgn_duplicate", "digest": "a" * 64, "marker": "first"}
+    second = {"assignment_id": "asgn_duplicate", "digest": "b" * 64, "marker": "second"}
+    assert _dispatch_reviews(
+        daemon, _CountingContext(), {}, pending, set(), set(), set(), [first, second], 2,
+    ) == 1
+    assert daemon.prefaced == [first]
+    assert daemon.signatures == ["a" * 64]
+    assert pending["asgn_duplicate"].assignment["marker"] == "first"
+
+
+def test_mixed_unique_assignments_respect_available_slots(tmp_path: Path) -> None:
+    daemon = _DispatchDaemon(tmp_path)
+    ctx = _CountingContext()
+    in_flight: dict[Any, Any] = {}
+    rows = [{"assignment_id": f"asgn_{index}"} for index in range(3)]
+    assert _dispatch_reviews(
+        daemon, ctx, in_flight, {}, set(), set(), set(), rows, 2,
+    ) == 2
+    assert set(in_flight) == {"asgn_0", "asgn_1"}
+    assert ctx.starts == ["ormas-validator-asgn_0", "ormas-validator-asgn_1"]
 
 
 def _until_decisions(gateway: _MultiGateway, want: dict[str, str]):

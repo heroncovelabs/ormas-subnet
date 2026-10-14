@@ -1,9 +1,8 @@
 """The reference solver commits only what the packet allows — never the miner's environment.
 
-Jake's first live run (2026-09-15, job_87075aeb39d1): the result commit's ONLY change
-was ``.rustup/settings.toml`` — a toolchain file some hook on the miner's machine wrote
-into the workdir, swept up by ``git add -A``. A miner's local artifacts must never land
-in a customer's repository, and nothing outside ``allowed_paths`` may be staged.
+A synthetic regression places ``.rustup/settings.toml`` and another local artifact in
+the workdir beside the requested edit. A miner's local artifacts must never land in a
+customer's repository, and nothing outside ``allowed_paths`` may be staged.
 
 Rule: when the draft carries ``allowed_paths``, stage exactly those paths (``git add --
 <paths>``; a listed path that does not exist is fine). With no ``allowed_paths`` on the

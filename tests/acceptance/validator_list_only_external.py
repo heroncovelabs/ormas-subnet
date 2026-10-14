@@ -1,4 +1,4 @@
-"""Ormas external acceptance for card 5a960b1f.
+"""Ormas external acceptance for the validator list-only behavior.
 
 Runs the frozen validator --list-only check inside the candidate in one call,
 which stays under the 60 s bridge limit. On the base the --list-only checks
