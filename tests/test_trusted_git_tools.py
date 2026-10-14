@@ -6,6 +6,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 import json
 import hashlib
 from pathlib import Path
@@ -357,6 +358,25 @@ def test_embedded_runtime_ignores_hostile_sibling_path_and_bounds_environment(
     assert "ORMAS_TEST_AMBIENT_SECRET" not in host_env
 
 
+def test_embedded_runtime_rechecks_gitlinks_with_frozen_git_path(tmp_path: Path) -> None:
+    repo, git, _env = _identity_free_repo(tmp_path)
+    target = tmp_path / "snapshot"
+    target.mkdir()
+    config = {
+        "repository_gitlinks": {}, "lock_files": {},
+        "limits": {"max_files": 10, "max_bytes": 1024 * 1024,
+                   "source_max_bytes": 1024 * 1024},
+    }
+
+    fingerprints = runtime._snapshot(
+        repo, target, config, time.monotonic() + 10,
+        runtime._host_environment(git, git), str(git),
+    )
+
+    assert fingerprints["out.txt"] == hashlib.sha256(b"base\n").hexdigest()
+    assert (target / "out.txt").read_text() == "base\n"
+
+
 def test_embedded_runtime_rejects_missing_and_writable_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -396,16 +416,22 @@ def test_cleanup_guard_uses_passed_absolute_docker_with_hostile_path(
     assert not hostile_marker.exists()
 
 
-def test_verifier_catalog_rotates_without_stranding_previous_compiler() -> None:
+def test_verifier_catalog_history_loads_after_compiler_revocation() -> None:
     assets = Path(support.__file__).with_name("client_assets")
     current = json.loads(assets.joinpath("outcomes_support.v1.json").read_text())
     previous = json.loads(assets.joinpath(
         "outcomes_support_history", "2026-10-04.1-e4511421b6b2.json").read_text())
+    broken = json.loads(assets.joinpath(
+        "outcomes_support_history", "2026-10-14.1-aebcdc4a64d5.json").read_text())
     source = Path(runtime.__file__).read_text()
 
-    assert current["revision"] == "2026-10-14.1"
+    assert current["revision"] == "2026-10-14.2"
     assert current["verifier_compiler_sha256"] == hashlib.sha256(source.encode()).hexdigest()
     assert support.digest(previous) == (
         "sha256:e4511421b6b2d459810e31cf50338c12bd91b02cee054a98d69d602cd9b0717f"
     )
     assert support.load_support_catalog(support.digest(previous)) == previous
+    assert support.digest(broken) == (
+        "sha256:aebcdc4a64d54b94c27a1eae933144290abe82f0062626f0187ad33d7a8195e7"
+    )
+    assert support.load_support_catalog(support.digest(broken)) == broken

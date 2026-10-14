@@ -41,7 +41,7 @@ PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
 # selecting its old catalog digest.  Updating this allowlist requires review of
 # the exact embedded verifier source and coordinated gateway/SDK rollout.
 _ACTIVE_VERIFIER_COMPILERS = frozenset({
-    'c5d5f29905234ae9b9d08c15d133e3d6ba5e0c9623ed2f67134bc5b074ff0d2e',
+    'd609ed993b3bda292cc93e5e995699da1175ca995d4226d17cb8794a8ab89151',
 })
 
 

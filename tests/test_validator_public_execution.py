@@ -85,8 +85,14 @@ def test_public_contract_never_provisions_an_ambient_host_toolchain(tmp_path, mo
     assert daemon(tmp_path)._decide(assignment, tmp_path) == 'accept'
 
 
-def test_historical_catalog_loads_but_revoked_compiler_cannot_execute(assignment):
-    previous_digest = 'sha256:e4511421b6b2d459810e31cf50338c12bd91b02cee054a98d69d602cd9b0717f'
+@pytest.mark.parametrize(('previous_digest', 'revision'), [
+    ('sha256:e4511421b6b2d459810e31cf50338c12bd91b02cee054a98d69d602cd9b0717f',
+     '2026-10-04.1'),
+    ('sha256:aebcdc4a64d54b94c27a1eae933144290abe82f0062626f0187ad33d7a8195e7',
+     '2026-10-14.1'),
+])
+def test_historical_catalog_loads_but_revoked_compiler_cannot_execute(
+        assignment, previous_digest, revision):
     previous = support.load_support_catalog(previous_digest)
     value = copy.deepcopy(assignment)
     environment = value['execution_contract']['execution_environment']
@@ -96,7 +102,7 @@ def test_historical_catalog_loads_but_revoked_compiler_cannot_execute(assignment
         profile for profile in previous['profiles'] if profile['profile_id'] == profile_id
     )
 
-    assert previous['revision'] == '2026-10-04.1'
+    assert previous['revision'] == revision
     with pytest.raises(ValueError, match='verifier_compiler_revoked'):
         module.validate_assignment_execution(value)
 
