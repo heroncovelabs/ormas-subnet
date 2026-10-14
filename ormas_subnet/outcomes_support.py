@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
 from .verifier_runtime import (
+    REVOKED_ACCEPTANCE_DRIVER_SHA256,
     RuntimeRefusal,
     dependency_spec,
     structured_test_argv,
@@ -41,7 +42,7 @@ PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
 # selecting its old catalog digest.  Updating this allowlist requires review of
 # the exact embedded verifier source and coordinated gateway/SDK rollout.
 _ACTIVE_VERIFIER_COMPILERS = frozenset({
-    '2c80182959d5f5f67dc9e7bc1389f532e8199be1880c1af5f7fb50ff9d272690',
+    '2ba990540ac8653f130efe5ed132a0dfdca6048db18386352719d3a317ae2c00',
 })
 
 
@@ -102,6 +103,19 @@ def _locked_file(root, name):
     if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
         raise ValueError('dependency_lock_unavailable')
     return path.read_bytes()
+
+
+def _validate_acceptance_files(files):
+    if not isinstance(files, dict) or not files or len(files) > 1000 or any(
+            not isinstance(name, str) or name.startswith(('/', '~')) or '\\' in name
+            or any(p in ('', '.', '..', '.git', '.venv', 'node_modules')
+                   for p in name.split('/'))
+            or not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha)
+            for name, sha in files.items()):
+        raise ValueError('invalid_acceptance_files')
+    if REVOKED_ACCEPTANCE_DRIVER_SHA256.intersection(files.values()):
+        raise ValueError('acceptance_driver_revoked')
+    return files
 
 
 def _languages(value, profile):
@@ -218,20 +232,6 @@ def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None):
                    'acceptance_files': {}}
     if 'repository_access' in selection:
         environment['repository_access'] = dict(selection['repository_access'])
-    # Freeze only pointers in this repository's committed tree. No submodule
-    # URL is consulted, and no recursively owned repository is fetched.
-    if profile.get('repository_features', {}).get('submodules') == 'uninitialized-pointers-v1':
-        links = {}
-        for entry in public_git(['ls-tree', '-rz', '--full-tree', 'HEAD'], cwd=root).split(b'\0'):
-            if entry:
-                metadata, path = entry.split(b'\t', 1)
-                mode, kind, oid = metadata.decode('ascii').split()
-                if mode == '160000':
-                    if kind != 'commit':
-                        raise ValueError('invalid_repository_gitlinks')
-                    links[path.decode('utf-8')] = oid
-        if links:
-            environment['repository_gitlinks'] = validate_repository_gitlinks(links)
     if 'service' in selection:
         environment['service'] = _service(selection['service'])
     config = runtime_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
@@ -272,10 +272,29 @@ def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None):
                 names.add(name)
         if not names or len(names) > 1000 or not all(any(n == p or n.startswith(p.rstrip('/') + '/') for n in names) for p in selected):
             raise ValueError('named_tests_must_be_frozen')
-        environment['acceptance_files'] = {name: hashlib.sha256(_locked_file(root, name)).hexdigest() for name in sorted(names)}
-        config['acceptance_files'] = environment['acceptance_files']
+        environment['acceptance_files'] = _validate_acceptance_files({
+            name: hashlib.sha256(_locked_file(root, name)).hexdigest()
+            for name in sorted(names)
+        })
     except RuntimeRefusal as exc:
         raise ValueError(str(exc)) from None
+    # Reject unsafe frozen driver bytes before resolving or invoking a host Git
+    # executable. Only accepted material proceeds to repository inspection.
+    # Freeze only pointers in this repository's committed tree. No submodule
+    # URL is consulted, and no recursively owned repository is fetched.
+    if profile.get('repository_features', {}).get('submodules') == 'uninitialized-pointers-v1':
+        links = {}
+        for entry in public_git(['ls-tree', '-rz', '--full-tree', 'HEAD'], cwd=root).split(b'\0'):
+            if entry:
+                metadata, path = entry.split(b'\t', 1)
+                mode, kind, oid = metadata.decode('ascii').split()
+                if mode == '160000':
+                    if kind != 'commit':
+                        raise ValueError('invalid_repository_gitlinks')
+                    links[path.decode('utf-8')] = oid
+        if links:
+            environment['repository_gitlinks'] = validate_repository_gitlinks(links)
+    config = runtime_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
     requirements = execution_requirements(environment, config, languages=languages, command_digest='sha256:' + '0' * 64)
     return environment, config, requirements
 
@@ -343,12 +362,7 @@ def validate_public_execution_packet(packet):
     locks = environment['lock_files']
     if not isinstance(locks, dict) or set(locks) != set(_lock_paths(profile)) or any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v) for v in locks.values()):
         raise ValueError('invalid_dependency_locks')
-    files = environment['acceptance_files']
-    if not isinstance(files, dict) or not files or len(files) > 1000 or any(
-            not isinstance(name, str) or name.startswith(('/', '~')) or '\\' in name
-            or any(p in ('', '.', '..', '.git', '.venv', 'node_modules') for p in name.split('/'))
-            or not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha) for name, sha in files.items()):
-        raise ValueError('invalid_acceptance_files')
+    files = _validate_acceptance_files(environment['acceptance_files'])
     vp, req, policy = packet.get('verifier_profile'), packet.get('execution_requirements'), packet.get('execution_policy')
     if not isinstance(vp, dict) or not isinstance(req, dict) or not isinstance(policy, dict):
         raise ValueError('public_execution_contract_required')
