@@ -391,6 +391,19 @@ The response contains `bid_id` and `window_closes_at`; a gateway may also includ
 shape, with no reserve feedback. Replacing terms uses a new POST and returns a
 new `bid_id`; the old open bid becomes `replaced`.
 
+### `GET /api/runner/v1/offers?runner_id=...&job_id=...`
+
+`get_offer_for_job(runner_id, job_id)` reconciles a saved POST intent when the
+gateway may have committed an offer but its acknowledgement was lost. The
+authenticated runner and device can read only their latest own bid for that
+job. The response is `{"job_id": str, "window_closed": bool, "bid": object|null}`;
+an included bid carries its immutable `terms`, status and bid identity. This is
+a read only lookup: it does not evaluate a window, update liveness or award work.
+The reference miner validates the response against its saved intent and never
+replays the ambiguous POST. A missing bid is conclusive only after
+`window_closed` becomes true; otherwise the miner remains fail closed and tries
+the read again on a later poll.
+
 ### `GET /api/runner/v1/offers/{bid_id}`
 
 `get_offer(bid_id)` reads an own bid only. Encode the id as one URL segment.
@@ -454,10 +467,11 @@ has reconciled awards. The default legacy route accepts on arrival within the
 client's undisclosed spending limit. Saved window identities remain required
 for every window award returned by either claim path.
 
-Recovery limits: the gateway provides neither an own-offer listing nor a POST
+Recovery limits: the gateway provides no general own-offer listing or POST
 idempotency key. A lost POST acknowledgement leaves a durable unresolved intent;
-the miner refuses further claims until an operator recovers its own bid identity.
-The queue also omits a window identity for reopened jobs. The reference miner
+the miner refuses claims until the runner/job recovery read returns the matching
+own bid or proves the window closed without it. The queue also omits a window
+identity for reopened jobs. The reference miner
 retains unchanged bid records and avoids automatic same-price resubmission
 for such a job. It reconciles gateway-owned reopening and awards at the saved
 terms. Explicitly changed terms can submit a new bid through the gateway;
