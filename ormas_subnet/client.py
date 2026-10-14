@@ -11,6 +11,8 @@ call :func:`load_token` yourself — the caller owns where the token lives.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -43,6 +45,8 @@ HOTKEY_CHALLENGE_MAX_BYTES = 512
 _HOTKEY = re.compile(r"[1-9A-HJ-NP-Za-km-z]{30,64}")
 _MINER_IDENTITY = re.compile(r"miner:[A-Za-z0-9_-]{1,128}")
 _HOTKEY_NONCE = re.compile(r"[0-9a-f]{32}")
+_OFFER_REQUEST_ID = re.compile(r"ofr_[0-9a-f]{32}")
+_OFFER_AUTHORITY_EPOCH = re.compile(r"[0-9a-f]{32}")
 
 
 def _utc_timestamp(value: Any) -> datetime:
@@ -174,6 +178,32 @@ def _validate_window_offer(offer: Any) -> None:
         raise ValueError("estimate_usd must be at most limit_usd")
 
 
+def _validate_offer_request_id(value: Any) -> str:
+    """Return one bounded, log-safe offer idempotency key."""
+    if not isinstance(value, str) or _OFFER_REQUEST_ID.fullmatch(value) is None:
+        raise ValueError("offer_request_id must be 'ofr_' plus 32 lowercase hex characters")
+    return value
+
+
+def _validate_offer_authority_epoch(value: Any) -> str:
+    if not isinstance(value, str) or _OFFER_AUTHORITY_EPOCH.fullmatch(value) is None:
+        raise ValueError("offer_authority_epoch must be 32 lowercase hex characters")
+    return value
+
+
+def _offer_terms_sha256(offer: Mapping[str, Any]) -> str:
+    """Digest gateway-normalized terms using the offer-v1 canonical JSON."""
+    _validate_window_offer(offer)
+    normalized = dict(offer)
+    for field in ("price_usd", "estimate_usd", "limit_usd"):
+        if field in normalized:
+            normalized[field] = float(normalized[field])
+    canonical = json.dumps(
+        normalized, allow_nan=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 class OrmasGatewayError(RuntimeError):
     """An HTTP error from the gateway, carrying its structured error body.
 
@@ -191,10 +221,12 @@ class OrmasGatewayError(RuntimeError):
         status_code: int | None,
         error_type: str | None,
         message: str,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         self.status_code = status_code
         self.error_type = error_type
         self.message = message
+        self.details = dict(details) if details is not None else {}
         label = f"HTTP {status_code}" if status_code is not None else "HTTP error"
         type_part = f" [{error_type}]" if error_type else ""
         super().__init__(f"gateway {label}{type_part}: {message}")
@@ -296,6 +328,7 @@ class OrmasMinerClient:
         except Exception as exc:
             error_type: str | None = None
             detail: str | None = None
+            error_details: Mapping[str, Any] | None = None
             try:
                 payload = resp.json()
             except Exception:  # noqa: BLE001 - the body may not be JSON at all
@@ -303,6 +336,7 @@ class OrmasMinerClient:
             if isinstance(payload, Mapping):
                 error = payload.get("error")
                 if isinstance(error, Mapping):
+                    error_details = error
                     raw_type = error.get("type")
                     raw_message = error.get("message")
                     error_type = None if raw_type is None else str(raw_type)
@@ -314,6 +348,7 @@ class OrmasMinerClient:
                 status_code=getattr(resp, "status_code", None),
                 error_type=error_type,
                 message=detail,
+                details=error_details,
             ) from exc
 
     # ------------------------------------------------------------------
@@ -381,24 +416,51 @@ class OrmasMinerClient:
             raise ValueError("invalid queue payload")
         return payload
 
-    def submit_offer(self, runner_id: str, offer: dict[str, Any]) -> dict[str, Any]:
+    def submit_offer(
+        self,
+        runner_id: str,
+        offer: dict[str, Any],
+        *,
+        offer_request_id: str | None = None,
+        offer_authority_epoch: str | None = None,
+    ) -> dict[str, Any]:
         """POST an own offer; a replacement returns a new bid identity.
 
         The offers route accepts pricing fields and runner_id without a schema
-        version. Its acknowledgement exposes no reserve or ranking feedback.
+        version. ``offer_request_id`` and ``offer_authority_epoch`` make an
+        exact retry idempotent when the gateway advertises that protocol. Its
+        acknowledgement must echo the request identity, epoch, job and terms
+        digest. Omitting both preserves the legacy wire body for direct callers.
         """
         if not isinstance(runner_id, str) or not runner_id.strip():
             raise ValueError("runner_id must be a non-empty string")
         _validate_window_offer(offer)
-        resp = self._post("/api/runner/v1/offers", {"runner_id": runner_id, **offer})
+        body = {"runner_id": runner_id, **offer}
+        if (offer_request_id is None) != (offer_authority_epoch is None):
+            raise ValueError("offer_request_id and offer_authority_epoch must be provided together")
+        if offer_request_id is not None and offer_authority_epoch is not None:
+            body["offer_request_id"] = _validate_offer_request_id(offer_request_id)
+            body["offer_authority_epoch"] = _validate_offer_authority_epoch(
+                offer_authority_epoch,
+            )
+        resp = self._post("/api/runner/v1/offers", body)
         self._raise_for_status(resp)
-        return resp.json()
+        payload = resp.json()
+        if offer_request_id is not None:
+            if not isinstance(payload, dict):
+                raise ValueError("invalid offer acknowledgement")
+            if (payload.get("offer_request_id") != offer_request_id
+                    or payload.get("offer_authority_epoch") != offer_authority_epoch
+                    or payload.get("job_id") != offer["job_id"]
+                    or payload.get("offer_terms_sha256") != _offer_terms_sha256(offer)):
+                raise ValueError("offer acknowledgement request identity mismatch")
+        return payload
 
     def get_offer_for_job(self, runner_id: str, job_id: str) -> dict[str, Any]:
-        """Read the latest own offer after an ambiguous POST acknowledgement.
+        """Read the latest own offer for legacy unkeyed recovery.
 
-        This endpoint is read only. Callers use it to recover the gateway's bid
-        identity and must never replay an ambiguously acknowledged POST.
+        This endpoint is read only. New idempotent requests replay their saved
+        POST; this route can only supply positive evidence for pre-id journals.
         """
         from urllib.parse import urlencode
 

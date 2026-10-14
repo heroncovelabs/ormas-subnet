@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -40,7 +41,10 @@ from .client import (
     OrmasGatewayError,
     OrmasMinerClient,
     _ClaimIdentityError,
+    _offer_terms_sha256,
     _positive_usd,
+    _validate_offer_authority_epoch,
+    _validate_offer_request_id,
     _validate_window_offer,
 )
 from ._recovery import PublicRecovery, RecoveryRequired
@@ -1027,11 +1031,31 @@ class MinerSkeleton:
                 if not isinstance(bid_id, str) or not bid_id:
                     raise ValueError("invalid bid identity")
                 _validate_window_offer(bid["terms"])
+                if "offer_request_id" in bid:
+                    _validate_offer_request_id(bid["offer_request_id"])
+                    _validate_offer_authority_epoch(bid["offer_authority_epoch"])
+                    if bid["offer_terms_sha256"] != _offer_terms_sha256(bid["terms"]):
+                        raise ValueError("invalid offer terms digest")
             for job_id, bid_id in state["current"].items():
                 if state["bids"][bid_id]["terms"]["job_id"] != job_id:
                     raise ValueError("invalid bid job identity")
-            if state["pending"] is not None:
-                _validate_window_offer(state["pending"])
+            pending = state["pending"]
+            if pending is not None:
+                if (isinstance(pending, dict) and type(pending.get("version")) is int
+                        and pending["version"] == 2 and set(pending) == {
+                            "version", "offer_request_id", "offer_authority_epoch",
+                            "offer_terms_sha256", "terms",
+                        }):
+                    _validate_offer_request_id(pending["offer_request_id"])
+                    _validate_offer_authority_epoch(pending["offer_authority_epoch"])
+                    _validate_window_offer(pending["terms"])
+                    if pending["offer_terms_sha256"] != _offer_terms_sha256(pending["terms"]):
+                        raise ValueError("invalid offer terms digest")
+                else:
+                    # Journals written before offer request ids contained the
+                    # offer terms directly. They remain readable for a narrow
+                    # fail-closed recovery path, but are never POSTed again.
+                    _validate_window_offer(pending)
             return state
         except (ValueError, KeyError, TypeError):
             raise RecoveryRequired("offer recovery record is corrupt") from None
@@ -1065,15 +1089,102 @@ class MinerSkeleton:
         return normalized
 
     @staticmethod
+    def _new_offer_request_id() -> str:
+        """Generate a bounded 128-bit idempotency identity for one offer intent."""
+        return _validate_offer_request_id(f"ofr_{secrets.token_hex(16)}")
+
+    @staticmethod
+    def _offer_authority_epoch(queue: Mapping[str, Any]) -> str | None:
+        capability = queue.get("offer_idempotency")
+        if not isinstance(capability, Mapping):
+            return None
+        if capability.get("protocol") != "ormas-offer-request-v1":
+            return None
+        try:
+            return _validate_offer_authority_epoch(capability.get("authority_epoch"))
+        except ValueError:
+            return None
+
+    @staticmethod
     def _pending_offer_refusal(cause: BaseException | None = None) -> NoReturn:
-        message = "offer POST outcome unknown; retry own-offer read before claiming"
+        message = "offer POST outcome unknown; replay saved request or manually reconcile before claiming"
         raise RecoveryRequired(message) from cause
 
-    def _recover_pending_offer(self, state: dict[str, Any]) -> set[str]:
-        """Resolve one saved POST intent by read, without ever replaying the POST."""
-        intent = state["pending"]
-        if intent is None:
-            return set()
+    @staticmethod
+    def _durable_offer_refusal(
+        exc: OrmasGatewayError, pending: Mapping[str, Any],
+    ) -> bool:
+        """Recognize only the gateway's persisted, request-bound refusal."""
+        return (exc.status_code == 409
+                and exc.error_type == "offer_request_refused"
+                and exc.message in {"window_closed", "not_offering"}
+                and exc.details.get("offer_request_id") == pending["offer_request_id"]
+                and exc.details.get("job_id") == pending["terms"]["job_id"]
+                and exc.details.get("offer_terms_sha256") == pending["offer_terms_sha256"]
+                and exc.details.get("offer_authority_epoch")
+                == pending["offer_authority_epoch"])
+
+    def _resolve_offer_request(
+        self, state: dict[str, Any], pending: dict[str, Any],
+    ) -> tuple[str, str | None]:
+        """Replay one exact request and durably record its success or refusal."""
+        request_id = pending["offer_request_id"]
+        authority_epoch = pending["offer_authority_epoch"]
+        terms_sha256 = pending["offer_terms_sha256"]
+        terms = pending["terms"]
+        try:
+            response = self.client.submit_offer(
+                self.config.runner_id, terms,
+                offer_request_id=request_id,
+                offer_authority_epoch=authority_epoch,
+            )
+        except OrmasGatewayError as exc:
+            if not self._durable_offer_refusal(exc, pending):
+                # Preserve ordinary daemon behavior for authentication,
+                # throttling and transient gateway failures. The journal is
+                # already durable, so the next poll replays the same request.
+                if (exc.status_code is None or exc.status_code in {401, 403, 429}
+                        or exc.status_code >= 500):
+                    raise
+                self._pending_offer_refusal(exc)
+            state["pending"] = None
+            self._save_offers(state)
+            return "refused", exc.message
+        except (HTTPError, OSError):
+            raise
+        except Exception as exc:  # transport, malformed echo and old gateway all stay pending
+            self._pending_offer_refusal(exc)
+
+        new_id = response.get("bid_id")
+        ack_by_at = response.get("ack_by_at")
+        closes = response.get("window_closes_at")
+        if (response.get("offer_request_id") != request_id
+                or response.get("offer_authority_epoch") != authority_epoch
+                or response.get("offer_terms_sha256") != terms_sha256
+                or response.get("job_id") != terms["job_id"]
+                or not isinstance(new_id, str) or not new_id or new_id in state["bids"]
+                or not isinstance(ack_by_at, str) or not ack_by_at
+                or not isinstance(closes, str) or not closes):
+            self._pending_offer_refusal()
+        bid = {
+            "terms": terms,
+            "status": "open",
+            "window_closes_at": closes,
+            "offer_request_id": request_id,
+            "offer_authority_epoch": authority_epoch,
+            "offer_terms_sha256": terms_sha256,
+            "ack_by_at": ack_by_at,
+        }
+        state["pending"] = None
+        state["bids"][new_id] = bid
+        state["current"][terms["job_id"]] = new_id
+        self._save_offers(state)
+        return "accepted", None
+
+    def _recover_legacy_pending_offer(
+        self, state: dict[str, Any], intent: dict[str, Any],
+    ) -> set[str]:
+        """Adopt only an exact new own bid; negative GET evidence never clears."""
         job_id = intent["job_id"]
         try:
             response = self.client.get_offer_for_job(self.config.runner_id, job_id)
@@ -1097,40 +1208,50 @@ class MinerSkeleton:
                 intent_terms = self._normalized_offer_terms(intent)
             except (ValueError, TypeError, KeyError, OverflowError):
                 self._pending_offer_refusal()
-        # The lookup returns the latest own bid.  A locally known identity or
-        # different immutable terms therefore proves that it predates this
-        # pending intent, regardless of the bid's current status.  It is safe
-        # to clear the intent only once the gateway authoritatively closes the
-        # window; until then the POST may still be in flight or unobserved.
+        # A locally known identity or different terms proves this is a prior
+        # bid regardless of status. Neither a prior bid nor absence proves an
+        # unkeyed POST can no longer commit, even after a reported close.
         prior_bid = (isinstance(bid, Mapping)
                      and (remote_terms != intent_terms
                           or bid.get("bid_id") in state["bids"]))
         if bid is None or prior_bid:
-            if not response["window_closed"]:
-                self._pending_offer_refusal()
-        else:
-            bid_id, status = bid["bid_id"], bid["status"]
-            if (bid_id in state["bids"] or remote_terms != intent_terms
-                    or (status in {"open", "awarded"} and (
-                        not isinstance(bid.get("ack_by_at"), str) or not bid["ack_by_at"]
-                        or not isinstance(bid.get("window_closes_at"), str)
-                        or not bid["window_closes_at"]))
-                    or (status == "awarded" and (
-                        not isinstance(bid.get("award_id"), str) or not bid["award_id"]))):
-                self._pending_offer_refusal()
-            state["bids"][bid_id] = {
-                "terms": intent,
-                "status": status,
-                "ack_by_at": bid.get("ack_by_at"),
-                "window_closes_at": bid.get("window_closes_at"),
-                "award_id": bid.get("award_id"),
-            }
-            state["current"][job_id] = bid_id
+            self._pending_offer_refusal()
+        bid_id, status = bid["bid_id"], bid["status"]
+        if ((status in {"open", "awarded"} and (
+                not isinstance(bid.get("ack_by_at"), str) or not bid["ack_by_at"]
+                or not isinstance(bid.get("window_closes_at"), str)
+                or not bid["window_closes_at"]))
+                or (status == "awarded" and (
+                    not isinstance(bid.get("award_id"), str) or not bid["award_id"]))):
+            self._pending_offer_refusal()
+        state["bids"][bid_id] = {
+            "terms": intent,
+            "status": status,
+            "ack_by_at": bid.get("ack_by_at"),
+            "window_closes_at": bid.get("window_closes_at"),
+            "award_id": bid.get("award_id"),
+        }
+        state["current"][job_id] = bid_id
         state["pending"] = None
         self._save_offers(state)
-        # Do not reprice or repost this job in the same tick if queue visibility
-        # races the recovery read. A later fresh window can be offered normally.
         return {job_id}
+
+    def _recover_pending_offer(
+        self, state: dict[str, Any],
+    ) -> tuple[set[str], list[dict[str, Any]]]:
+        """Resolve one saved intent before any queue, pricing or claim action."""
+        pending = state["pending"]
+        if pending is None:
+            return set(), []
+        if not (isinstance(pending, dict) and type(pending.get("version")) is int
+                and pending["version"] == 2):
+            return self._recover_legacy_pending_offer(state, pending), []
+        outcome, reason = self._resolve_offer_request(state, pending)
+        terms = pending["terms"]
+        legacy = [terms] if outcome == "refused" and reason == "not_offering" else []
+        # Do not reprice or repost this job in the same tick. A later poll may
+        # create a fresh request identity after this one is conclusively done.
+        return {terms["job_id"]}, legacy
 
     @staticmethod
     def _offer_conflict(exc: OrmasGatewayError, message: str) -> bool:
@@ -1190,7 +1311,7 @@ class MinerSkeleton:
 
     def _claim_offer_window(self) -> tuple[TaskLease, TaskDraft] | None:
         state = self._offer_state()
-        recovered_jobs = self._recover_pending_offer(state)
+        recovered_jobs, legacy_offers = self._recover_pending_offer(state)
         if self._queue_unsupported:
             if state["bids"]:
                 raise RecoveryRequired("own offer bids require gateway queue support")
@@ -1204,8 +1325,8 @@ class MinerSkeleton:
                 raise RecoveryRequired("own offer bids require gateway queue support") from exc
             self._queue_unsupported = True
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
+        authority_epoch = self._offer_authority_epoch(queue)
         missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
-        legacy_offers = []
         for entry in queue.get("jobs", []):
             job_id = entry["job_id"]
             if job_id in recovered_jobs:
@@ -1249,33 +1370,25 @@ class MinerSkeleton:
             if (bid is not None and not bid.get("legacy") and bid["terms"] == offer
                     and bid["status"] == "open"):
                 continue
-            # Save intent first. A lost response is reconciled by the read-only
-            # runner/job lookup; the POST itself is never replayed.
-            state["pending"] = offer
+            if authority_epoch is None:
+                raise RecoveryRequired("gateway has no usable offer idempotency capability")
+            # Save the request identity and exact terms before the first POST.
+            # Any ambiguous outcome replays this envelope with the same id.
+            pending = {
+                "version": 2,
+                "offer_request_id": self._new_offer_request_id(),
+                "offer_authority_epoch": authority_epoch,
+                "offer_terms_sha256": _offer_terms_sha256(offer),
+                "terms": offer,
+            }
+            state["pending"] = pending
             self._save_offers(state)
-            try:
-                response = self.client.submit_offer(self.config.runner_id, offer)
-            except OrmasGatewayError as exc:
-                if exc.status_code is None or exc.status_code >= 500:
-                    raise  # The gateway may have recorded the POST.
-                state["pending"] = None
-                self._save_offers(state)
-                if self._offer_conflict(exc, "not_offering") and (bid is None or bid.get("legacy")):
+            outcome, reason = self._resolve_offer_request(state, pending)
+            if outcome == "refused":
+                if reason == "not_offering" and (bid is None or bid.get("legacy")):
                     legacy_offers.append(offer)
-                    continue
-                if self._offer_conflict(exc, "window_closed"):
-                    if bid is not None:
-                        self._read_bid(state, bid_id)
-                    continue
-                raise
-            new_id, closes = response.get("bid_id"), response.get("window_closes_at")
-            if (not isinstance(new_id, str) or not new_id or new_id in state["bids"]
-                    or not isinstance(closes, str) or not closes):
-                raise RecoveryRequired("offer response has no new bid identity or window_closes_at")
-            state["pending"] = None
-            state["bids"][new_id] = {"terms": offer, "status": "open", "window_closes_at": closes}
-            state["current"][job_id] = new_id
-            self._save_offers(state)
+                elif reason == "window_closed" and bid is not None:
+                    self._read_bid(state, bid_id)
         if missing_pricing and not state["bids"]:
             raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
         # An own award can be absent from the queue page; recover its frozen
