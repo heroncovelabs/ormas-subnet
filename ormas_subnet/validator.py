@@ -916,7 +916,8 @@ class ValidatorDaemon:
 
         try:
             diff_out = _run_git(
-                ["diff", "--name-only", "--no-renames", "-z",
+                ["diff", "--no-ext-diff", "--no-textconv",
+                 "--name-only", "--no-renames", "-z",
                  base_commit, result_commit, "--"],
                 cwd=workdir,
             )
