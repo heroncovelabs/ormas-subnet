@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import math
 import os
-from pathlib import Path
+import re
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from ._private_file import read_private_text
 from .protocol import (
     RUNNER_DEVICE_HEADER,
     RUNNER_PROTOCOL_V1,
@@ -34,6 +36,68 @@ __all__ = ["OrmasMinerClient", "OrmasGatewayError", "load_token"]
 
 # Mirrors the gateway's ``runner_api.CLAIM_PAGE_LIMIT``: the most offers one claim may carry.
 CLAIM_PAGE_LIMIT = 20
+HOTKEY_CHALLENGE_TTL_S = 300
+HOTKEY_CHALLENGE_CLOCK_SKEW_S = 300
+HOTKEY_CHALLENGE_MAX_BYTES = 512
+_HOTKEY = re.compile(r"[1-9A-HJ-NP-Za-km-z]{30,64}")
+_MINER_IDENTITY = re.compile(r"miner:[A-Za-z0-9_-]{1,128}")
+_HOTKEY_NONCE = re.compile(r"[0-9a-f]{32}")
+
+
+def _utc_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError("invalid hotkey challenge payload")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("invalid hotkey challenge payload") from None
+    if parsed.tzinfo is None:
+        raise ValueError("invalid hotkey challenge payload")
+    return parsed.astimezone(timezone.utc)
+
+
+def _utc_now() -> datetime:
+    """Clock seam for deterministic freshness tests."""
+    return datetime.now(timezone.utc)
+
+
+def _validate_hotkey_challenge(payload: Any, *, hotkey_ss58: str) -> dict[str, Any]:
+    """Validate the official domain-separated statement before releasing a signature."""
+    if not isinstance(payload, Mapping) or _HOTKEY.fullmatch(hotkey_ss58) is None:
+        raise ValueError("invalid hotkey challenge payload")
+    challenge = payload.get("challenge")
+    miner_identity = payload.get("miner_identity")
+    expires_at = payload.get("expires_at")
+    server_now_text = payload.get("now")
+    if (
+        not isinstance(challenge, str)
+        or len(challenge.encode("utf-8")) > HOTKEY_CHALLENGE_MAX_BYTES
+        or not isinstance(miner_identity, str)
+        or _MINER_IDENTITY.fullmatch(miner_identity) is None
+        or not isinstance(expires_at, str)
+    ):
+        raise ValueError("invalid hotkey challenge payload")
+
+    prefix = f"ormas-hotkey:v1:{miner_identity}:{hotkey_ss58}:"
+    suffix = f":{expires_at}"
+    if not challenge.startswith(prefix) or not challenge.endswith(suffix):
+        raise ValueError("invalid hotkey challenge payload")
+    nonce = challenge[len(prefix):len(challenge) - len(suffix)]
+    if _HOTKEY_NONCE.fullmatch(nonce) is None:
+        raise ValueError("invalid hotkey challenge payload")
+
+    server_now = _utc_timestamp(server_now_text)
+    expires = _utc_timestamp(expires_at)
+    ttl_s = (expires - server_now).total_seconds()
+    local_now = _utc_now()
+    clock_skew_s = abs((server_now - local_now).total_seconds())
+    if (
+        not 0 < ttl_s <= HOTKEY_CHALLENGE_TTL_S
+        or expires <= local_now
+        or clock_skew_s > HOTKEY_CHALLENGE_CLOCK_SKEW_S
+    ):
+        raise ValueError("invalid hotkey challenge payload")
+    return dict(payload)
 
 
 def _positive_usd(value: Any) -> bool:
@@ -148,7 +212,7 @@ def load_token(*, token_env: str | None = None, token_path: str | os.PathLike[st
         if not token:
             raise ValueError(f"environment variable {token_env!r} is not set")
         return token
-    text = Path(token_path).read_text(encoding="utf-8").strip()
+    text = read_private_text(token_path, label="token file", strip=True)
     if not text:
         raise ValueError(f"token file {token_path!r} is empty")
     return text
@@ -495,13 +559,10 @@ class OrmasMinerClient:
 
         The gateway binds the challenge to (runner, miner identity, hotkey); it
         is valid for 300 s and can be consumed exactly once. Response keys:
-        ``challenge``, ``expires_at``, ``now``, ``miner_identity``. Raises
-        ``ValueError`` if the payload is not a mapping or lacks a str
-        ``challenge``.
-
-        This package never holds, derives, or loads a hotkey — the challenge is
-        an opaque string here; signing it is the miner's own tooling's job (see
-        :meth:`register_hotkey`).
+        ``challenge``, ``expires_at``, ``now``, ``miner_identity``. The client
+        validates the domain, identity grammar, requested hotkey, nonce, expiry,
+        TTL, clock freshness, and maximum size before the statement can reach a
+        signer.
         """
         body: dict[str, Any] = {
             "schema_version": RUNNER_PROTOCOL_V1,
@@ -510,10 +571,7 @@ class OrmasMinerClient:
         }
         resp = self._post("/api/runner/v1/hotkey/challenge", body)
         self._raise_for_status(resp)
-        payload = resp.json()
-        if not isinstance(payload, Mapping) or not isinstance(payload.get("challenge"), str):
-            raise ValueError("invalid hotkey challenge payload")
-        return dict(payload)
+        return _validate_hotkey_challenge(resp.json(), hotkey_ss58=hotkey_ss58)
 
     def register_hotkey(
         self,
@@ -524,12 +582,10 @@ class OrmasMinerClient:
     ) -> dict[str, Any]:
         """Drive challenge → sign → register for the miner's chain hotkey.
 
-        Mints a challenge via :meth:`hotkey_challenge`, then calls the injected
-        signer as ``sign_fn(challenge.encode("utf-8"))`` — the signature covers
-        EXACTLY the UTF-8 bytes of the challenge string, nothing prepended. The
-        signer is injected because this package never holds, derives, or loads a
-        hotkey; the miner signs with its own tooling (e.g. a Bittensor wallet
-        ``Keypair.sign``) and hands back the hex signature.
+        Mints and validates a domain-separated challenge via
+        :meth:`hotkey_challenge`, then calls the injected signer over those exact
+        canonical UTF-8 bytes. The signer is injected because this package never
+        holds, derives, or loads a hotkey.
 
         The signature is validated locally BEFORE the register request is sent:
         it must be a non-empty ``str`` of even length consisting only of hex
@@ -543,7 +599,8 @@ class OrmasMinerClient:
         (``miner_identity``, ``hotkey_ss58``, ``verified``,
         ``signature_scheme``).
         """
-        challenge = self.hotkey_challenge(runner_id, hotkey_ss58=hotkey_ss58)["challenge"]
+        challenge_payload = self.hotkey_challenge(runner_id, hotkey_ss58=hotkey_ss58)
+        challenge = challenge_payload["challenge"]
         signature_hex = sign_fn(challenge.encode("utf-8"))
         if (
             not isinstance(signature_hex, str)
@@ -563,7 +620,16 @@ class OrmasMinerClient:
         }
         resp = self._post("/api/runner/v1/hotkey", body)
         self._raise_for_status(resp)
-        return resp.json()
+        result = resp.json()
+        if (
+            not isinstance(result, Mapping)
+            or result.get("verified") is not True
+            or result.get("signature_scheme") != "sr25519"
+            or result.get("hotkey_ss58") != hotkey_ss58
+            or result.get("miner_identity") != challenge_payload["miner_identity"]
+        ):
+            raise ValueError("invalid hotkey registration response")
+        return dict(result)
 
     def close(self) -> None:
         if self._owns_client:

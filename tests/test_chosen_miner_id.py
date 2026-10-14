@@ -27,8 +27,8 @@ def _registration(**kwargs: Any) -> RunnerRegistration:
 
 
 def test_to_wire_includes_miner_id_when_set() -> None:
-    wire = _registration(miner_id="jake-miner").to_wire()
-    assert wire["miner_id"] == "jake-miner"
+    wire = _registration(miner_id="example-miner").to_wire()
+    assert wire["miner_id"] == "example-miner"
     assert wire["schema_version"] == RUNNER_PROTOCOL_V1
 
 
@@ -38,10 +38,10 @@ def test_to_wire_omits_miner_id_when_absent() -> None:
 
 
 def test_from_wire_round_trips_chosen_and_absent_miner_id() -> None:
-    chosen = _registration(miner_id="jake-miner")
+    chosen = _registration(miner_id="example-miner")
     restored = RunnerRegistration.from_wire(chosen.to_wire())
-    assert restored.miner_id == "jake-miner"
-    assert restored.to_wire()["miner_id"] == "jake-miner"
+    assert restored.miner_id == "example-miner"
+    assert restored.to_wire()["miner_id"] == "example-miner"
 
     absent = _registration()
     restored_absent = RunnerRegistration.from_wire(absent.to_wire())
@@ -115,13 +115,13 @@ def _skeleton(transport: Any, tmp_path: Path, **config_kw: Any) -> MinerSkeleton
 
 def test_register_sends_configured_miner_id_and_adopts_runner_id(tmp_path: Path) -> None:
     gw = _AssigningGateway()
-    sk = _skeleton(gw, tmp_path, miner_id="jake-miner")
+    sk = _skeleton(gw, tmp_path, miner_id="example-miner")
     resp = sk.register()
     path, body = gw.calls[0]
     assert path == "/api/runner/v1/registrations"
-    assert body["miner_id"] == "jake-miner"
+    assert body["miner_id"] == "example-miner"
     assert resp["runner_id"] == "runr_assigned01"
-    assert resp["miner_id"] == "jake-miner"
+    assert resp["miner_id"] == "example-miner"
     assert sk.config.runner_id == "runr_assigned01"
 
 

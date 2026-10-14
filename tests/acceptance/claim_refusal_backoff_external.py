@@ -1,4 +1,4 @@
-"""Ormas external acceptance for card f18d030c.
+"""Ormas external acceptance for claim-refusal backoff behavior.
 
 Runs the frozen claim-refusal backoff check and the existing run_forever
 resilience file inside the candidate, one call per file so each stays under

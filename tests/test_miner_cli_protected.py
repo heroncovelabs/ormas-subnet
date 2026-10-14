@@ -36,8 +36,10 @@ def home(monkeypatch, tmp_path):
 def env_args(tmp_path):
     worker = tmp_path / "worker.json"
     worker.write_text(json.dumps({"PROVIDER_KEY": "worker-canary"}))
+    worker.chmod(0o600)
     registry = tmp_path / "registry.txt"
     registry.write_text(REGISTRY)
+    registry.chmod(0o600)
     return [
         "protected-env", "--api-url", cli.DEFAULT_GATEWAY,
         "--miner-id", "my-miner", "--runtime", "production",
@@ -141,6 +143,7 @@ def test_file_values_refuse_unsafe_content(env_args, tmp_path, capsys, source, k
 def test_authorization_compact_json_alternative(env_args, tmp_path, capsys):
     path = tmp_path / "authorization.json"
     path.write_text(json.dumps({"approved_by": "miner-operator", "bounds": {"cell": 1.0}}, indent=2))
+    path.chmod(0o600)
     for flag in ("--cell-bounds", "--approved-by"):
         index = env_args.index(flag)
         del env_args[index:index + 2]

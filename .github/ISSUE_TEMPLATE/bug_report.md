@@ -26,4 +26,7 @@ What actually happened.
 
 **Logs (redacted)**
 
-Tracebacks and log lines are welcome. Strip every token (they start `ormr_`) and any other credential before posting — job ids, lease ids, and repo ids are fine to include.
+Tracebacks and log lines are welcome after redaction. Do not post tokens, signing material,
+customer source, repository names or URLs, job/task IDs, lease IDs, miner/runner IDs, project
+IDs, account IDs, or private deployment identifiers. Send a report that needs live identifiers
+to `ops@ormas.ai` instead of a public issue.

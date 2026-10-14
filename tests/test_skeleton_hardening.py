@@ -1,15 +1,4 @@
-"""Card 5f129fc0: the reference skeleton survives what an outside miner will hit on day two.
-
-Found by the 2026-09-12 fresh-clone rehearsal:
-1. ``register()`` returns the gateway's cadences but the skeleton polls/heartbeats on module
-   constants — a gateway change silently desynchronises every miner.
-2. A crashed job leaves its workdir; the same lease is re-served on restart and
-   ``_fresh_workdir`` raises ``workdir already exists`` forever.
-3. A raising ``solve`` (or a git failure) escapes ``run_once``; nothing is reported and the
-   lease expires server-side.
-4. An HTTP error surfaces as a bare status code; the gateway's structured error body
-   (``{"error": {"type": ..., "message": ...}}``, docs/protocol.md) is never shown.
-"""
+"""Synthetic restart, cadence, solver-failure, and structured-error regressions."""
 from __future__ import annotations
 
 import sys
