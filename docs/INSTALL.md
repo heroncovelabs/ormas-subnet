@@ -362,6 +362,10 @@ If the process died before the artifact was saved, its provider outcome is unkno
 The miner reports an aborted result without another solver call or an invented
 settlement receipt. Corrupt or unsafe recovery evidence refuses new work for
 inspection. Retain the journal and checkout; deleting them loses recovery evidence.
+Journal version 1 artifact/completion records predate immutable-path enforcement and
+are held for operator reconciliation after upgrade; drain retained work before the
+upgrade where possible. Version 1 claimed records can still close as interrupted,
+without publishing a result.
 The service manager must restart a stopped miner process: the SDK recovers work
 when launched, but does not itself supervise or reboot the host.
 

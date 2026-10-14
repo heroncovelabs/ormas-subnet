@@ -108,7 +108,9 @@ def _publish(
         return subprocess.check_output(["git", *args], cwd=cwd)
 
     monkeypatch.setattr("ormas_subnet.skeleton._public_git", local_public_git)
-    return miner._publish_public(lease, draft, repo, result)
+    return miner._publish_public(
+        lease, draft, repo, result, capture={"scope_ok": True},
+    )
 
 
 def _commit_with_parents(repo: Path, tree: str, *parents: str) -> str:
@@ -214,7 +216,11 @@ def test_public_artifact_enforces_frozen_changed_file_cap(tmp_path, monkeypatch)
     _git(repo, "commit", "--quiet", "-m", "two files")
     result = _git(repo, "rev-parse", "HEAD")
     packet = {
-        "execution_policy": {"repo_base_sha": base},
+        "execution_policy": {
+            "repo_base_sha": base,
+            "allowed_paths": ["one.txt", "two.txt"],
+            "immutable_paths": [],
+        },
         "execution_requirements": {
             "publication": {"max_changed_files": 1},
             "limits": {"max_bytes": 1024},
