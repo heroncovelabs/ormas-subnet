@@ -35,7 +35,14 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from httpx import HTTPError
 
 from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
-from .client import OrmasGatewayError, OrmasMinerClient, _positive_usd, _validate_window_offer
+from ._workdir import contained_workdir
+from .client import (
+    OrmasGatewayError,
+    OrmasMinerClient,
+    _ClaimIdentityError,
+    _positive_usd,
+    _validate_window_offer,
+)
 from ._recovery import PublicRecovery, RecoveryRequired
 from .verification_context import verification_call
 from .protocol import (
@@ -46,6 +53,7 @@ from .protocol import (
     TaskLease,
     TaskReceipt,
     TaskTerminal,
+    require_task_id,
 )
 
 __all__ = [
@@ -68,10 +76,6 @@ _RESULT_REF_LOCAL = "local:ormas/job/"
 DEFAULT_POLL_INTERVAL_S = 15
 DEFAULT_LEASE_TTL_S = 300
 DEFAULT_HEARTBEAT_S = 90
-
-# Bound on the exception text carried in a failure capture's ``error`` field —
-# enough to diagnose, short enough to stay a sane evidence payload.
-_FAILURE_MESSAGE_MAX = 500
 
 # `TaskReceipt.model` is optional. Omit it when the solver did not name one.
 # Do not send a synthetic stand-in such as "unknown": a third-party receipt
@@ -691,7 +695,9 @@ class MinerSkeleton:
         same lease is re-served on restart — the leftover must be removed,
         not treated as fatal, or every restart wedges on it.
         """
-        workdir = self.config.workdir_root / task_id
+        workdir = contained_workdir(
+            self.config.workdir_root, task_id, field_name="task_id"
+        )
         if workdir.exists():
             shutil.rmtree(workdir)
         workdir.parent.mkdir(parents=True, exist_ok=True)
@@ -976,7 +982,10 @@ class MinerSkeleton:
 
     def _claim_task(self) -> tuple[TaskLease, TaskDraft] | None:
         if self.config.offer_window:
-            return self._claim_offer_window()
+            try:
+                return self._claim_offer_window()
+            except _ClaimIdentityError as exc:
+                raise RecoveryRequired("lease award task identity mismatch") from exc
         offer_fn = self.config.offer_fn
         if offer_fn is not None and not self._queue_unsupported:
             try:
@@ -1213,13 +1222,23 @@ class MinerSkeleton:
         if claimed is None:
             return False
         lease, draft = claimed
+        lease_task_id = require_task_id(lease.task_id)
+        draft_task_id = require_task_id(draft.task_id)
+        if lease_task_id != draft_task_id:
+            raise ValueError("claim task identity mismatch")
         start = time.monotonic()
         try:
             if _public_packet(draft) is not None:
                 if store is None:
                     raise RecoveryRequired('public recovery requires gateway identity')
                 store.begin(lease, draft)
-                if (self.config.workdir_root / draft.task_id).exists():
+                try:
+                    checkout = contained_workdir(
+                        self.config.workdir_root, draft.task_id, field_name="task_id"
+                    )
+                except ValueError:
+                    raise RecoveryRequired("public checkout path is unsafe") from None
+                if checkout.exists():
                     raise RecoveryRequired('public checkout has no matching recovery record')
             self._run_leased_task(lease, draft, start)
         except RecoveryRequired:
@@ -1237,10 +1256,16 @@ class MinerSkeleton:
     def _recover_public(self, pending) -> bool:
         """Resolve retained public work before any claim or solver invocation."""
         self.cancelled.clear()
-        lease = (TaskLease.from_wire(pending['lease']) if 'lease' in pending else
-                 SimpleNamespace(lease_id=pending['lease_id'], task_id=pending['task_id']))
-        draft = SimpleNamespace(task_id=pending['task_id'], base_commit=pending['base_commit'],
-                                repo_url=pending['repo_url'])
+        try:
+            task_id = require_task_id(pending['task_id'])
+            lease = (TaskLease.from_wire(pending['lease']) if 'lease' in pending else
+                     SimpleNamespace(lease_id=pending['lease_id'], task_id=task_id))
+            if lease.task_id != task_id:
+                raise ValueError("lease task identity mismatch")
+            draft = SimpleNamespace(task_id=task_id, base_commit=pending['base_commit'],
+                                    repo_url=pending['repo_url'])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise RecoveryRequired('public recovery identity mismatch') from None
         start = time.monotonic()
         last_run = {'task_id': draft.task_id, 'renewals': 0, 'lease_lost': False,
                     'completion_attempts': 0, 'completion_error': None,
@@ -1251,12 +1276,19 @@ class MinerSkeleton:
             # Its provider outcome is unknown, so do not call the solver again.
             self._report_lease_failure(lease, draft, RecoveryRequired('public execution interrupted'), start)
             return self._public_recovery.pending() is None
-        if pending.get('version') != 2:
+        if pending.get('version') != 2 and not (
+            pending.get('version') == 1 and pending['stage'] == 'completion'
+        ):
             raise RecoveryRequired(
                 'legacy public recovery lacks frozen publication scope authorization'
             )
         if pending['stage'] == 'artifact':
-            workdir = self.config.workdir_root / draft.task_id
+            try:
+                workdir = contained_workdir(
+                    self.config.workdir_root, draft.task_id, field_name="task_id"
+                )
+            except ValueError:
+                raise RecoveryRequired('public recovery checkout is missing or unsafe') from None
             if workdir.is_symlink() or not workdir.is_dir():
                 raise RecoveryRequired('public recovery checkout is missing or unsafe')
             try:
@@ -1274,7 +1306,7 @@ class MinerSkeleton:
             capture = pending['capture']
             self._freeze_public_completion(lease, result_ref, result, capture)
             pending = self._public_recovery.pending()
-        kwargs = pending['completion']
+        kwargs = self._public_recovery.completion_for_wire(pending)
         response = self._complete_with_retry(
             draft.task_id, lease, start, receipt=TaskReceipt.from_wire(kwargs['receipt']),
             terminal=TaskTerminal.from_wire(kwargs['terminal']), capture=kwargs['capture'],
@@ -1570,9 +1602,9 @@ class MinerSkeleton:
         says ``verification_state='failed'`` / ``settlement_state='unset'``
         with no result ref. A public crash leaves ``result_commit`` empty; a
         private crash points it at the base commit. The capture carries a
-        ``failure_class`` plus the (truncated) exception message. The default
-        receipt reports unknown usage rather than fabricated zeros. A caller
-        that already knows no provider ran (a public base that exits 0) passes
+        typed ``failure_class``; local exception text never crosses the wire.
+        The default receipt reports unknown usage rather than fabricated zeros.
+        A caller that already knows no provider ran (a public base that exits 0) passes
         ``failure_class``, ``verification_state='failed'``, and
         ``known_cost_usd=0.0`` so this same completion carries a known zero
         cost instead of the public abort class. Reporting itself is
@@ -1582,9 +1614,10 @@ class MinerSkeleton:
         """
         public = self._public_recovery is not None and self._public_recovery.pending() is not None
         if failure_class is None:
-            failure_class = "git_error" if isinstance(exc, GitError) else "solve_error"
-            if public:
-                failure_class = 'public_execution_interrupted'
+            local_failure_class = "git_error" if isinstance(exc, GitError) else "solve_error"
+            failure_class = 'public_execution_interrupted' if public else 'failed'
+        else:
+            local_failure_class = failure_class
         if verification_state is None:
             verification_state = "aborted" if public else "failed"
         terminal = TaskTerminal(
@@ -1617,11 +1650,18 @@ class MinerSkeleton:
             "changed_paths": [],
             "wall_s": time.monotonic() - start,
             "failure_class": failure_class,
-            "error": str(exc)[:_FAILURE_MESSAGE_MAX],
+        }
+        local_failure = {
+            'task_id': draft.task_id,
+            'failure_class': local_failure_class,
+            'exception_type': type(exc).__name__,
         }
         if public:
             self._public_recovery.freeze(receipt=receipt, terminal=terminal, capture=capture)
-            self.last_run = {'task_id': draft.task_id}
+        if self.last_run is None or self.last_run.get('task_id') != draft.task_id:
+            self.last_run = local_failure
+        else:
+            self.last_run.update(local_failure)
         try:
             response = self.client.complete_task(
                 draft.task_id,

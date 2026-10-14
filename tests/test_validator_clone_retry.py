@@ -33,32 +33,23 @@ def assignment():
         result_commit="b" * 40, repo_url="https://github.com/example/public.git",
         verify_command="true", allowed_paths=["out.txt"], immutable_paths=[],
     )
-    return {"assignment_id": "assignment-1", **fields,
+    return {"assignment_id": "assignment-1", "validator_id": "val_test",
+            "decision_protocol_version": "ormas-validator-decision-v2",
+            "decision_nonce": "a" * 64,
+            "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
+            "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
             "evidence_digest_sha256": module.evidence_digest_hex(fields)}
 
 
-def _review(tmp_path, assignment, entry):
-    if entry == "child":
-        return module.review_assignment(str(tmp_path), assignment)
-
-    class Client:
-        decisions = []
-
-        def list_assignments(self):
-            return [assignment]
-
-        def post_decision(self, assignment_id, **kwargs):
-            self.decisions.append((assignment_id, kwargs))
-
-    client = Client()
-    daemon = module.ValidatorDaemon(client, module.ValidatorConfig(tmp_path), lambda digest: digest)
-    assert daemon.run_once()
-    assert len(client.decisions) == 1
-    return client.decisions[0][1]["decision"]
+def _review(tmp_path, assignment):
+    daemon = module.ValidatorDaemon(None, module.ValidatorConfig(tmp_path), lambda digest: digest)
+    workdir = daemon._clone_with_retry(assignment)
+    if workdir is None:
+        return "error"
+    return daemon._decide(assignment, workdir)
 
 
-@pytest.mark.parametrize("entry", ["child", "inline"])
-def test_clone_fails_once_then_review_proceeds(tmp_path, monkeypatch, caplog, clock, assignment, entry):
+def test_clone_fails_once_then_review_proceeds(tmp_path, monkeypatch, caplog, clock, assignment):
     attempts = []
     reviewed = []
 
@@ -75,7 +66,7 @@ def test_clone_fails_once_then_review_proceeds(tmp_path, monkeypatch, caplog, cl
     monkeypatch.setattr(module.ValidatorDaemon, "_clone", clone)
     monkeypatch.setattr(module.ValidatorDaemon, "_decide", decide)
     with caplog.at_level(logging.WARNING):
-        assert _review(tmp_path, assignment, entry) == "accept"
+        assert _review(tmp_path, assignment) == "accept"
     assert len(attempts) == 2
     assert reviewed == [(assignment, tmp_path)]
     assert clock[1] == [1.0]
@@ -83,8 +74,7 @@ def test_clone_fails_once_then_review_proceeds(tmp_path, monkeypatch, caplog, cl
     assert "GitError" in caplog.text and "fatal: remote disconnected" in caplog.text
 
 
-@pytest.mark.parametrize("entry", ["child", "inline"])
-def test_persistent_clone_failure_stops_at_bound(tmp_path, monkeypatch, caplog, clock, assignment, entry):
+def test_persistent_clone_failure_stops_at_bound(tmp_path, monkeypatch, caplog, clock, assignment):
     attempts = []
 
     def clone(self, row):
@@ -94,7 +84,7 @@ def test_persistent_clone_failure_stops_at_bound(tmp_path, monkeypatch, caplog, 
     monkeypatch.setattr(module.ValidatorDaemon, "_clone", clone)
     monkeypatch.setattr(module.ValidatorDaemon, "_decide", lambda *_: pytest.fail("failed clone reviewed"))
     with caplog.at_level(logging.WARNING):
-        assert _review(tmp_path, assignment, entry) == "error"
+        assert _review(tmp_path, assignment) == "error"
     assert len(attempts) == DEFAULT_POLL_INTERVAL_S
     assert clock[1] == [1.0] * (DEFAULT_POLL_INTERVAL_S - 1)
     assert len(caplog.records) == len(attempts)
@@ -115,7 +105,7 @@ def test_assignment_timeout_bounds_retry_window(
 
     monkeypatch.setattr(module.ValidatorDaemon, "_clone", clone)
     with caplog.at_level(logging.WARNING):
-        assert _review(tmp_path, assignment, "child") == "error"
+        assert _review(tmp_path, assignment) == "error"
     bound = min(timeout_s, DEFAULT_POLL_INTERVAL_S)
     assert len(attempts) == bound
     assert clock[1] == [1.0] * (bound - 1)
@@ -132,7 +122,7 @@ def test_slow_failed_clone_consumes_retry_budget(tmp_path, monkeypatch, caplog, 
 
     monkeypatch.setattr(module.ValidatorDaemon, "_clone", clone)
     with caplog.at_level(logging.WARNING):
-        assert _review(tmp_path, assignment, "child") == "error"
+        assert _review(tmp_path, assignment) == "error"
     assert len(attempts) == 1
     assert clock[1] == []
     assert len(caplog.records) == 1
@@ -156,7 +146,7 @@ def test_clone_warning_preserves_underlying_stderr(tmp_path, monkeypatch, caplog
 
         monkeypatch.setattr(module, "_run_git", git)
     with caplog.at_level(logging.WARNING):
-        assert _review(tmp_path, assignment, "child") == "error"
+        assert _review(tmp_path, assignment) == "error"
     assert len(caplog.records) == DEFAULT_POLL_INTERVAL_S
     assert all(stderr in record.getMessage() for record in caplog.records)
     assert ("CalledProcessError" if public else "GitError") in caplog.text
@@ -200,6 +190,6 @@ def test_clone_warning_redacts_repository_credential(tmp_path, monkeypatch, capl
 
     monkeypatch.setattr(module.ValidatorDaemon, "_clone", clone)
     with caplog.at_level(logging.WARNING):
-        assert _review(tmp_path, assignment, "child") == "error"
+        assert _review(tmp_path, assignment) == "error"
     assert "test-secret-token" not in caplog.text
     assert "fatal:" in caplog.text

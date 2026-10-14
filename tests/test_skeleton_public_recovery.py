@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from ormas_subnet.client import OrmasGatewayError
-from ormas_subnet.protocol import TaskLease
+from ormas_subnet.protocol import TaskLease, TaskReceipt, TaskTerminal
 from ormas_subnet.skeleton import MinerConfig, MinerSkeleton, SolveResult
 
 
@@ -173,6 +173,54 @@ _DONE = {
 _OUTCOME_UNKNOWN = {"status": "outcome_unknown"}
 
 
+def _freeze_legacy_failure(
+    root: Path, client, lease, draft, *, extra_capture=None, record_version=None,
+):
+    """Write the exact pre-fix failure journal shape, including local exception text."""
+    from ormas_subnet._recovery import PublicRecovery
+
+    store = PublicRecovery(root, client.base_url, "miner-public")
+    body = store.begin(lease, draft)
+    body.pop("completion_capture_version", None)
+    if record_version is not None:
+        body["version"] = record_version
+    store.save(body)
+    receipt = TaskReceipt(
+        lease_id=lease.lease_id,
+        generation_ids=(),
+        actual_provider="unknown",
+        model=None,
+        prompt_tokens=0,
+        completion_tokens=0,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+        reasoning_tokens=0,
+        upstream_cost_usd=None,
+        finish_reason=None,
+        metering_complete=False,
+    )
+    terminal = TaskTerminal(
+        lease_id=lease.lease_id,
+        verification_state="aborted",
+        result_ref=None,
+        settlement_state="unset",
+        rating=None,
+        result_commit="",
+    )
+    capture = {
+        "status": "failed",
+        "scope_ok": False,
+        "file_count": 0,
+        "changed_paths": [],
+        "wall_s": 1.0,
+        "failure_class": "public_execution_interrupted",
+        "error": "SECRET_EXCEPTION_CANARY",
+    }
+    capture.update(extra_capture or {})
+    store.freeze(receipt=receipt, terminal=terminal, capture=capture)
+    return store, store.path.read_bytes()
+
+
 @pytest.mark.parametrize("limit_offer", [False, True])
 def test_restart_replays_ambiguous_public_completion_without_another_solve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_offer: bool,
@@ -303,6 +351,187 @@ def test_restart_reports_interrupted_pre_artifact_work_without_solving_again(
     assert terminal["result_ref"] is None
     assert terminal["result_commit"] == ""
     assert client.completions[0]["receipt"]["metering_complete"] is False
+
+
+def test_fresh_public_failure_never_sends_exception_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, draft = _lease_and_draft()
+    client = _RecoveryClient(lease, draft, [_OUTCOME_UNKNOWN])
+
+    def fail_with_secret(_draft, _workdir):
+        raise RuntimeError("SECRET_EXCEPTION_CANARY")
+
+    _patch_public_loop(monkeypatch, client)
+    assert MinerSkeleton(client, _config(tmp_path / "work"), fail_with_secret).run_once() is True
+
+    assert len(client.completions) == 1
+    capture = client.completions[0]["capture"]
+    assert "error" not in capture
+    assert "SECRET_EXCEPTION_CANARY" not in repr(client.completions[0])
+    assert capture["failure_class"] == "public_execution_interrupted"
+    assert client.completions[0]["terminal"]["verification_state"] == "aborted"
+
+
+def test_private_solver_failure_uses_valid_wire_class_and_keeps_local_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, draft = _lease_and_draft()
+    draft.work_packet = {}
+    client = _RecoveryClient(lease, draft, [{
+        "status": "failed",
+        "receipt": {"receipt_id": "receipt-private", "settlement": "no_delivery"},
+    }])
+
+    def clone(_self, current_draft):
+        workdir = _self.config.workdir_root / current_draft.task_id
+        workdir.mkdir(parents=True, exist_ok=True)
+        return workdir
+
+    def fail_with_secret(_draft, _workdir):
+        raise RuntimeError("SECRET_PRIVATE_EXCEPTION_CANARY")
+
+    monkeypatch.setattr("ormas_subnet.skeleton._public_packet", lambda _draft: None)
+    monkeypatch.setattr(MinerSkeleton, "_clone_and_checkout", clone)
+    skeleton = MinerSkeleton(client, _config(tmp_path / "work"), fail_with_secret)
+    assert skeleton.run_once() is True
+
+    assert len(client.completions) == 1
+    capture = client.completions[0]["capture"]
+    assert capture["failure_class"] == "failed"
+    assert "error" not in capture
+    assert "SECRET_PRIVATE_EXCEPTION_CANARY" not in repr(client.completions[0])
+    assert skeleton.last_run["failure_class"] == "solve_error"
+    assert skeleton.last_run["exception_type"] == "RuntimeError"
+
+
+def test_legacy_failure_replay_is_sanitized_without_rewriting_frozen_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost acknowledgement replays one derived body from unchanged journal bytes."""
+    lease, draft = _lease_and_draft()
+    client = _RecoveryClient(
+        lease,
+        draft,
+        [KeyboardInterrupt("synthetic lost acknowledgement"), _OUTCOME_UNKNOWN],
+    )
+    root = tmp_path / "work"
+    store, original = _freeze_legacy_failure(root, client, lease, draft)
+    _patch_public_loop(monkeypatch, client)
+
+    def no_resolve(_draft, _workdir):
+        pytest.fail("legacy completion recovery must not invoke the solver")
+
+    with pytest.raises(KeyboardInterrupt, match="lost acknowledgement"):
+        MinerSkeleton(client, _config(root), no_resolve).run_once()
+    assert store.path.read_bytes() == original
+    assert len(client.completions) == 1
+    assert "error" not in client.completions[0]["capture"]
+    assert "SECRET_EXCEPTION_CANARY" not in repr(client.completions[0])
+
+    assert MinerSkeleton(client, _config(root), no_resolve).run_once() is True
+    assert len(client.completions) == 2
+    assert client.completions[1] == client.completions[0]
+    assert client.claims == 0
+    assert store.path.exists() is False
+    history = list(store.root.glob("*.json"))
+    assert len(history) == 1
+    assert history[0].read_bytes() == original
+
+
+def test_legacy_failure_replay_tombstones_a_revoked_lease_without_rewriting_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, draft = _lease_and_draft()
+    lease_lost = OrmasGatewayError(
+        status_code=409,
+        error_type="lease_lost",
+        message="synthetic expired or revoked lease",
+    )
+    client = _RecoveryClient(lease, draft, [lease_lost])
+    root = tmp_path / "work"
+    store, original = _freeze_legacy_failure(root, client, lease, draft)
+    _patch_public_loop(monkeypatch, client)
+
+    def no_resolve(_draft, _workdir):
+        pytest.fail("a revoked retained completion must not invoke the solver")
+
+    assert MinerSkeleton(client, _config(root), no_resolve).run_once() is True
+    assert len(client.completions) == 1
+    assert "error" not in client.completions[0]["capture"]
+    assert client.claims == 0
+    assert store.path.exists() is False
+    history = list(store.root.glob("*.json"))
+    assert len(history) == 1
+    assert history[0].read_bytes() == original
+
+
+def test_version_one_legacy_failure_replays_but_other_completion_stays_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, draft = _lease_and_draft()
+    client = _RecoveryClient(lease, draft, [_OUTCOME_UNKNOWN])
+    root = tmp_path / "work"
+    store, original = _freeze_legacy_failure(
+        root, client, lease, draft, record_version=1,
+    )
+    _patch_public_loop(monkeypatch, client)
+
+    assert MinerSkeleton(client, _config(root), lambda *_args: None).run_once() is True
+    assert len(client.completions) == 1
+    assert "error" not in client.completions[0]["capture"]
+    history = list(store.root.glob("*.json"))
+    assert len(history) == 1
+    assert history[0].read_bytes() == original
+
+    other_client = _RecoveryClient(lease, draft, [_OUTCOME_UNKNOWN])
+    other_root = tmp_path / "other-work"
+    other_store, _ = _freeze_legacy_failure(
+        other_root, other_client, lease, draft, record_version=1,
+    )
+    body = other_store.pending()
+    del body["completion"]["capture"]["error"]
+    other_store.save(body)
+    other_original = other_store.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="legacy|scope|recover"):
+        MinerSkeleton(other_client, _config(other_root), lambda *_args: None).run_once()
+    assert other_client.completions == []
+    assert other_store.path.read_bytes() == other_original
+
+
+def test_legacy_failure_projection_refuses_noncanonical_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, draft = _lease_and_draft()
+    client = _RecoveryClient(lease, draft, [_OUTCOME_UNKNOWN])
+    root = tmp_path / "work"
+    store, original = _freeze_legacy_failure(
+        root, client, lease, draft, extra_capture={"mystery": "value"},
+    )
+    _patch_public_loop(monkeypatch, client)
+
+    with pytest.raises(RuntimeError, match="legacy|capture|recover"):
+        MinerSkeleton(client, _config(root), lambda *_args: None).run_once()
+
+    assert client.completions == []
+    assert client.claims == 0
+    assert store.path.read_bytes() == original
+
+
+def test_versioned_failure_capture_never_projects_local_diagnostics(tmp_path: Path) -> None:
+    lease, draft = _lease_and_draft()
+    client = _RecoveryClient(lease, draft, [_OUTCOME_UNKNOWN])
+    store, _original = _freeze_legacy_failure(tmp_path / "work", client, lease, draft)
+    body = store.pending()
+    body["completion_capture_version"] = 2
+    store.save(body)
+    versioned = store.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="diagnostic|capture|recover"):
+        store.completion_for_wire()
+
+    assert store.path.read_bytes() == versioned
 
 
 def test_settling_completion_stays_pending_and_replays_exactly_after_restart(

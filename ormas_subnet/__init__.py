@@ -18,12 +18,16 @@ from .protocol import (
 )
 from .skeleton import MinerConfig, MinerSkeleton, SolveFn, SolveResult
 from .validator import (
+    SUPPORTED_VALIDATOR_DECISION_PROTOCOLS,
+    VALIDATOR_DECISION_PROTOCOL_V1,
+    VALIDATOR_DECISION_PROTOCOL_V2,
     VALIDATOR_PROTOCOL_V1,
     OrmasValidatorClient,
     SignFn,
     ValidatorConfig,
     ValidatorDaemon,
     canonical_evidence_fields,
+    decision_signature_message,
     evidence_digest_hex,
     make_ed25519_signer,
 )
@@ -50,11 +54,15 @@ __all__ = [
     "SolveFn",
     "SolveResult",
     "VALIDATOR_PROTOCOL_V1",
+    "VALIDATOR_DECISION_PROTOCOL_V1",
+    "VALIDATOR_DECISION_PROTOCOL_V2",
+    "SUPPORTED_VALIDATOR_DECISION_PROTOCOLS",
     "OrmasValidatorClient",
     "SignFn",
     "ValidatorConfig",
     "ValidatorDaemon",
     "canonical_evidence_fields",
+    "decision_signature_message",
     "evidence_digest_hex",
     "make_ed25519_signer",
 ]

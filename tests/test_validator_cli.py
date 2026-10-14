@@ -92,8 +92,12 @@ def test_validator_cli_registers_and_polls_with_private_file_credentials(tmp_pat
     assert all(call[1] == f"Bearer {token}" for call in calls)
     assert len(calls[0][2]["pubkey_hex"]) == 64
     from ormas_subnet.public_acceptance import SUPPORTED_ACCEPTANCE_CONTRACTS
+    from ormas_subnet.validator import SUPPORTED_VALIDATOR_DECISION_PROTOCOLS
 
     assert calls[0][2].get("acceptance_contracts") == list(SUPPORTED_ACCEPTANCE_CONTRACTS)
+    assert calls[0][2].get("decision_protocol_versions") == list(
+        SUPPORTED_VALIDATOR_DECISION_PROTOCOLS
+    )
     assert key_hex not in json.dumps(calls), "private key was sent to the gateway"
 
 
@@ -121,8 +125,8 @@ def test_validator_cli_refuses_exposed_credentials_before_network(tmp_path, monk
         ])
 
 
-@pytest.mark.parametrize("bad", ["0", "-1", "nope", "1.5"])
-def test_validator_cli_rejects_non_positive_or_non_integer_slots(tmp_path, bad, capsys):
+@pytest.mark.parametrize("bad", ["0", "-1", "nope", "1.5", "2", "01", "+1"])
+def test_validator_cli_rejects_any_slot_count_other_than_exactly_one(tmp_path, bad, capsys):
     from ormas_subnet.validator import main
 
     token = tmp_path / "token"
@@ -143,10 +147,10 @@ def test_validator_cli_rejects_non_positive_or_non_integer_slots(tmp_path, bad, 
     assert exc.value.code != 0
     assert "unrecognized arguments" not in err
     assert "--slots" in err
-    assert "positive integer" in err
+    assert "exactly 1" in err
 
 
-def test_once_reviews_a_single_assignment_regardless_of_slots(tmp_path, monkeypatch):
+def test_once_reviews_a_single_assignment_with_explicit_single_slot(tmp_path, monkeypatch):
     from ormas_subnet import validator
 
     posted = []
@@ -160,9 +164,12 @@ def test_once_reviews_a_single_assignment_regardless_of_slots(tmp_path, monkeypa
 
         def list_assignments(self):
             return [
-                {"assignment_id": "asgn_1", "evidence_digest_sha256": "0" * 64},
-                {"assignment_id": "asgn_2", "evidence_digest_sha256": "0" * 64},
-                {"assignment_id": "asgn_3", "evidence_digest_sha256": "0" * 64},
+                {"assignment_id": "asgn_1", "decision_protocol_version":
+                 "ormas-validator-decision-v1", "evidence_digest_sha256": "0" * 64},
+                {"assignment_id": "asgn_2", "decision_protocol_version":
+                 "ormas-validator-decision-v1", "evidence_digest_sha256": "0" * 64},
+                {"assignment_id": "asgn_3", "decision_protocol_version":
+                 "ormas-validator-decision-v1", "evidence_digest_sha256": "0" * 64},
             ]
 
         def post_decision(self, assignment_id, *, decision, signature_hex):
@@ -182,7 +189,7 @@ def test_once_reviews_a_single_assignment_regardless_of_slots(tmp_path, monkeypa
             "--token-env", "VALIDATOR_TOKEN_TEST",
             "--private-key-env", "VALIDATOR_KEY_TEST",
             "--workdir-root", str(tmp_path / "work"),
-            "--slots", "4",
+            "--slots", "1",
             "--once",
         ])
     except SystemExit as exc:
