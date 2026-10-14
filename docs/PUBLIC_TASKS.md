@@ -179,8 +179,13 @@ and validator operator. Completion remains pending until the frozen acceptance
 policy is satisfied. The gateway is the receipt and settlement authority.
 
 New languages, interfaces and environments expand through versioned qualifications.
-An in-flight task normally keeps its frozen catalog and checker policy. A verifier
-compiler security revocation overrides execution compatibility: inventory and drain
+An in-flight task normally keeps its frozen catalog and checker policy. The miner
+also accepts the deployed `2026-10-14.4` catalog (`sha256:ff7c1e51…`) with compiler
+`214eadfb…` as an explicit draining pair. That older embedded verifier predates
+trusted-tool hardening; the allowance is not compiler-wide. The public `.4`
+(`sha256:398f6c9f…`, compiler `2ba99054…`) remains the default, and revoked acceptance
+drivers and other revoked compilers (including `6208cd15…`) remain refused.
+A verifier compiler security revocation overrides execution compatibility: inventory and drain
 or expire affected queued, leased and recovery-pending packets, recompile the frozen
 inputs with an active compiler, and requeue under a new agreement. Keep the original
 packet as audit evidence rather than accepting or rewriting it in place. Other check
