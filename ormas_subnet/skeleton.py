@@ -1097,11 +1097,12 @@ class MinerSkeleton:
                 intent_terms = self._normalized_offer_terms(intent)
             except (ValueError, TypeError, KeyError, OverflowError):
                 self._pending_offer_refusal()
-        terminal = {
-            "not_awarded", "withdrawn", "replaced", "no_capacity",
-            "acceptance_capacity", "award_lapsed",
-        }
-        prior_bid = (isinstance(bid, Mapping) and bid.get("status") in terminal
+        # The lookup returns the latest own bid.  A locally known identity or
+        # different immutable terms therefore proves that it predates this
+        # pending intent, regardless of the bid's current status.  It is safe
+        # to clear the intent only once the gateway authoritatively closes the
+        # window; until then the POST may still be in flight or unobserved.
+        prior_bid = (isinstance(bid, Mapping)
                      and (remote_terms != intent_terms
                           or bid.get("bid_id") in state["bids"]))
         if bid is None or prior_bid:

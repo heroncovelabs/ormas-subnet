@@ -400,9 +400,11 @@ job. The response is `{"job_id": str, "window_closed": bool, "bid": object|null}
 an included bid carries its immutable `terms`, status and bid identity. This is
 a read only lookup: it does not evaluate a window, update liveness or award work.
 The reference miner validates the response against its saved intent and never
-replays the ambiguous POST. A missing bid is conclusive only after
-`window_closed` becomes true; otherwise the miner remains fail closed and tries
-the read again on a later poll.
+replays the ambiguous POST. A missing bid, a locally known bid identity, or a
+bid with different immutable terms is conclusive only after `window_closed`
+becomes true; otherwise the miner remains fail closed and tries the read again
+on a later poll. A known prior award keeps its original frozen terms and can
+still be claimed after the pending replacement is resolved.
 
 ### `GET /api/runner/v1/offers/{bid_id}`
 
