@@ -36,6 +36,14 @@ from .verifier_runtime import (
 
 PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
 
+# Historical catalogs remain available for interpreting frozen evidence, but a
+# compiler that lost execution approval must never become executable merely by
+# selecting its old catalog digest.  Updating this allowlist requires review of
+# the exact embedded verifier source and coordinated gateway/SDK rollout.
+_ACTIVE_VERIFIER_COMPILERS = frozenset({
+    'c5d5f29905234ae9b9d08c15d133e3d6ba5e0c9623ed2f67134bc5b074ff0d2e',
+})
+
 
 def digest(value):
     return 'sha256:' + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
@@ -58,6 +66,13 @@ def load_support_catalog(catalog_digest=None):
 
 def _runtime_source():
     return Path(__file__).with_name('verifier_runtime.py').read_text()
+
+
+def _active_compiler(catalog):
+    compiler = catalog.get('verifier_compiler_sha256') if isinstance(catalog, dict) else None
+    if compiler not in _ACTIVE_VERIFIER_COMPILERS:
+        raise ValueError('verifier_compiler_revoked')
+    return compiler
 
 
 def _profile(profile_id, catalog_digest=None):
@@ -155,7 +170,8 @@ def _service(value):
 
 def effective_command(config):
     source = _runtime_source()
-    if hashlib.sha256(source.encode()).hexdigest() != load_support_catalog().get('verifier_compiler_sha256'):
+    compiler = _active_compiler(load_support_catalog())
+    if hashlib.sha256(source.encode()).hexdigest() != compiler:
         raise ValueError('compiler_catalog_stale')
     encoded = base64.b64encode(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).decode()
     return shlex.join(['python3', '-I', '-S', '-c', source, encoded])
@@ -314,6 +330,7 @@ def validate_public_execution_packet(packet):
     catalog, profile = _profile(environment['profile'].get('profile_id'), environment['catalog_digest'])
     if environment['catalog_digest'] != digest(catalog) or environment['profile'] != profile:
         raise ValueError('execution_catalog_changed')
+    compiler = _active_compiler(catalog)
     if 'repository_access' in environment:
         _private_repository_access(environment['repository_access'], catalog)
     if 'repository_gitlinks' in environment:
@@ -346,7 +363,7 @@ def validate_public_execution_packet(packet):
     arguments = shlex.split(expected_command)
     encoded = base64.b64encode(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).decode()
     if (len(arguments) != 6 or arguments[:4] != ['python3', '-I', '-S', '-c']
-            or hashlib.sha256(arguments[4].encode()).hexdigest() != catalog.get('verifier_compiler_sha256')
+            or hashlib.sha256(arguments[4].encode()).hexdigest() != compiler
             or arguments[5] != encoded or shlex.join(arguments) != expected_command):
         raise ValueError('verifier_compiler_mismatch')
     sha = hashlib.sha256(expected_command.encode()).hexdigest()

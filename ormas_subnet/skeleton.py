@@ -386,6 +386,7 @@ def _split_verify_command(verify_command: str) -> tuple[list[str], dict[str, str
 def _run_verify_command(
     verify_command: str, *, cwd: Path, path_prefix: str | None = None,
     evidence_identity=None, raise_setup_errors: bool = False,
+    trusted_public_python: bool = False,
 ) -> int:
     """Run ``verify_command`` in ``cwd`` under a bounded, credential-free env.
 
@@ -397,6 +398,9 @@ def _run_verify_command(
     fails closed (1 / 127) rather than raising past the caller.
     When ``path_prefix`` is set, it is prepended to the child's ``PATH`` and
     ``VIRTUAL_ENV`` is set to that prefix's parent directory.
+    Validated public verifier commands set ``trusted_public_python`` so their
+    leading ``python3`` is replaced with an operator-vetted absolute system
+    interpreter and the inherited ``PATH`` cannot choose the verifier process.
     Validators set ``raise_setup_errors`` to distinguish a command that never
     launched from a real verifier that returned the same numeric exit code.
     """
@@ -406,9 +410,28 @@ def _run_verify_command(
         if raise_setup_errors:
             raise ValueError("invalid_verifier_command") from exc
         return 1
+    trusted_python: Path | None = None
+    if trusted_public_python:
+        # This mode is used only after the generated public execution contract
+        # has been reconstructed and validated.  Keep that boundary explicit:
+        # leading environment assignments and legacy toolchain prefixes belong
+        # to the legacy verifier path, never to the embedded public verifier.
+        if path_prefix is not None or env_overrides or argv[0] != "python3":
+            if raise_setup_errors:
+                raise ValueError("invalid_public_verifier_command")
+            return 1
+        try:
+            trusted_python = trusted_executable("python3")
+        except TrustedExecutableUnavailable as exc:
+            if raise_setup_errors:
+                raise ValueError("trusted_verifier_python_unavailable") from exc
+            return 127
+        argv[0] = str(trusted_python)
     with tempfile.TemporaryDirectory(prefix="ormas-verify-home-") as scratch_home:
         env: dict[str, str] = {}
-        if path_prefix is not None:
+        if trusted_python is not None:
+            env["PATH"] = str(trusted_python.parent)
+        elif path_prefix is not None:
             env["PATH"] = path_prefix + os.pathsep + os.environ.get("PATH", "")
             env["VIRTUAL_ENV"] = os.path.dirname(path_prefix)
         else:
@@ -1309,7 +1332,9 @@ class MinerSkeleton:
         try:
             packet = _public_packet(draft)
             if packet is not None:
-                base_exit = _run_verify_command(draft.verify_command, cwd=workdir)
+                base_exit = _run_verify_command(
+                    draft.verify_command, cwd=workdir, trusted_public_python=True,
+                )
                 if base_exit == 0:
                     # A passing base is not an interrupted run. Complete it
                     # before solve_fn; the gateway rejects the generic abort.
@@ -1352,7 +1377,11 @@ class MinerSkeleton:
                 ),
             )
 
-            verify_exit_code = _run_verify_command(draft.verify_command, cwd=workdir)
+            verify_exit_code = _run_verify_command(
+                draft.verify_command,
+                cwd=workdir,
+                trusted_public_python=packet is not None,
+            )
             wall_s = time.monotonic() - start
 
             material_sha = self._material_diff_sha256(workdir, draft.base_commit, result.result_commit)

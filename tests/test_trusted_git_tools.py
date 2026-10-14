@@ -97,6 +97,58 @@ def test_public_git_ignores_writable_inherited_path(
     assert not marker.exists()
 
 
+def test_generated_public_verifier_ignores_writable_inherited_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PATH fake cannot forge the public base/result exit sequence."""
+    marker = tmp_path / "fake-python-ran"
+    state = tmp_path / "fake-python-state"
+    fake = tmp_path / "job-bin" / "python3"
+    _executable(
+        fake,
+        f"printf ran > {shlex.quote(str(marker))}\n"
+        f"if [ -e {shlex.quote(str(state))} ]; then exit 0; fi\n"
+        f": > {shlex.quote(str(state))}\n"
+        "exit 86\n",
+    )
+    monkeypatch.setenv("PATH", str(fake.parent))
+    command = support.effective_command({})
+
+    exits = [
+        sk._run_verify_command(command, cwd=tmp_path, trusted_public_python=True),
+        sk._run_verify_command(command, cwd=tmp_path, trusted_public_python=True),
+    ]
+
+    # The real embedded runtime rejects the deliberately incomplete config.
+    # The fake would instead produce the validator's accepting [86, 0] pair.
+    assert exits == [98, 98]
+    assert not marker.exists()
+    assert not state.exists()
+
+
+def test_generated_public_verifier_requires_trusted_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = support.effective_command({})
+
+    def unavailable(name: str) -> Path:
+        assert name == "python3"
+        raise tools.TrustedExecutableUnavailable("missing")
+
+    monkeypatch.setattr(sk, "trusted_executable", unavailable)
+
+    assert sk._run_verify_command(
+        command, cwd=tmp_path, trusted_public_python=True,
+    ) == 127
+    with pytest.raises(ValueError, match="trusted_verifier_python_unavailable"):
+        sk._run_verify_command(
+            command,
+            cwd=tmp_path,
+            trusted_public_python=True,
+            raise_setup_errors=True,
+        )
+
+
 def test_run_git_passes_only_bounded_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

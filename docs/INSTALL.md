@@ -20,8 +20,9 @@ Installing this candidate does not activate it in production.
 
 - Python ≥ 3.10 (per [`pyproject.toml`](../pyproject.toml)). A **legacy validator** host additionally needs every Python minor a client may declare in a packet `toolchain` installed as `python3.X` on `PATH` (today: `python3.12`); a declared interpreter that is missing makes the validator post `error` for that assignment, which is excluded from quorum. Create the venv with a ≥ 3.10 interpreter explicitly — `python3.12 -m venv .venv` — because the stock macOS `python3` is 3.9 and its bundled pip fails the editable install with a misleading setuptools error.
 - A system `git`; the legacy credential route also needs a system `ssh`, and a
-  bounded-packet validator needs the Docker CLI. Privileged calls ignore inherited
-  `PATH` and resolve these programs only from `/usr/bin`, `/bin` or `/usr/local/bin`.
+  bounded-packet validator needs a system `python3` and the Docker CLI. Privileged
+  calls ignore inherited `PATH` and resolve these programs only from `/usr/bin`,
+  `/bin` or `/usr/local/bin`.
   The resolved program must be a regular executable whose file and parent path the
   service account cannot modify. Unsupported layouts and a root service account fail
   closed. Bounded-packet jobs publish through the gateway: public-repository jobs
