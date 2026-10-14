@@ -45,6 +45,15 @@ _ACTIVE_VERIFIER_COMPILERS = frozenset({
     '2ba990540ac8653f130efe5ed132a0dfdca6048db18386352719d3a317ae2c00',
 })
 
+# 2026-10-14.4 (ff7c1e51…): the deployed verifier plus download resilience.
+# Like the gateway's draining allowance, keep it only while frozen packets drain:
+# it predates trusted-tool hardening. Bind the exception to this catalog/compiler
+# pair, not the revision label (the public .4 has a different digest/compiler).
+_DRAINING_VERIFIER_COMPILERS = {
+    'sha256:ff7c1e51b36c54f8aa8b63d2b9b6ea91c4d1587ee39bc31575b7763ffbf40367':
+        '214eadfb183270c187f0dba07ad16123ea402a90dcd2e13d883b906d2060db1c',
+}
+
 
 def digest(value):
     return 'sha256:' + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
@@ -71,7 +80,8 @@ def _runtime_source():
 
 def _active_compiler(catalog):
     compiler = catalog.get('verifier_compiler_sha256') if isinstance(catalog, dict) else None
-    if compiler not in _ACTIVE_VERIFIER_COMPILERS:
+    if compiler not in _ACTIVE_VERIFIER_COMPILERS and (
+            compiler is None or _DRAINING_VERIFIER_COMPILERS.get(digest(catalog)) != compiler):
         raise ValueError('verifier_compiler_revoked')
     return compiler
 
