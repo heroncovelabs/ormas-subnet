@@ -67,8 +67,9 @@ Remove public `.4` from the public active set only in a later reviewed release a
 
 Finalization also requires a reviewed legacy repair-admission cutoff and an
 evidence-only historical parser so revocation does not make retained accounting
-records unreadable. No stage-one or activation release may remove `.5` execution
-authority.
+records unreadable. The `.5` candidate was never released and is not authoritative;
+do not admit its catalog or compiler. Inventory any development or preview records
+that were frozen on `.5` and retire or recompile them explicitly.
 
 Use read-only inventory for production evidence. Do not create jobs, invoke
 providers, submit chain transactions, or mutate receipts to prove the cutover.

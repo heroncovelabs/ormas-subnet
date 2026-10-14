@@ -28,6 +28,9 @@ PUBLIC_V6_COMPILER = (
 PRIVATE_V3_CATALOG = (
     "sha256:303d916bed2312ced5649a23df326996c91999487b5bea122641797a96e92f30"
 )
+PRIVATE_V2_CATALOG = (
+    "sha256:9251253a5dc1c1a4fd5947f0b1190a27393bf499f30c325d6345a0db98b946a9"
+)
 
 
 def _packet(tmp_path: Path) -> tuple[dict, dict]:
@@ -168,3 +171,11 @@ def test_bridge_accepts_frozen_v6_packet_without_emitting_v6(tmp_path: Path) -> 
 def test_public_bridge_does_not_import_private_gateway_catalog() -> None:
     with pytest.raises(ValueError, match="unsupported_catalog_version"):
         support.load_support_catalog(PRIVATE_V3_CATALOG)
+
+    private_v2 = support.load_support_catalog(PRIVATE_V2_CATALOG)
+    with pytest.raises(ValueError, match="verifier_compiler_revoked"):
+        support._active_compiler(private_v2)
+
+    project = (Path(__file__).parents[1] / "pyproject.toml").read_text()
+    project_section = project.split("[project]", 1)[1].split("[", 1)[0]
+    assert '\nname = "ormas-subnet"\n' in project_section
