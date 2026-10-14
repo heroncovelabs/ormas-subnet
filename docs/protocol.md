@@ -587,7 +587,13 @@ The gateway and SDK recompile and compare the executable/configuration against t
 frozen catalog. They do not trust a client-supplied wrapper merely because its shape
 looks valid. Historical catalogs remain loadable for evidence and profile
 interpretation, while execution also requires the catalog's verifier compiler hash
-to be on the explicit active allowlist. A revoked compiler fails closed even for an
+to be on the explicit active allowlist or match an explicit catalog/compiler draining
+pair. The deployed `2026-10-14.4` catalog (`sha256:ff7c1e51…`) is draining only with
+compiler `214eadfb…`; this does not make that compiler active for any other catalog.
+The public `2026-10-14.4` (`sha256:398f6c9f…`, compiler `2ba99054…`) remains the default.
+Compare catalogs by digest, not revision label. The draining verifier predates
+trusted-tool hardening; packet validation still rejects revoked acceptance drivers.
+Other revoked compilers, including `6208cd15…`, fail closed even for an
 already admitted packet. Before revocation rollout, inventory queued, leased and
 recovery-pending packets using that compiler; drain or expire them, then recompile
 their frozen inputs with an active compiler and requeue them under a new agreement.

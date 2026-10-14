@@ -94,8 +94,8 @@ def _complete_packet(environment, config, original_command):
     }
 
 
-def _packet_for_digest(driver_digest):
-    catalog = support.load_support_catalog()
+def _packet_for_digest(driver_digest, *, catalog_digest=None):
+    catalog = support.load_support_catalog(catalog_digest)
     profile = next(
         value for value in catalog["profiles"]
         if value["profile_id"] == "linux-python-pytest-v1"
@@ -222,9 +222,13 @@ def test_unsafe_card_is_refused_before_host_git_lookup(
     assert host_git_lookups == []
 
 
+@pytest.mark.parametrize("catalog_digest", [
+    None,
+    "sha256:ff7c1e51b36c54f8aa8b63d2b9b6ea91c4d1587ee39bc31575b7763ffbf40367",
+])
 @pytest.mark.parametrize("driver_digest", ALL_REVOKED_DIGESTS)
-def test_frozen_packet_with_revoked_driver_fails_validation(driver_digest):
-    packet, _ = _packet_for_digest(driver_digest)
+def test_frozen_packet_with_revoked_driver_fails_validation(driver_digest, catalog_digest):
+    packet, _ = _packet_for_digest(driver_digest, catalog_digest=catalog_digest)
     with pytest.raises(ValueError, match="acceptance_driver_revoked"):
         support.validate_public_execution_packet(packet)
 
