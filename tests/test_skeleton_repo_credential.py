@@ -74,7 +74,7 @@ def test_credential_draft_clones_draft_repo_url_with_the_key_and_leaves_no_key_b
     real_run = subprocess.run
 
     def spy_run(argv, **kwargs):
-        if argv[:1] == ["git"] and argv[1:2] in (["clone"], ["push"]):
+        if Path(argv[0]).name == "git" and argv[1:2] in (["clone"], ["push"]):
             env = kwargs.get("env") or {}
             seen.append({"argv": list(argv), "ssh": env.get("GIT_SSH_COMMAND", ""),
                          "key_exists": _key_path(env.get("GIT_SSH_COMMAND", "")) is not None

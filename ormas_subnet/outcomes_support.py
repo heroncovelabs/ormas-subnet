@@ -25,6 +25,7 @@ from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
 from .verifier_runtime import (
     RuntimeRefusal,
     dependency_spec,
@@ -383,14 +384,24 @@ def validate_public_execution_packet(packet):
     return expected
 
 
+def _trusted_tool(name):
+    try:
+        return trusted_executable(name)
+    except TrustedExecutableUnavailable as exc:
+        raise ValueError(f'trusted {name} executable unavailable') from exc
+
+
 def _git_environment():
-    return {'PATH': os.environ.get('PATH', ''), 'HOME': '/nonexistent',
+    git = _trusted_tool('git')
+    return {'PATH': str(git.parent), 'HOME': '/nonexistent',
             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': os.devnull,
-            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'}
+            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
+            'GIT_NO_REPLACE_OBJECTS': '1'}
 
 
 def _isolated_git(args, *, cwd, env):
-    proc = subprocess.run(['git', '--literal-pathspecs', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + os.devnull,
+    git = _trusted_tool('git')
+    proc = subprocess.run([str(git), '--literal-pathspecs', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + os.devnull,
         '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never',
         '-c', 'protocol.file.allow=never', *args], cwd=str(cwd), env=env,
         capture_output=True, check=False, timeout=120)
@@ -595,7 +606,7 @@ def repository_git(args, *, cwd, repo_url, credential):
             with os.fdopen(fd, 'w') as stream:
                 stream.write(body if body.endswith('\n') else body + '\n')
         env = _git_environment()
-        env['GIT_SSH_COMMAND'] = shlex.join(['ssh', '-F', os.devnull, '-i', str(key),
+        env['GIT_SSH_COMMAND'] = shlex.join([str(_trusted_tool('ssh')), '-F', os.devnull, '-i', str(key),
             '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
             '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + str(hosts),
             '-o', 'GlobalKnownHostsFile=' + os.devnull, '-o', 'HostKeyAlgorithms=ssh-ed25519',
