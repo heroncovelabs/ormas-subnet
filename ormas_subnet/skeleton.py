@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -30,7 +31,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, NoReturn, Sequence
 
 from httpx import HTTPError
 
@@ -40,7 +41,11 @@ from .client import (
     OrmasGatewayError,
     OrmasMinerClient,
     _ClaimIdentityError,
+    _offer_terms_sha256,
     _positive_usd,
+    _validate_offer_authority_epoch,
+    _validate_offer_request_id,
+    _validate_offer_window_id,
     _validate_window_offer,
 )
 from ._recovery import PublicRecovery, RecoveryRequired
@@ -74,6 +79,8 @@ _RESULT_REF_LOCAL = "local:ormas/job/"
 # /api/runner/v1/registrations (runner_api.py: POLL_INTERVAL_S, LEASE_TTL_S,
 # HEARTBEAT_S). Used only until the first registration response arrives.
 DEFAULT_POLL_INTERVAL_S = 15
+_OFFER_IDEMPOTENCY_PROTOCOL = "ormas-offer-request-v1"
+_OFFER_TERMINAL_REASONS = frozenset({"window_closed", "not_offering", "request_limit"})
 DEFAULT_LEASE_TTL_S = 300
 DEFAULT_HEARTBEAT_S = 90
 
@@ -1003,6 +1010,43 @@ class MinerSkeleton:
                 return self.client.claim_task(self.config.runner_id, offers=offers)
         return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
 
+    @staticmethod
+    def _empty_offer_state(gateway: str, runner_id: str) -> dict[str, Any]:
+        return {
+            "gateway": gateway,
+            "runner_id": runner_id,
+            "bids": {},
+            "current": {},
+            "pending": None,
+            "offer_protocol_floor": None,
+            "offer_protocol_poisoned": False,
+            "offer_authority_epoch": None,
+            "request_outcomes": {},
+            "window_markers": {},
+        }
+
+    @staticmethod
+    def _validate_offer_request_envelope(envelope: Any) -> None:
+        if (not isinstance(envelope, dict) or type(envelope.get("version")) is not int
+                or envelope["version"] != 2 or set(envelope) != {
+                    "version", "offer_request_id", "offer_authority_epoch",
+                    "offer_window_id", "offer_terms_sha256", "terms",
+                }):
+            raise ValueError("invalid offer request envelope")
+        epoch = _validate_offer_authority_epoch(envelope["offer_authority_epoch"])
+        window_id = _validate_offer_window_id(envelope["offer_window_id"])
+        _validate_window_offer(envelope["terms"])
+        terms_sha256 = _offer_terms_sha256(envelope["terms"])
+        if envelope["offer_terms_sha256"] != terms_sha256:
+            raise ValueError("invalid offer terms digest")
+        _validate_offer_request_id(
+            envelope["offer_request_id"],
+            offer_window_id=window_id,
+            offer_terms_sha256=terms_sha256,
+        )
+        if epoch != envelope["offer_authority_epoch"]:
+            raise ValueError("invalid offer authority epoch")
+
     def _offer_state(self) -> dict[str, Any]:
         store = self._public_recovery
         if store is None:
@@ -1011,8 +1055,7 @@ class MinerSkeleton:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
-            return {"gateway": store.namespace, "runner_id": store.runner_id,
-                    "bids": {}, "current": {}, "pending": None}
+            return self._empty_offer_state(store.namespace, store.runner_id)
         try:
             with os.fdopen(fd, "r", encoding="utf-8") as source:
                 metadata = os.fstat(source.fileno())
@@ -1021,19 +1064,122 @@ class MinerSkeleton:
                     raise RecoveryRequired("offer recovery record is unsafe")
                 state = json.load(source)
             if (state["gateway"] != store.namespace or state["runner_id"] != store.runner_id
-                    or not isinstance(state["bids"], dict) or not isinstance(state["current"], dict)):
+                    or not isinstance(state["bids"], dict)
+                    or not isinstance(state["current"], dict)):
                 raise RecoveryRequired("offer recovery identity mismatch")
+            state.setdefault("offer_protocol_floor", None)
+            state.setdefault("offer_protocol_poisoned", False)
+            state.setdefault("offer_authority_epoch", None)
+            state.setdefault("request_outcomes", {})
+            state.setdefault("window_markers", {})
+            if (state["offer_protocol_floor"] not in {None, _OFFER_IDEMPOTENCY_PROTOCOL}
+                    or type(state["offer_protocol_poisoned"]) is not bool
+                    or (state["offer_authority_epoch"] is not None
+                        and _validate_offer_authority_epoch(
+                            state["offer_authority_epoch"],
+                        ) != state["offer_authority_epoch"])
+                    or not isinstance(state["request_outcomes"], dict)
+                    or not isinstance(state["window_markers"], dict)):
+                raise ValueError("invalid offer protocol state")
+            has_v2_evidence = False
+            evidence_epochs: set[str] = set()
             for bid_id, bid in state["bids"].items():
                 if not isinstance(bid_id, str) or not bid_id:
                     raise ValueError("invalid bid identity")
                 _validate_window_offer(bid["terms"])
+                if "offer_request_id" in bid:
+                    has_v2_evidence = True
+                    terms_sha256 = _offer_terms_sha256(bid["terms"])
+                    window_id = _validate_offer_window_id(bid["offer_window_id"])
+                    evidence_epochs.add(
+                        _validate_offer_authority_epoch(bid["offer_authority_epoch"]),
+                    )
+                    _validate_offer_request_id(
+                        bid["offer_request_id"],
+                        offer_window_id=window_id,
+                        offer_terms_sha256=terms_sha256,
+                    )
+                    if bid["offer_terms_sha256"] != terms_sha256:
+                        raise ValueError("invalid offer terms digest")
             for job_id, bid_id in state["current"].items():
                 if state["bids"][bid_id]["terms"]["job_id"] != job_id:
                     raise ValueError("invalid bid job identity")
-            if state["pending"] is not None:
-                raise RecoveryRequired("offer POST outcome unknown; recover own bid identity before claiming")
+            pending = state["pending"]
+            if pending == _OFFER_IDEMPOTENCY_PROTOCOL:
+                has_v2_evidence = True
+            elif pending is not None:
+                if isinstance(pending, dict) and pending.get("version") == 2:
+                    self._validate_offer_request_envelope(pending)
+                    has_v2_evidence = True
+                    evidence_epochs.add(pending["offer_authority_epoch"])
+                else:
+                    # Journals written before offer request ids contained the
+                    # offer terms directly. They remain byte-for-byte available
+                    # for manual reconciliation and are never attributed by GET.
+                    _validate_window_offer(pending)
+            for request_id, outcome in state["request_outcomes"].items():
+                if (not isinstance(outcome, dict) or set(outcome) != {
+                        "version", "offer_request_id", "offer_authority_epoch",
+                        "offer_window_id", "offer_terms_sha256", "terms",
+                        "outcome", "http_status", "error_type", "message",
+                } or outcome.get("outcome") != "refused"
+                        or type(outcome.get("http_status")) is not int
+                        or outcome["http_status"] != 409
+                        or outcome.get("error_type") != "offer_request_refused"
+                        or outcome.get("message") not in _OFFER_TERMINAL_REASONS):
+                    raise ValueError("invalid archived offer outcome")
+                envelope = {key: value for key, value in outcome.items()
+                            if key not in {"outcome", "http_status", "error_type", "message"}}
+                self._validate_offer_request_envelope(envelope)
+                evidence_epochs.add(outcome["offer_authority_epoch"])
+                if request_id != outcome["offer_request_id"]:
+                    raise ValueError("invalid archived request identity")
+                has_v2_evidence = True
+            for job_id, marker in state["window_markers"].items():
+                if (not isinstance(job_id, str) or not job_id
+                        or not isinstance(marker, dict) or set(marker) != {
+                            "offer_request_id", "offer_authority_epoch",
+                            "offer_window_id", "reason",
+                        } or marker.get("reason") not in _OFFER_TERMINAL_REASONS):
+                    raise ValueError("invalid offer window marker")
+                outcome = state["request_outcomes"][marker["offer_request_id"]]
+                if (outcome["terms"]["job_id"] != job_id
+                        or outcome["offer_authority_epoch"]
+                        != marker["offer_authority_epoch"]
+                        or outcome["offer_window_id"] != marker["offer_window_id"]
+                        or outcome["message"] != marker["reason"]):
+                    raise ValueError("offer window marker does not match its outcome")
+                has_v2_evidence = True
+            if len(evidence_epochs) > 1:
+                raise ValueError("mixed offer authority epochs")
+            evidence_epoch = next(iter(evidence_epochs), None)
+            pinned_epoch = state["offer_authority_epoch"]
+            migrated = False
+            if evidence_epoch is not None:
+                if pinned_epoch is None:
+                    state["offer_authority_epoch"] = evidence_epoch
+                    pinned_epoch = evidence_epoch
+                    migrated = True
+                elif pinned_epoch != evidence_epoch:
+                    raise ValueError("offer authority epoch does not match journal evidence")
+            if has_v2_evidence and state["offer_protocol_floor"] is None:
+                # Read-compatible migration for a request-ID journal written by
+                # a prerelease candidate.
+                state["offer_protocol_floor"] = _OFFER_IDEMPOTENCY_PROTOCOL
+                migrated = True
+            if (state["offer_protocol_floor"] == _OFFER_IDEMPOTENCY_PROTOCOL
+                    and state["pending"] is None):
+                # An idle protocol sentinel makes every adopted journal
+                # deliberately unreadable by the pre-request-id skeleton, whose
+                # recovery reader rejects any non-null pending value.
+                state["pending"] = _OFFER_IDEMPOTENCY_PROTOCOL
+                migrated = True
+            if migrated:
+                # Persist inferred floors, epochs and rollback fences before any
+                # queue, pricing, POST or claim operation.
+                self._save_offers(state)
             return state
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             raise RecoveryRequired("offer recovery record is corrupt") from None
 
     def _save_offers(self, state: dict[str, Any]) -> None:
@@ -1056,6 +1202,214 @@ class MinerSkeleton:
                 os.unlink(name)
 
     @staticmethod
+    def _normalized_offer_terms(offer: Mapping[str, Any]) -> dict[str, Any]:
+        """Match the gateway's stored float representation of accepted amounts."""
+        normalized = dict(offer)
+        for field in ("price_usd", "estimate_usd", "limit_usd"):
+            if field in normalized:
+                normalized[field] = float(normalized[field])
+        return normalized
+
+    @staticmethod
+    def _new_offer_request_id(offer_window_id: str, offer_terms_sha256: str) -> str:
+        """Generate a random request key that embeds its window and terms bindings."""
+        request_id = f"ofr_{offer_window_id}{offer_terms_sha256}{secrets.token_hex(16)}"
+        return _validate_offer_request_id(
+            request_id,
+            offer_window_id=offer_window_id,
+            offer_terms_sha256=offer_terms_sha256,
+        )
+
+    @staticmethod
+    def _offer_authority_epoch(queue: Mapping[str, Any]) -> str | None:
+        capability = queue.get("offer_idempotency")
+        if not isinstance(capability, Mapping):
+            return None
+        if capability.get("protocol") != _OFFER_IDEMPOTENCY_PROTOCOL:
+            return None
+        try:
+            return _validate_offer_authority_epoch(capability.get("authority_epoch"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _offer_window_id(entry: Mapping[str, Any]) -> str:
+        try:
+            return _validate_offer_window_id(entry.get("offer_window_id"))
+        except ValueError as exc:
+            raise RecoveryRequired("queue job has no usable offer window identity") from exc
+
+    def _bind_offer_protocol(
+        self, state: dict[str, Any], authority_epoch: str | None,
+    ) -> None:
+        """Persist the v1 floor, epoch and old-binary rollback fence."""
+        if state["offer_protocol_poisoned"]:
+            raise RecoveryRequired("offer idempotency protocol rollback requires reconciliation")
+        floor = state["offer_protocol_floor"]
+        if authority_epoch is None:
+            if floor == _OFFER_IDEMPOTENCY_PROTOCOL:
+                state["offer_protocol_poisoned"] = True
+                self._save_offers(state)
+                raise RecoveryRequired("offer idempotency protocol rollback requires reconciliation")
+            return
+        pinned_epoch = state["offer_authority_epoch"]
+        if pinned_epoch is not None and pinned_epoch != authority_epoch:
+            raise RecoveryRequired("offer authority epoch changed; reconcile saved offers")
+        changed = False
+        if floor is None:
+            state["offer_protocol_floor"] = _OFFER_IDEMPOTENCY_PROTOCOL
+            changed = True
+        if pinned_epoch is None:
+            state["offer_authority_epoch"] = authority_epoch
+            changed = True
+        if state["pending"] is None:
+            state["pending"] = _OFFER_IDEMPOTENCY_PROTOCOL
+            changed = True
+        if changed:
+            self._save_offers(state)
+
+    @staticmethod
+    def _pending_offer_refusal(cause: BaseException | None = None) -> NoReturn:
+        message = "offer POST outcome unknown; replay saved request or manually reconcile before claiming"
+        raise RecoveryRequired(message) from cause
+
+    @staticmethod
+    def _durable_offer_refusal(
+        exc: OrmasGatewayError, pending: Mapping[str, Any],
+    ) -> bool:
+        """Recognize only the gateway's persisted, request-bound refusal."""
+        return (exc.status_code == 409
+                and exc.error_type == "offer_request_refused"
+                and exc.message in _OFFER_TERMINAL_REASONS
+                and exc.details.get("offer_request_id") == pending["offer_request_id"]
+                and exc.details.get("job_id") == pending["terms"]["job_id"]
+                and exc.details.get("offer_terms_sha256") == pending["offer_terms_sha256"]
+                and exc.details.get("offer_authority_epoch")
+                == pending["offer_authority_epoch"]
+                and exc.details.get("offer_window_id") == pending["offer_window_id"])
+
+    def _resolve_offer_request(
+        self, state: dict[str, Any], pending: dict[str, Any], *, activate_current: bool = True,
+    ) -> tuple[str, str | None]:
+        """Replay one exact request and durably record its success or refusal."""
+        request_id = pending["offer_request_id"]
+        authority_epoch = pending["offer_authority_epoch"]
+        window_id = pending["offer_window_id"]
+        terms_sha256 = pending["offer_terms_sha256"]
+        terms = pending["terms"]
+        try:
+            response = self.client.submit_offer(
+                self.config.runner_id, terms,
+                offer_request_id=request_id,
+                offer_authority_epoch=authority_epoch,
+                offer_window_id=window_id,
+            )
+        except OrmasGatewayError as exc:
+            if not self._durable_offer_refusal(exc, pending):
+                # Preserve ordinary daemon behavior for authentication,
+                # throttling and transient gateway failures. The journal is
+                # already durable, so the next poll replays the same request.
+                if (exc.status_code is None or exc.status_code in {401, 403, 429}
+                        or exc.status_code >= 500):
+                    raise
+                self._pending_offer_refusal(exc)
+            outcome = {
+                **pending,
+                "outcome": "refused",
+                "http_status": exc.status_code,
+                "error_type": exc.error_type,
+                "message": exc.message,
+            }
+            archived = state["request_outcomes"].get(request_id)
+            if archived is not None and archived != outcome:
+                self._pending_offer_refusal()
+            state["request_outcomes"][request_id] = outcome
+            state["window_markers"][terms["job_id"]] = {
+                "offer_request_id": request_id,
+                "offer_authority_epoch": authority_epoch,
+                "offer_window_id": window_id,
+                "reason": exc.message,
+            }
+            state["pending"] = _OFFER_IDEMPOTENCY_PROTOCOL
+            self._save_offers(state)
+            return "refused", exc.message
+        except (HTTPError, OSError):
+            raise
+        except Exception as exc:  # transport, malformed echo and old gateway all stay pending
+            self._pending_offer_refusal(exc)
+
+        new_id = response.get("bid_id")
+        ack_by_at = response.get("ack_by_at")
+        closes = response.get("window_closes_at")
+        if (response.get("offer_request_id") != request_id
+                or response.get("offer_authority_epoch") != authority_epoch
+                or response.get("offer_window_id") != window_id
+                or response.get("offer_terms_sha256") != terms_sha256
+                or response.get("job_id") != terms["job_id"]
+                or not isinstance(new_id, str) or not new_id or new_id in state["bids"]
+                or not isinstance(ack_by_at, str) or not ack_by_at
+                or not isinstance(closes, str) or not closes):
+            self._pending_offer_refusal()
+        bid = {
+            "terms": terms,
+            "status": "open",
+            "window_closes_at": closes,
+            "offer_request_id": request_id,
+            "offer_authority_epoch": authority_epoch,
+            "offer_window_id": window_id,
+            "offer_terms_sha256": terms_sha256,
+            "ack_by_at": ack_by_at,
+        }
+        state["pending"] = _OFFER_IDEMPOTENCY_PROTOCOL
+        state["bids"][new_id] = bid
+        if activate_current:
+            state["current"][terms["job_id"]] = new_id
+            state["window_markers"].pop(terms["job_id"], None)
+        self._save_offers(state)
+        return "accepted", None
+
+    def _recover_legacy_pending_offer(
+        self, state: dict[str, Any], intent: dict[str, Any],
+    ) -> set[str]:
+        """A latest-bid read cannot causally attribute an unkeyed ambiguous POST."""
+        del state, intent
+        self._pending_offer_refusal()
+
+    def _recover_pending_offer(
+        self, state: dict[str, Any], authority_epoch: str | None,
+        observed_generations: Mapping[str, tuple[str | None, str]],
+    ) -> tuple[set[str], list[dict[str, Any]]]:
+        """Resolve one saved intent before any queue, pricing or claim action."""
+        pending = state["pending"]
+        if pending is None or pending == _OFFER_IDEMPOTENCY_PROTOCOL:
+            return set(), []
+        if not (isinstance(pending, dict) and type(pending.get("version")) is int
+                and pending["version"] == 2):
+            return self._recover_legacy_pending_offer(state, pending), []
+        if authority_epoch != pending["offer_authority_epoch"]:
+            self._pending_offer_refusal()
+        terms = pending["terms"]
+        pending_generation = (
+            pending["offer_authority_epoch"], pending["offer_window_id"],
+        )
+        observed_generation = observed_generations.get(terms["job_id"])
+        generation_is_current = (
+            observed_generation is None or observed_generation == pending_generation
+        )
+        outcome, reason = self._resolve_offer_request(
+            state, pending, activate_current=generation_is_current,
+        )
+        bid_id = state["current"].get(terms["job_id"])
+        bid = state["bids"].get(bid_id)
+        legacy = ([terms] if generation_is_current and outcome == "refused"
+                  and reason == "not_offering"
+                  and (bid is None or bid.get("legacy")) else [])
+        # A queue row for a newer generation must be handled in this tick. The
+        # immutable old result is retained, but never promoted to current.
+        recovered = {terms["job_id"]} if generation_is_current else set()
+        return recovered, legacy
+
+    @staticmethod
     def _offer_conflict(exc: OrmasGatewayError, message: str) -> bool:
         return (exc.status_code == 409
                 and (exc.error_type == message
@@ -1067,12 +1421,23 @@ class MinerSkeleton:
             raise RecoveryRequired("unknown own award bid")
         if bid.get("legacy"):
             return bid
+        if (bid["status"] in {"withdrawn", "replaced", "no_capacity", "award_lapsed"}
+                or (bid["status"] == "not_awarded"
+                    and bid.get("offer_request_id") is not None)):
+            # These gateway-owned terminal states never reopen. Keeping them
+            # locally sticky also blocks a two-step stale view
+            # (terminal -> open -> awarded). A new offer generation requires a
+            # new request identity. A requestless rollout bid remains pollable
+            # because the gateway may still reopen that legacy bid.
+            return bid
         response = self.client.get_offer(bid_id)
         status, award = response.get("status"), response.get("award_id")
         if (response.get("bid_id") != bid_id or status not in
                 {"open", "awarded", "not_awarded", "withdrawn", "replaced", "no_capacity",
                  "award_lapsed"}
                 or (status == "awarded" and (not isinstance(award, str) or not award))
+                or (status == "awarded"
+                    and bid["status"] not in {"open", "not_awarded", "awarded"})
                 or (bid["status"] == "awarded" and status != "award_lapsed" and (
                     status != "awarded" or bid.get("award_id") != award))):
             raise RecoveryRequired("invalid own bid status or award identity")
@@ -1081,7 +1446,10 @@ class MinerSkeleton:
         self._save_offers(state)
         return bid
 
-    def _check_offer_lease(self, state, claimed, legacy_offers=()):
+    def _check_offer_lease(
+        self, state, claimed, legacy_offers=(),
+        observed_generations: Mapping[str, tuple[str | None, str]] | None = None,
+    ):
         if claimed is None:
             return None
         lease, draft = claimed
@@ -1094,6 +1462,18 @@ class MinerSkeleton:
             bid = {"terms": terms, "status": "awarded", "legacy": True}
             legacy = True
         else:
+            observed_generation = (
+                None if observed_generations is None
+                else observed_generations.get(lease.task_id)
+            )
+            if (bid.get("offer_request_id") is not None
+                    and observed_generation is not None
+                    and (bid.get("offer_authority_epoch"), bid.get("offer_window_id"))
+                    != observed_generation):
+                raise RecoveryRequired("lease award is from a superseded offer generation")
+            current_id = state["current"].get(lease.task_id)
+            if current_id != lease.bid_id:
+                raise RecoveryRequired("lease award is from a superseded offer generation")
             bid = self._read_bid(state, lease.bid_id)
         terms = bid["terms"]
         if (bid["status"] != "awarded" or lease.task_id != terms["job_id"]
@@ -1113,7 +1493,17 @@ class MinerSkeleton:
 
     def _claim_offer_window(self) -> tuple[TaskLease, TaskDraft] | None:
         state = self._offer_state()
+        pending = state["pending"]
+        if pending is not None and pending != _OFFER_IDEMPOTENCY_PROTOCOL and not (
+            isinstance(pending, dict) and type(pending.get("version")) is int
+            and pending["version"] == 2
+        ):
+            self._pending_offer_refusal()
+        if state["offer_protocol_poisoned"]:
+            raise RecoveryRequired("offer idempotency protocol rollback requires reconciliation")
         if self._queue_unsupported:
+            if state["offer_protocol_floor"] == _OFFER_IDEMPOTENCY_PROTOCOL:
+                self._bind_offer_protocol(state, None)
             if state["bids"]:
                 raise RecoveryRequired("own offer bids require gateway queue support")
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
@@ -1122,25 +1512,75 @@ class MinerSkeleton:
         except OrmasGatewayError as exc:
             if exc.status_code != 404 or exc.error_type is not None:
                 raise
+            if state["offer_protocol_floor"] == _OFFER_IDEMPOTENCY_PROTOCOL:
+                self._bind_offer_protocol(state, None)
             if state["bids"]:
                 raise RecoveryRequired("own offer bids require gateway queue support") from exc
             self._queue_unsupported = True
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
-        missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
-        legacy_offers = []
-        for entry in queue.get("jobs", []):
+        authority_epoch = self._offer_authority_epoch(queue)
+        self._bind_offer_protocol(state, authority_epoch)
+        rows = queue.get("jobs", [])
+        observed_generations: dict[str, tuple[str | None, str]] = {}
+        for entry in rows:
             job_id = entry["job_id"]
+            window_id = self._offer_window_id(entry)
+            generation = (authority_epoch, window_id)
+            prior = observed_generations.get(job_id)
+            if prior is not None and prior != generation:
+                raise RecoveryRequired("queue contains conflicting offer generations")
+            observed_generations[job_id] = generation
+        recovered_jobs, legacy_offers = self._recover_pending_offer(
+            state, authority_epoch, observed_generations,
+        )
+        missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
+        for entry in rows:
+            job_id = entry["job_id"]
+            window_id = observed_generations[job_id][1]
+            if job_id in recovered_jobs:
+                continue
             bid_id = state["current"].get(job_id)
             bid = state["bids"].get(bid_id)
             if entry.get("awarded_to_you"):
-                awarded = self._read_bid(state, entry.get("bid_id"))
+                awarded_id = entry.get("bid_id")
+                if state["current"].get(job_id) != awarded_id:
+                    raise RecoveryRequired("queue award is from a superseded offer generation")
+                awarded = self._read_bid(state, awarded_id)
                 if (awarded["terms"]["job_id"] != job_id or awarded["status"] != "awarded"
-                        or awarded.get("award_id") != entry.get("award_id")):
+                        or awarded.get("award_id") != entry.get("award_id")
+                        or (awarded.get("offer_request_id") is not None and (
+                            awarded.get("offer_authority_epoch") != authority_epoch
+                            or awarded.get("offer_window_id") != window_id
+                        ))):
                     raise RecoveryRequired("queue award bid identity mismatch")
+                if state["current"].get(job_id) != awarded_id:
+                    state["current"][job_id] = awarded_id
+                    self._save_offers(state)
                 continue
             if bid is not None and not bid.get("legacy"):
                 bid = self._read_bid(state, bid_id)
-                if bid["status"] == "awarded":
+                same_generation = (
+                    bid.get("offer_authority_epoch") == authority_epoch
+                    and bid.get("offer_window_id") == window_id
+                )
+                if (bid["status"] == "awarded"
+                        and (bid.get("offer_request_id") is None or same_generation)):
+                    continue
+            marker = state["window_markers"].get(job_id)
+            marker_reason = None
+            if marker is not None:
+                if (marker["reason"] == "not_offering"
+                        and marker["offer_authority_epoch"] != authority_epoch):
+                    raise RecoveryRequired(
+                        "offer authority changed for a classified offer window",
+                    )
+            if marker is not None and marker["offer_window_id"] == window_id:
+                if marker["offer_authority_epoch"] != authority_epoch:
+                    raise RecoveryRequired(
+                        "offer authority changed for a terminal offer window",
+                    )
+                marker_reason = marker["reason"]
+                if marker_reason in {"window_closed", "request_limit"}:
                     continue
             if self.config.offer_fn is not None:
                 offer = self.config.offer_fn(entry)
@@ -1166,48 +1606,53 @@ class MinerSkeleton:
             if offer["job_id"] != job_id:
                 raise ValueError("offer job_id must match its queue entry")
             offer = dict(offer)
-            if (bid is not None and not bid.get("legacy") and bid["terms"] == offer
-                    and bid["status"] == "open"):
-                continue
-            # Save intent first: a lost POST response cannot be recovered by the
-            # own-status API, which requires the returned bid id.
-            state["pending"] = offer
-            self._save_offers(state)
-            try:
-                response = self.client.submit_offer(self.config.runner_id, offer)
-            except OrmasGatewayError as exc:
-                if exc.status_code is None or exc.status_code >= 500:
-                    raise  # The gateway may have recorded the POST.
-                state["pending"] = None
-                self._save_offers(state)
-                if self._offer_conflict(exc, "not_offering") and (bid is None or bid.get("legacy")):
+            if marker_reason == "not_offering":
+                if bid is None or bid.get("legacy"):
                     legacy_offers.append(offer)
-                    continue
-                if self._offer_conflict(exc, "window_closed"):
-                    if bid is not None:
-                        self._read_bid(state, bid_id)
-                    continue
-                raise
-            new_id, closes = response.get("bid_id"), response.get("window_closes_at")
-            if (not isinstance(new_id, str) or not new_id or new_id in state["bids"]
-                    or not isinstance(closes, str) or not closes):
-                raise RecoveryRequired("offer response has no new bid identity or window_closes_at")
-            state["pending"] = None
-            state["bids"][new_id] = {"terms": offer, "status": "open", "window_closes_at": closes}
-            state["current"][job_id] = new_id
+                continue
+            if (bid is not None and not bid.get("legacy") and bid["terms"] == offer
+                    and bid["status"] == "open"
+                    and bid.get("offer_authority_epoch") == authority_epoch
+                    and bid.get("offer_window_id") == window_id):
+                continue
+            if authority_epoch is None:
+                raise RecoveryRequired("gateway has no usable offer idempotency capability")
+            # Save the request identity and exact terms before the first POST.
+            # Any ambiguous outcome replays this envelope with the same id.
+            terms_sha256 = _offer_terms_sha256(offer)
+            pending = {
+                "version": 2,
+                "offer_request_id": self._new_offer_request_id(window_id, terms_sha256),
+                "offer_authority_epoch": authority_epoch,
+                "offer_window_id": window_id,
+                "offer_terms_sha256": terms_sha256,
+                "terms": offer,
+            }
+            state["pending"] = pending
             self._save_offers(state)
+            outcome, reason = self._resolve_offer_request(state, pending)
+            if outcome == "refused":
+                if reason == "not_offering" and (bid is None or bid.get("legacy")):
+                    legacy_offers.append(offer)
+                elif reason == "window_closed" and bid is not None:
+                    self._read_bid(state, bid_id)
         if missing_pricing and not state["bids"]:
             raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
         # An own award can be absent from the queue page; recover its frozen
         # terms through an empty-offer claim before requiring fresh pricing.
         claimed = self.client.claim_task(self.config.runner_id, offers=[])
         if claimed is not None:
-            return self._check_offer_lease(state, claimed)
+            return self._check_offer_lease(
+                state, claimed, observed_generations=observed_generations,
+            )
         if missing_pricing:
             raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
         if legacy_offers:
             claimed = self.client.claim_task(self.config.runner_id, offers=legacy_offers)
-            return self._check_offer_lease(state, claimed, legacy_offers)
+            return self._check_offer_lease(
+                state, claimed, legacy_offers,
+                observed_generations=observed_generations,
+            )
         return None
 
     def _run_once_locked(self) -> bool:
