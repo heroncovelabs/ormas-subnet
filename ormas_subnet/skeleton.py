@@ -1421,13 +1421,14 @@ class MinerSkeleton:
             raise RecoveryRequired("unknown own award bid")
         if bid.get("legacy"):
             return bid
-        if bid["status"] in {
-            "not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed",
-        }:
+        if (bid["status"] in {"withdrawn", "replaced", "no_capacity", "award_lapsed"}
+                or (bid["status"] == "not_awarded"
+                    and bid.get("offer_request_id") is not None)):
             # These gateway-owned terminal states never reopen. Keeping them
             # locally sticky also blocks a two-step stale view
             # (terminal -> open -> awarded). A new offer generation requires a
-            # new request identity; only requestless legacy bids may reopen.
+            # new request identity. A requestless rollout bid remains pollable
+            # because the gateway may still reopen that legacy bid.
             return bid
         response = self.client.get_offer(bid_id)
         status, award = response.get("status"), response.get("award_id")

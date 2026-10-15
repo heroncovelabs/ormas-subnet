@@ -663,6 +663,71 @@ def test_request_id_not_awarded_cannot_reopen_into_a_later_bid(tmp_path):
     assert transport.source.completed is None
 
 
+def test_requestless_rollout_bid_can_reopen_at_frozen_terms(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    assert miner.run_once() is False
+
+    # Model a journal written before request IDs while preserving the adopted
+    # protocol floor.  Rollout gateways may still reopen exactly this class of
+    # frozen bid; the request-bound bid above must remain terminal.
+    journal = next(tmp_path.rglob("offers.json"))
+    state = json.loads(journal.read_text())
+    saved = state["bids"]["bid_1"]
+    for field in (
+        "offer_request_id", "offer_authority_epoch", "offer_window_id",
+        "offer_terms_sha256", "ack_by_at",
+    ):
+        saved.pop(field, None)
+    state.update(
+        pending=None, offer_protocol_floor=None, offer_protocol_poisoned=False,
+        offer_authority_epoch=None, request_outcomes={}, window_markers={},
+    )
+    journal.write_text(json.dumps(state))
+
+    transport.bids["bid_1"]["status"] = "not_awarded"
+    idle = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    idle.config.offer_fn = lambda _: None
+    assert idle.run_once() is False
+    saved = json.loads(journal.read_text())["bids"]["bid_1"]
+    assert saved["status"] == "not_awarded"
+    assert len(offers(transport)) == 1
+
+    transport.set_award("bid_1")
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    restarted.config.offer_fn = lambda _: pytest.fail(
+        "a reopened requestless award must retain its frozen terms",
+    )
+    assert restarted.run_once() is True
+    assert len(offers(transport)) == 1
+    assert transport.source.completed["terminal"]["verification_state"] == "verified"
+
+
+def test_request_id_not_awarded_rejects_hidden_stale_lease(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    assert miner.run_once() is False
+    transport.bids["bid_1"]["status"] = "not_awarded"
+
+    idle = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    idle.config.offer_fn = lambda _: None
+    assert idle.run_once() is False
+    assert len(offers(transport)) == 1
+
+    transport.set_award("bid_1")
+    transport.queue_response = _FakeResponse(200, {
+        "jobs": deepcopy(transport.jobs),
+        "offer_idempotency": {
+            "protocol": "ormas-offer-request-v1",
+            "authority_epoch": transport.offer_authority_epoch,
+        },
+    })
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    restarted.config.offer_fn = lambda _: None
+    restarted.solve_fn = lambda *_: pytest.fail("a terminal request-ID bid cannot execute")
+    with pytest.raises(RecoveryRequired, match="lease award bid identity"):
+        restarted.run_once()
+    assert transport.source.completed is None
+
+
 @pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed"])
 def test_losing_status_never_executes(tmp_path, status):
     transport, miner = window_miner(tmp_path)
