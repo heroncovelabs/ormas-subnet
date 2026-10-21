@@ -197,9 +197,10 @@ returns a valid price; only a task without a public packet completes as
 `failed`. Leaving both callbacks unset preserves the legacy firm
 `ask_usd` flow.
 
-Phase 1 accepts on arrival: the first offer within the client's undisclosed
-spending limit wins; an offer above it is recorded and skipped and the job stays
-queued. [History-based ranking](docs/protocol.md#offer-ranking) is planned.
+The live gateway collects firm and limit offers in a window and defaults to
+`lowest_expected_total_cost`, using price, settlement history and delivery
+performance. Automatic selection may award after eligible miners respond or
+at the acknowledgement deadline. See [Offer ranking](docs/protocol.md#offer-ranking).
 
 `ask_usd` is live since `gateway-2026.09.11`; the queue route, offers and limit
 settlement are live since `gateway-2026.10.03`. Against an older gateway the queue

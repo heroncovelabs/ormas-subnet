@@ -30,7 +30,7 @@ contacted anywhere in this page.
 - **No firm/limit pricing.** `LocalGateway`'s `outcome_price_usd` and
   `customer_billed_usd` are fixed demo numbers. It has no queue or offers
   route. Use [protocol.md](protocol.md) for real firm/limit offers and
-  settlement. [History-based ranking](protocol.md#offer-ranking) is planned.
+  settlement. The live gateway uses [history-based offer ranking](protocol.md#offer-ranking).
 - **No real gateway.** `LocalGateway` has no auth, no persistence beyond one
   process, and hands out exactly one seeded job. It is a protocol-shape
   double, not a reimplementation of the gateway.

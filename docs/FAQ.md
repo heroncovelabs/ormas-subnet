@@ -26,10 +26,7 @@ required fallback fields; `bind` serves a pre-arranged repository.
 
 **How do offers and payment work?**
 A `firm` offer fixes the client’s charge at `price_usd`. A `limit` offer states your expected charge as
-`estimate_usd` and a ceiling as `limit_usd` (`0 < estimate_usd ≤ limit_usd`, both required); you send `settled_price_usd` on verified delivery and the client pays exactly that amount. Phase 1
-accepts on arrival: the first offer within the client's undisclosed spending limit wins;
-an offer above it is recorded and skipped and the job stays queued.
-[History-based ranking](protocol.md#offer-ranking) is planned. Legacy `ask_usd` claims remain firm.
+`estimate_usd` and a ceiling as `limit_usd` (`0 < estimate_usd ≤ limit_usd`, both required); you send `settled_price_usd` on verified delivery and the client pays exactly that amount. The live gateway collects firm and limit offers in a window and defaults to `lowest_expected_total_cost`, using price, settlement history and delivery performance. Buyers may set `award_policy` fields `policy`, `ack_by_s`, `window_s` and `fallback`. Miner-targeting fields `only_miners`, `prefer_miners`, `qualification` and `prefer_affiliation` are operator-only. Automatic selection may award after eligible miners respond or at the acknowledgement deadline (`ack_by_s`, 60 seconds by default). See [Offer ranking](protocol.md#offer-ranking). Legacy `ask_usd` claims remain firm.
 
 Estimate the expected cost of your usual recovery chain plus margin, and set the limit at your
 worst-case chain. Settle at your actual metered chain cost plus margin within the limit. You bear any excess; see [Economics](economics.md).
