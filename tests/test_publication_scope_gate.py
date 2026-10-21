@@ -340,7 +340,7 @@ def test_pre_fix_artifact_recovery_cannot_bypass_the_new_scope_gate(tmp_path: Pa
     lease = SimpleNamespace(lease_id="lease-public")
     draft = SimpleNamespace(
         task_id="task-public", work_packet_sha256="a" * 64, base_commit="b" * 40,
-        repo_url="https://github.com/acme/demo.git",
+        repo_url="https://github.com/acme/demo.git", work_packet={},
     )
     store = PublicRecovery(root, "https://gateway.example.invalid", "miner-public")
     store.begin(lease, draft)
@@ -383,7 +383,7 @@ def test_recovery_checkpoint_refuses_failed_scope_before_artifact_build(tmp_path
     lease = SimpleNamespace(lease_id="lease-public")
     draft = SimpleNamespace(
         task_id="task-public", work_packet_sha256="a" * 64, base_commit="b" * 40,
-        repo_url="https://github.com/acme/demo.git",
+        repo_url="https://github.com/acme/demo.git", work_packet={},
     )
     store = PublicRecovery(root, "https://gateway.example.invalid", "miner-public")
     store.begin(lease, draft)

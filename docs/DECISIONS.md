@@ -16,10 +16,11 @@ follows these; where any document here disagrees with this page, this page wins.
 4. **The client prepares the task inside its own perimeter.** The client's own tooling freezes
    the task packet (brief, acceptance criteria, verify command, allowed and immutable paths,
    base commit). No model is called through Ormas for that step.
-5. **Phase 1 selection is accept-on-arrival (amended 2026-10-02).** The first offer
-   within the client's undisclosed spending limit wins; an offer above it is recorded and
-   skipped and the job stays queued. [History-based ranking](protocol.md#offer-ranking)
-   is planned. Miners can decline a queued job by omitting it from their offers.
+5. **Offer-window selection uses live history-based ranking.** The gateway defaults
+   to `lowest_expected_total_cost`, using price, settlement history and delivery
+   performance. Automatic selection may award after eligible miners respond or at
+   the acknowledgement deadline. See [Offer ranking](protocol.md#offer-ranking).
+   Miners can decline a queued job by omitting it from their offers.
 6. **Acceptance is the validator's role, and it feeds reputation.** A validator re-runs the
    client's verify command against the delivered branch in a digest-pinned container it
    controls, checks the diff against the allowed and immutable paths, and posts a signed
@@ -63,8 +64,8 @@ Miners see a privacy-safe task envelope before offering. A limit offer carries b
 `estimate_usd`, the expected charge (the expected cost of the usual recovery chain
 plus margin), and `limit_usd`, the hard ceiling (the worst-case chain), with
 `0 < estimate_usd ≤ limit_usd`; the gateway refuses a limit offer without an
-estimate. The gateway will keep dollar-weighted settled-to-estimate and
-settled-to-limit ratios per miner and task shape as a planned ranking input. Settle at actual metered
+estimate. The gateway keeps dollar-weighted settled-to-estimate and
+settled-to-limit ratios per miner and task shape as live ranking inputs. Settle at actual metered
 chain cost plus margin, capped at the accepted limit; the miner bears any excess.
 The client pays exactly the firm price or settled limit price. Limit deliveries
 require `settled_price_usd`; firm and legacy terminals omit it. Limit leases and receipts expose

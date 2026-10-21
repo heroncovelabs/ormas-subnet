@@ -706,11 +706,11 @@ class MinerSkeleton:
     def _read_credential(self, draft: TaskDraft, lease_id: str | None) -> Any:
         """The credential for one private read under this still-live lease.
 
-        An expired App token is replaced through the authenticated lease; the
+        A missing or expired App token is replaced through the authenticated lease; the
         replacement stays local to this read, never in the draft or receipt.
         """
         credential = draft.repo_credential
-        if lease_id is None or not _app_read_expired(credential):
+        if lease_id is None or (credential is not None and not _app_read_expired(credential)):
             return credential
         return _refreshed_app_read(lambda: self.client.read_repository_credential(
             draft.task_id, self.config.runner_id, lease_id))
@@ -1263,7 +1263,8 @@ class MinerSkeleton:
             if lease.task_id != task_id:
                 raise ValueError("lease task identity mismatch")
             draft = SimpleNamespace(task_id=task_id, base_commit=pending['base_commit'],
-                                    repo_url=pending['repo_url'])
+                                    repo_url=pending['repo_url'],
+                                    work_packet=pending.get('work_packet'), repo_credential=None)
         except (AttributeError, KeyError, TypeError, ValueError):
             raise RecoveryRequired('public recovery identity mismatch') from None
         start = time.monotonic()
@@ -1276,6 +1277,11 @@ class MinerSkeleton:
             # Its provider outcome is unknown, so do not call the solver again.
             self._report_lease_failure(lease, draft, RecoveryRequired('public execution interrupted'), start)
             return self._public_recovery.pending() is None
+        if pending['stage'] == 'artifact' and draft.work_packet is None:
+            _LOGGER.warning('public task %s recovery skipped: legacy artifact record '
+                            'has no work_packet; retained as history', draft.task_id)
+            self._public_recovery.acknowledge()
+            return True
         if pending.get('version') != 2 and not (
             pending.get('version') == 1 and pending['stage'] == 'completion'
         ):

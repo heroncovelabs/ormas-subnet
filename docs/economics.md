@@ -28,12 +28,9 @@ rises above $1.60, the settlement stays at $1.60 and you bear the loss.
 what you will never exceed. The gateway's ledger can compare what you settled with
 what you estimated and with your limit, dollar-weighted, by task shape. A miner
 whose settlements track its estimates earns credible estimates; one that estimates
-low and settles near the limit shows it. These two ratios are a planned ranking
-input, not live in phase 1.
+low and settles near the limit shows it. These two ratios inform live offer ranking.
 
-Phase 1 accepts on arrival: the first offer within the client's undisclosed
-spending limit wins; an offer above it is recorded and skipped and the job stays
-queued. [History-based ranking](protocol.md#offer-ranking) is planned.
+The live gateway collects firm and limit offers in a window and defaults to `lowest_expected_total_cost`, using price, settlement history and delivery performance. Buyers may set `award_policy` fields `policy`, `ack_by_s`, `window_s` and `fallback`. Miner-targeting fields `only_miners`, `prefer_miners`, `qualification` and `prefer_affiliation` are operator-only. Automatic selection may award after eligible miners respond or at the acknowledgement deadline (`ack_by_s`, 60 seconds by default). See [Offer ranking](protocol.md#offer-ranking).
 
 ## Chain compensation (targets and weights live; treasury top-ups planned)
 

@@ -193,9 +193,9 @@ or environment changes also require a new agreement.
 
 ## Offers and payment
 
-Phase 1 accepts on arrival: the first offer within the client's undisclosed
-spending limit wins; an offer above it is recorded and skipped and the job stays
-queued. A firm offer charges exactly
+The live gateway collects firm and limit offers in a window and defaults to `lowest_expected_total_cost`, using price, settlement history and delivery performance. Buyers may set `award_policy` fields `policy`, `ack_by_s`, `window_s` and `fallback`. Miner-targeting fields `only_miners`, `prefer_miners`, `qualification` and `prefer_affiliation` are operator-only. Automatic selection may award after eligible miners respond or at the acknowledgement deadline (`ack_by_s`, 60 seconds by default). See [Offer ranking](protocol.md#offer-ranking).
+
+A firm offer charges exactly
 `price_usd`; a limit offer states `estimate_usd` and `limit_usd`
 (`0 < estimate_usd <= limit_usd`) and charges exactly the miner's
 `settled_price_usd`, at or below `limit_usd`, after validator acceptance. Failed deliveries are unpaid.
@@ -210,7 +210,7 @@ path the published work is held for recovery, no completion is sent, and every
 later poll re-raises until the hook returns a valid price; only a task without a
 public packet completes as `failed`. See
 [economics.md](economics.md) for an example.
-[History-based ranking](protocol.md#offer-ranking) and chain emissions are planned.
+Chain emissions are planned.
 
 Standard/Protected is the Ormas service level. Public/private repository is
 GitHub visibility; each service level has its own requirements.

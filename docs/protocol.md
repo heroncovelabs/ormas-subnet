@@ -371,6 +371,18 @@ acknowledgement deadline. Manual selection uses its window deadline and the
 configured fallback. Use returned `window_closes_at` and own gateway statuses;
 miners introduce no local bidding deadlines or reserve estimates.
 
+### Offer ranking
+
+The live gateway collects firm and limit offers in a window and defaults to
+`lowest_expected_total_cost`, using price, settlement history and delivery
+performance. Buyers may set `award_policy` fields `policy`, `ack_by_s`,
+`window_s` and `fallback`. Miner-targeting fields `only_miners`, `prefer_miners`,
+`qualification` and `prefer_affiliation` are operator-only.
+
+Automatic selection may award after eligible miners respond or at the
+acknowledgement deadline (`ack_by_s`, 60 seconds by default). Manual selection
+uses its window deadline and configured fallback.
+
 ### `POST /api/runner/v1/offers`
 
 `submit_offer(runner_id, offer)` sends exactly one of these bodies, with no
@@ -1065,8 +1077,8 @@ takes a `--sign-command` that reads the challenge on stdin and prints hex).
 - **`ask_usd` is live since `gateway-2026.09.11`; the queue route, offers and
   limit settlement are live since `gateway-2026.10.03`.** Against an older gateway
   the queue returns 404 without `error.type`, and the skeleton falls back to `ask_usd`.
-- **History-based ranking is planned.** See [Offer ranking](#offer-ranking) for
-  Phase 1 selection and the next phase.
+- **History-based offer ranking is live.** See [Offer ranking](#offer-ranking) for
+  the default policy and buyer controls.
 - **A `paid` receipt on `api.ormas.ai` today reflects one operator-run validator.**
   The reference checking component ships here. Independent validator admission
   and the combined public validator service remain release work; see

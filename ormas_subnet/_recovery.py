@@ -178,7 +178,8 @@ class PublicRecovery:
         body = {"version": 2, "gateway": self.namespace, "runner_id": self.runner_id,
                 "task_id": draft.task_id, "lease_id": lease.lease_id,
                 "packet_hash": draft.work_packet_sha256, "base_commit": draft.base_commit,
-                "repo_url": draft.repo_url, "stage": "claimed",
+                "repo_url": draft.repo_url, "work_packet": dict(draft.work_packet),
+                "stage": "claimed",
                 "completion_capture_version": _COMPLETION_CAPTURE_VERSION}
         if getattr(lease, "offer_kind", None) == "limit":
             body["lease"] = lease.to_wire()
