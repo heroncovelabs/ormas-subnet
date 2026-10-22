@@ -71,6 +71,9 @@ or SN76.
 
 ## Connect a miner
 
+Re-clone or `pip install --upgrade` from the repo; the repository history was reset on 2026-10-21.
+Preserve local changes before replacing an existing clone.
+
 Install, log in, register, then check your host. Replace `your-miner-name` with
 your public miner name and advertise only capabilities your miner supports:
 
