@@ -368,7 +368,12 @@ A response with a subset of valid envelope keys:
 
 ### Offer windows: explicit opt-in
 
-Rollout requires a gateway with offer-window support. The reference miner ships
+The request-identity contract below is a required gateway extension, not evidence
+that a deployed gateway implements it. Client tests alone cannot establish that
+its capability advertisement, persistent epoch, window identities and durable
+request outcomes exist. Verify these against the gateway before rollout.
+
+Rollout requires a gateway with `ormas-offer-request-v1` support. The reference miner ships
 with `MinerConfig.offer_window=False`; `--offer-window` enables it explicitly.
 Window mode uses `offer_fn(entry)` for per-job firm or limit terms. With no hook,
 a configured positive finite `ask_usd` supplies a static firm offer. Missing
@@ -376,6 +381,14 @@ pricing is refused. The legacy defaults and pre-floor bare queue-404 fallback
 keep their existing claim bodies. A miner that has observed the idempotency
 protocol refuses a route-missing fallback so it can preserve its request and
 award bindings.
+
+For a successful queue response, window mode requires a valid capability even
+when the page is empty or every task is declined. It refuses before pricing,
+offer submission or claiming if that capability is absent or malformed. Ordinary
+claim mode on a fresh journal keeps its existing legacy wire bodies. Once a
+namespace has saved offer state, disabling `offer_window` does not bypass it:
+the updated miner requires window mode or explicit operator reconciliation before
+any new queue or claim operation.
 
 The gateway owns two clocks: `ack_by_s` defaults to 60 seconds and ranges from
 15 to 60; manual `window_s` defaults to 600 seconds and has a maximum of 600.
@@ -426,7 +439,7 @@ Cross-implementation digest vectors for the canonical encoding are:
 |---|---|
 | `{"job_id":"job-1","kind":"firm","price_usd":0.2}` | `1767f3a9a2bdc2fc894b9fe73c3e5fafb0abf327166c6bc6376ffcfaecb3c602` |
 | `{"job_id":"task_1","kind":"firm","price_usd":1.0}` | `75446b10a33e374110a2de8909da965a20c11433033eae9c545233a8cd444d45` |
-| `{"estimate_usd":0.2,"job_id":"tâche-雪","kind":"limit","limit_usd":1.0}` | `88dff061f258375e70cc280d58043d4676b9dab75dc1f9d869bd8f354008cefb` |
+| `{"estimate_usd":0.2,"job_id":"t\u00e2che-\u96ea","kind":"limit","limit_usd":1.0}` | `88dff061f258375e70cc280d58043d4676b9dab75dc1f9d869bd8f354008cefb` |
 
 The JSON shown is the compact key-sorted representation after numeric
 normalization. UTF-8 bytes are hashed directly; JSON's default non-ASCII
@@ -455,9 +468,9 @@ as HTTP 409:
 
 Only this typed refusal, with `message` equal to `window_closed`, `not_offering`
 or `request_limit` and every binding field equal to the journal, lets the
-reference miner resolve a pending request. The current Ormas gateway emits no
-guessed numeric request cap: its authoritative terminal fence covers
-`window_closed` and `not_offering`. The client recognizes `request_limit` only
+reference miner resolve a pending request. This contract specifies no numeric
+request cap. A supporting gateway must persist its authoritative terminal fences
+for `window_closed` and `not_offering`. The client recognizes `request_limit` only
 for compatibility with a gateway that durably materializes the same immutable
 per-window terminal marker before replying. The miner archives the complete
 validated refusal in the same durable state replacement that returns the journal
@@ -573,12 +586,25 @@ reconciliation. A saved request may recover an immutable outcome after the queue
 advances or omits the old window row. A fresh request always uses the current row's
 exact window id. Missing or malformed window identity blocks that request.
 
+The miner persists each observed window transition before pricing or recovery
+POSTs. Its window history survives restarts and queue omissions: an older bid or
+replayed acknowledgement cannot authorize execution after a newer window was
+observed, even if that newer window was declined or pricing failed. A queue page
+that returns to an already retired window is refused before any offer or claim.
+Opaque window ids are never reused within one authority epoch. Existing
+request-id journals without this history adopt the current queue view and retain
+their other saved request bindings.
+
 The miner persists a protocol floor after observing v1. Later capability loss or
 downgrade writes a sticky rollback poison and refuses further offer and claim
 activity until manual reconciliation; capability restoration does not silently
 clear that poison. While idle it stores the protocol name in the legacy `pending`
-slot, which makes the pre-request-id reference miner fail closed on the same
-journal. It persists inferred protocol, epoch and rollback state from prerelease
+slot, which makes the pre-request-id reference miner's window-mode reader fail
+closed on the same journal. Older binaries do not inspect this journal in ordinary
+claim mode; the sentinel cannot fence that path. The updated miner checks both
+modes. Keep the recovery namespace and window mode unchanged when rolling back;
+do not treat switching mode, work directories or miner identity as reconciliation.
+It persists inferred protocol, epoch and rollback state from prerelease
 journals before queue or pricing I/O. An inconsistent fleet that rejects already
 journalled identity fields also leaves the exact request pending. Rollout therefore
 installs the schema and id-aware code on the whole gateway fleet before advertising
@@ -1200,3 +1226,4 @@ takes a `--sign-command` that reads the challenge on stdin and prints hex).
   The reference checking component ships here. Independent validator admission
   and the combined public validator service remain release work; see
   [Public tasks](PUBLIC_TASKS.md).
+

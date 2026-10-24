@@ -488,10 +488,11 @@ class OrmasMinerClient:
         return payload
 
     def get_offer_for_job(self, runner_id: str, job_id: str) -> dict[str, Any]:
-        """Read the latest own offer for legacy unkeyed recovery.
+        """Read the latest own offer for operator inspection.
 
         This endpoint is read only. New idempotent requests replay their saved
-        POST; this route can only supply positive evidence for pre-id journals.
+        POST. A latest-bid read cannot attribute an ambiguous unkeyed POST, so
+        the skeleton never uses it to clear a pre-id journal's pending intent.
         """
         from urllib.parse import urlencode
 
@@ -775,3 +776,4 @@ class OrmasMinerClient:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+

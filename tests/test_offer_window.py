@@ -680,7 +680,7 @@ def test_requestless_rollout_bid_can_reopen_at_frozen_terms(tmp_path):
         saved.pop(field, None)
     state.update(
         pending=None, offer_protocol_floor=None, offer_protocol_poisoned=False,
-        offer_authority_epoch=None, request_outcomes={}, window_markers={},
+        offer_authority_epoch=None, request_outcomes={}, window_markers={}, offer_window_history={},
     )
     journal.write_text(json.dumps(state))
 
@@ -892,7 +892,7 @@ def test_protocol_rollout_can_claim_known_pre_request_id_award(tmp_path):
         state["bids"]["bid_1"].pop(field, None)
     state.update(
         pending=None, offer_protocol_floor=None, offer_protocol_poisoned=False,
-        offer_authority_epoch=None, request_outcomes={}, window_markers={},
+        offer_authority_epoch=None, request_outcomes={}, window_markers={}, offer_window_history={},
     )
     journal.write_text(json.dumps(state))
     transport.set_award("bid_1")
@@ -972,8 +972,14 @@ def test_unknown_or_mismatched_lease_refuses_before_solver(tmp_path, mismatch):
 
 def test_unknown_awarded_queue_refuses_without_claim(tmp_path):
     transport, miner = window_miner(tmp_path)
-    transport.queue_response = _FakeResponse(200, {"jobs": [
-        {**transport.jobs[0], "awarded_to_you": True, "bid_id": "foreign", "award_id": "awd_foreign"}]})
+    transport.queue_response = _FakeResponse(200, {
+        "jobs": [{**transport.jobs[0], "awarded_to_you": True,
+                  "bid_id": "foreign", "award_id": "awd_foreign"}],
+        "offer_idempotency": {
+            "protocol": "ormas-offer-request-v1",
+            "authority_epoch": transport.offer_authority_epoch,
+        },
+    })
     with pytest.raises(RecoveryRequired, match="award|bid"):
         miner.run_once()
     assert claims(transport) == []
@@ -1292,6 +1298,146 @@ def test_unadvertised_old_gateway_gets_no_idempotent_offer_post(tmp_path):
     assert transport.bids == {} and claims(transport) == []
     journals = list(Path(tmp_path).rglob("offers.json"))
     assert not journals or json.loads(journals[0].read_text())["pending"] is None
+
+
+@pytest.mark.parametrize("queue_view", ["empty", "legacy_row", "declined"])
+def test_unadvertised_gateway_never_claims_in_window_mode(tmp_path, queue_view):
+    transport, miner = window_miner(tmp_path)
+    transport.advertise_offer_idempotency = False
+    if queue_view == "empty":
+        transport.jobs = []
+    elif queue_view == "legacy_row":
+        transport.jobs[0].pop("offer_window_id")
+    else:
+        miner.config.offer_fn = lambda _: None
+    with pytest.raises(RecoveryRequired, match="no usable offer idempotency capability"):
+        miner.run_once()
+    assert offers(transport) == claims(transport) == []
+
+
+@pytest.mark.parametrize("prior", ["pending", "accepted", "refused", "poisoned"])
+def test_disabling_window_mode_cannot_bypass_offer_journal(tmp_path, prior):
+    transport, miner = window_miner(tmp_path)
+    if prior == "pending":
+        transport.lose_offer_ack = True
+        with pytest.raises(RecoveryRequired):
+            miner.run_once()
+    else:
+        if prior == "refused":
+            transport.offer_refusal_reason = "window_closed"
+        assert miner.run_once() is False
+        if prior == "poisoned":
+            transport.advertise_offer_idempotency = False
+            with pytest.raises(RecoveryRequired):
+                miner.run_once()
+    journal = next(tmp_path.rglob("offers.json"))
+    before = journal.read_bytes()
+    transport.calls.clear()
+    restarted = MinerSkeleton(miner.client, replace(miner.config, offer_window=False), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="offer-window mode"):
+        restarted.run_once()
+    assert journal.read_bytes() == before
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_new_window_fence_survives_restart_and_queue_omission(tmp_path, interrupted):
+    transport, miner = window_miner(tmp_path)
+    assert miner.run_once() is False
+    transport.jobs[0]["offer_window_id"] = "d" * 32
+    transport.queue_response = _FakeResponse(200, {
+        "jobs": deepcopy(transport.jobs),
+        "offer_idempotency": {
+            "protocol": "ormas-offer-request-v1",
+            "authority_epoch": transport.offer_authority_epoch,
+        },
+    })
+
+    def decline(_entry):
+        if interrupted:
+            raise RuntimeError("synthetic pricing failure")
+        return None
+
+    miner.config.offer_fn = decline
+    if interrupted:
+        with pytest.raises(RuntimeError, match="synthetic pricing failure"):
+            miner.run_once()
+    else:
+        # Do not withdraw the old bid: it was awarded before this page arrived.
+        transport.bids["bid_1"].update(status="awarded", award_id="awd_1")
+        assert miner.run_once() is False
+
+    transport.set_award("bid_1")
+    transport.queue_response = _FakeResponse(200, {
+        "jobs": [],
+        "offer_idempotency": {
+            "protocol": "ormas-offer-request-v1",
+            "authority_epoch": transport.offer_authority_epoch,
+        },
+    })
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="superseded offer generation"):
+        restarted.run_once()
+    assert len(offers(transport)) == 1
+    assert transport.source.completed is None
+
+
+def test_queue_cannot_return_to_a_previously_observed_window(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    assert miner.run_once() is False
+    old_window = transport.jobs[0]["offer_window_id"]
+    transport.jobs[0]["offer_window_id"] = "d" * 32
+    miner.config.offer_fn = lambda _: None
+    assert miner.run_once() is False
+    transport.jobs[0]["offer_window_id"] = old_window
+    transport.calls.clear()
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="offer window rollback"):
+        restarted.run_once()
+    assert offers(transport) == claims(transport) == []
+
+
+def test_old_pending_ack_cannot_be_promoted_after_new_window_pricing_failure(tmp_path):
+    transport, miner = window_miner(tmp_path)
+    transport.lose_offer_ack = True
+    with pytest.raises(RecoveryRequired):
+        miner.run_once()
+    transport.jobs[0]["offer_window_id"] = "d" * 32
+
+    def fail_pricing(_entry):
+        raise RuntimeError("synthetic pricing failure")
+
+    miner.config.offer_fn = fail_pricing
+    with pytest.raises(RuntimeError, match="synthetic pricing failure"):
+        miner.run_once()
+    transport.set_award("bid_1")
+    transport.jobs = []
+    restarted = MinerSkeleton(miner.client, replace(miner.config), miner.solve_fn)
+    with pytest.raises(RecoveryRequired, match="superseded offer generation|unknown own award"):
+        restarted.run_once()
+    state = json.loads(next(tmp_path.rglob("offers.json")).read_text())
+    assert state["current"] == {}
+    assert "bid_1" in state["bids"]
+    assert transport.source.completed is None
+
+
+def test_window_transition_must_be_durable_before_pricing_or_claim(tmp_path, monkeypatch):
+    transport, miner = window_miner(tmp_path)
+    assert miner.run_once() is False
+    journal = next(tmp_path.rglob("offers.json"))
+    before = journal.read_bytes()
+    transport.jobs[0]["offer_window_id"] = "d" * 32
+    transport.calls.clear()
+    miner.config.offer_fn = lambda _: pytest.fail("pricing preceded durable window history")
+
+    def fail_save(_state):
+        raise OSError("synthetic journal failure")
+
+    monkeypatch.setattr(miner, "_save_offers", fail_save)
+    with pytest.raises(OSError, match="synthetic journal failure"):
+        miner.run_once()
+    assert journal.read_bytes() == before
+    assert offers(transport) == claims(transport) == []
 
 
 @pytest.mark.parametrize("capability", [
@@ -1811,3 +1957,4 @@ def test_saved_award_mismatch_refuses_before_claim(tmp_path, status):
         miner.run_once()
     assert offers(transport) == claims(transport) == []
     assert transport.source.completed is None
+

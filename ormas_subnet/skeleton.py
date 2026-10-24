@@ -993,6 +993,15 @@ class MinerSkeleton:
                 return self._claim_offer_window()
             except _ClaimIdentityError as exc:
                 raise RecoveryRequired("lease award task identity mismatch") from exc
+        if self._public_recovery is not None:
+            state = self._offer_state()
+            if (state["pending"] is not None or state["bids"]
+                    or state["offer_protocol_floor"] is not None
+                    or state["offer_protocol_poisoned"]
+                    or state["offer_authority_epoch"] is not None):
+                raise RecoveryRequired(
+                    "saved offers require offer-window mode; reconcile before changing claim mode",
+                )
         offer_fn = self.config.offer_fn
         if offer_fn is not None and not self._queue_unsupported:
             try:
@@ -1023,6 +1032,7 @@ class MinerSkeleton:
             "offer_authority_epoch": None,
             "request_outcomes": {},
             "window_markers": {},
+            "offer_window_history": {},
         }
 
     @staticmethod
@@ -1072,6 +1082,7 @@ class MinerSkeleton:
             state.setdefault("offer_authority_epoch", None)
             state.setdefault("request_outcomes", {})
             state.setdefault("window_markers", {})
+            state.setdefault("offer_window_history", {})
             if (state["offer_protocol_floor"] not in {None, _OFFER_IDEMPOTENCY_PROTOCOL}
                     or type(state["offer_protocol_poisoned"]) is not bool
                     or (state["offer_authority_epoch"] is not None
@@ -1079,10 +1090,20 @@ class MinerSkeleton:
                             state["offer_authority_epoch"],
                         ) != state["offer_authority_epoch"])
                     or not isinstance(state["request_outcomes"], dict)
-                    or not isinstance(state["window_markers"], dict)):
+                    or not isinstance(state["window_markers"], dict)
+                    or not isinstance(state["offer_window_history"], dict)):
                 raise ValueError("invalid offer protocol state")
             has_v2_evidence = False
             evidence_epochs: set[str] = set()
+            for job_id, windows in state["offer_window_history"].items():
+                if (not isinstance(job_id, str) or not job_id
+                        or not isinstance(windows, list) or not windows):
+                    raise ValueError("invalid offer window history")
+                for window_id in windows:
+                    _validate_offer_window_id(window_id)
+                if len(set(windows)) != len(windows):
+                    raise ValueError("invalid offer window history")
+                has_v2_evidence = True
             for bid_id, bid in state["bids"].items():
                 if not isinstance(bid_id, str) or not bid_id:
                     raise ValueError("invalid bid identity")
@@ -1162,6 +1183,8 @@ class MinerSkeleton:
                     migrated = True
                 elif pinned_epoch != evidence_epoch:
                     raise ValueError("offer authority epoch does not match journal evidence")
+            if state["offer_window_history"] and pinned_epoch is None:
+                raise ValueError("offer window history has no authority epoch")
             if has_v2_evidence and state["offer_protocol_floor"] is None:
                 # Read-compatible migration for a request-ID journal written by
                 # a prerelease candidate.
@@ -1409,6 +1432,39 @@ class MinerSkeleton:
         recovered = {terms["job_id"]} if generation_is_current else set()
         return recovered, legacy
 
+    def _remember_offer_windows(
+        self, state: dict[str, Any],
+        observed: Mapping[str, tuple[str | None, str]],
+    ) -> dict[str, tuple[str, str]]:
+        """Fence retired windows durably, even when pricing declines or crashes."""
+        history = {job_id: list(windows)
+                   for job_id, windows in state["offer_window_history"].items()}
+        for job_id, (_, window_id) in observed.items():
+            windows = history.setdefault(job_id, [])
+            if windows and window_id != windows[-1] and window_id in windows:
+                raise RecoveryRequired("queue offer window rollback; reconcile saved offers")
+            if not windows:
+                # Upgrade old journals without guessing an order between their
+                # historical bids. Only this queue row identifies the current
+                # window; all other saved request windows are retired.
+                prior = {bid["offer_window_id"] for bid in state["bids"].values()
+                         if bid.get("offer_request_id") is not None
+                         and bid["terms"]["job_id"] == job_id
+                         and bid["offer_window_id"] != window_id}
+                pending = state["pending"]
+                if (isinstance(pending, dict) and pending.get("version") == 2
+                        and pending["terms"]["job_id"] == job_id
+                        and pending["offer_window_id"] != window_id):
+                    prior.add(pending["offer_window_id"])
+                windows.extend(sorted(prior))
+            if not windows or window_id != windows[-1]:
+                windows.append(window_id)
+        if history != state["offer_window_history"]:
+            state["offer_window_history"] = history
+            self._save_offers(state)
+        return {job_id: (state["offer_authority_epoch"], windows[-1])
+                for job_id, windows in history.items()}
+
     @staticmethod
     def _offer_conflict(exc: OrmasGatewayError, message: str) -> bool:
         return (exc.status_code == 409
@@ -1520,6 +1576,8 @@ class MinerSkeleton:
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
         authority_epoch = self._offer_authority_epoch(queue)
         self._bind_offer_protocol(state, authority_epoch)
+        if authority_epoch is None:
+            raise RecoveryRequired("gateway has no usable offer idempotency capability")
         rows = queue.get("jobs", [])
         observed_generations: dict[str, tuple[str | None, str]] = {}
         for entry in rows:
@@ -1530,8 +1588,9 @@ class MinerSkeleton:
             if prior is not None and prior != generation:
                 raise RecoveryRequired("queue contains conflicting offer generations")
             observed_generations[job_id] = generation
+        known_generations = self._remember_offer_windows(state, observed_generations)
         recovered_jobs, legacy_offers = self._recover_pending_offer(
-            state, authority_epoch, observed_generations,
+            state, authority_epoch, known_generations,
         )
         missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
         for entry in rows:
@@ -1643,7 +1702,7 @@ class MinerSkeleton:
         claimed = self.client.claim_task(self.config.runner_id, offers=[])
         if claimed is not None:
             return self._check_offer_lease(
-                state, claimed, observed_generations=observed_generations,
+                state, claimed, observed_generations=known_generations,
             )
         if missing_pricing:
             raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
@@ -1651,7 +1710,7 @@ class MinerSkeleton:
             claimed = self.client.claim_task(self.config.runner_id, offers=legacy_offers)
             return self._check_offer_lease(
                 state, claimed, legacy_offers,
-                observed_generations=observed_generations,
+                observed_generations=known_generations,
             )
         return None
 
@@ -2212,3 +2271,4 @@ class MinerSkeleton:
                 self._consecutive_claim_refusals = 0
             if not did_work:
                 idle_sleep(interval)
+
