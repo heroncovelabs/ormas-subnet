@@ -211,6 +211,11 @@ returns 404 without `error.type`, and the skeleton falls back to `ask_usd`. See
 [Protocol](docs/protocol.md) for the exact queue, claim and settlement fields.
 
 ## Release gaps
+
+Checksums for the separate `ormas.ai` client installer are published through
+this repository as an independent trust channel. Verify that installer before
+execution using [`docs/CLIENT_INSTALLER_CHECKSUMS.md`](docs/CLIENT_INSTALLER_CHECKSUMS.md).
+
 - **Unified validator installation is still release work.** This package ships
   task checking. The combined checker/chain service kit and live public-profile
   qualification must be proved separately. Task decisions use Ed25519; the chain
