@@ -249,6 +249,23 @@ def test_doctor_states(gateway, capsys, changes, expected, code):
     assert _redacted(output.out + output.err)
 
 
+@pytest.mark.parametrize("reason", [
+    "binding_mismatch", "relay_policy_required", "relay_policy_mismatch",
+    "miner_slot_inactive", "protected_release_unproven", "other",
+])
+@pytest.mark.parametrize("resolved,level,code", [(False, "fail", 1), (True, "warn", 0)])
+def test_doctor_reports_release_refusal_reason(gateway, capsys, reason, resolved, level, code):
+    gateway[0]["last_refusal"] = {"reason": reason, "at": STAMP}
+    if resolved:
+        gateway[0]["last_release"]["at"] = "2026-10-10T01:00:01+00:00"
+    assert _call(["doctor", "--protected"]) == code
+    output = capsys.readouterr()
+    assert f"{level} key-release: {reason} {STAMP}" in output.out.splitlines()
+    assert "invalid gateway response" not in output.out
+    assert output.err == ""
+    assert _redacted(output.out + output.err)
+
+
 @pytest.mark.parametrize("status", [401, 404, 500])
 def test_doctor_lookup_refusals_redacted(gateway, capsys, status):
     gateway[1].update(status=status, body={"error": {"type": "not_found_error", "message": TOKEN}})

@@ -384,10 +384,13 @@ def _protected_env(args: argparse.Namespace) -> int:
 
 
 # Public counterpart of protected_health's fixed refusal vocabulary; never echo error text.
+# The gateway's "other" fallback is accepted separately below, not a stable audit reason.
 _RELEASE_REFUSALS = frozenset({
     "challenge_unknown", "release_consumed", "challenge_expired", "verifier_error",
-    "collateral_unavailable", "attestation_refused", "mint_error", "seal_error",
-    "release_error", "audit_write_failed", "worker_digest_mismatch", "worker_policy_required", "other",
+    "collateral_unavailable", "attestation_refused", "binding_mismatch", "mint_error", "seal_error",
+    "release_error", "audit_write_failed", "worker_digest_mismatch", "worker_policy_required",
+    "relay_policy_required", "relay_policy_mismatch",
+    "miner_slot_inactive", "protected_release_unproven",
 })
 _JOB_STATUSES = frozenset({"queued", "offering", "running", "done", "failed", "cancelled", "outcome_unknown", "pending"})
 
@@ -468,7 +471,8 @@ def _doctor_protected(args: argparse.Namespace) -> int:
     elif refusal is None:
         line("ok", "key-release", "no refusal recorded")
     elif (isinstance(refusal, dict) and isinstance(refusal.get("reason"), str)
-          and refusal["reason"] in _RELEASE_REFUSALS and _diagnostic_time(refusal.get("at"))):
+          and (refusal["reason"] in _RELEASE_REFUSALS or refusal["reason"] == "other")
+          and _diagnostic_time(refusal.get("at"))):
         at = _diagnostic_time(refusal["at"])
         resolved = release_at and datetime.fromisoformat(release_at) > datetime.fromisoformat(at)
         line("warn" if resolved else "fail", "key-release", f"{refusal['reason']} {at}")

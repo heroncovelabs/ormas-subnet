@@ -329,9 +329,11 @@ key. Keep the same approved miner name.
 
 ## Costs
 
-You pay Phala's hourly CVM bill and your own model-provider spend. Production
-`tdx.small` was about **$0.058/hour** on 2026-10-08; check Phala's current rate
-before deploying. Include host cost in your firm price or limit-offer economics.
+You pay Phala's hourly CVM bill and your own model-provider spend. The
+`tdx.large` used by this guide was estimated at about **$0.2348/hour** in the
+2026-10-14 dstack-0.6.1 test ledger. For comparison, production `tdx.small` was
+about **$0.058/hour** on 2026-10-08. Check Phala's current rate before deploying.
+Include host cost in your firm price or limit-offer economics.
 An accepted firm offer charges its price; an accepted limit offer charges your
 settled price within its limit. You bear costs above the limit and costs of failed
 deliveries. See [Economics](economics.md).
