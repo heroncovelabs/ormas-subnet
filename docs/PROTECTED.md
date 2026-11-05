@@ -143,9 +143,11 @@ ormas-miner protected-env --miner-id '<approved-miner-name>' --runtime productio
   --provider-key-file /private/provider.key --out /private/miner.env
 ```
 
-Use `--relay engy-zdr` for Engy zero-retention models. Repeat `--relay-model` for
-each permitted model; there is no default model ladder. Engy accepts only its
-ZDR-qualified canonical ids. The shell receives
+`--relay engy-zdr` selects the Engy route with data collection denied. In this
+image it does not request zero-data-retention routing; that arrives with the next
+measured image. Repeat `--relay-model` for each permitted model; there is no
+default model ladder. The Engy route accepts only the canonical ids on its
+approved list. The shell receives
 `ORMAS_PROTECTED_RELAY_POLICY_JSON` and either `SAYGM_API_KEY` or `ENGY_API_KEY`;
 the unused key is empty. Neither the policy nor the key enters the worker JSON.
 Without relay flags all three relay fields are empty (CONNECT mode).

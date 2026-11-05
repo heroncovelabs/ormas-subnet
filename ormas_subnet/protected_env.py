@@ -30,7 +30,9 @@ RELAY_KINDS = {
     "saygm-frontier": ("frontier_gateway", "SAYGM_API_KEY"),
     "engy": ("zero_retention", "ENGY_API_KEY"),
 }
-# EngyAdapter's ZDR-qualified canonical ids, not a default worker model ladder.
+# EngyAdapter's approved canonical ids, not a default worker model ladder. In
+# this image the engy-zdr route sends data_collection: deny and does not request
+# zero-data-retention routing; that arrives with the next measured image.
 _ENGY_MODELS = frozenset({
     "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "qwen3.8-27b",
     "glm-5.3-flash", "glm-5.2", "glm-5.3", "kimi-k3",
@@ -103,7 +105,7 @@ def relay_policy(provider: str, models, salt: str | None = None) -> tuple[str, s
             or any(not isinstance(m, str) or not _FRONTIER_MODEL.fullmatch(m) for m in models)):
         raise ValueError("relay: model ids must be distinct plain ids")
     if provider == "engy" and any(model not in _ENGY_MODELS for model in models):
-        raise ValueError("relay: model ids must be ZDR-qualified Engy ids")
+        raise ValueError("relay: model ids must be approved Engy canonical ids")
     salt = secrets.token_hex(32) if salt is None else salt
     if not isinstance(salt, str) or not _HEX64.fullmatch(salt):
         raise ValueError("relay: invalid binding salt")
