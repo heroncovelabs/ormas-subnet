@@ -38,7 +38,7 @@ def args(tmp_path):
     key = tmp_path / "saygm.key"
     key.write_text(SAYGM + "\n")
     return [
-        "protected-env", "--api-url", cli.DEFAULT_GATEWAY, "--miner-id", "aegis-atalanta",
+        "protected-env", "--api-url", cli.DEFAULT_GATEWAY, "--miner-id", "example-miner",
         "--runtime", "production", "--cell-bounds", "c=1.00", "--approved-by", "op",
         "--task-cells", "task:code", "--bind-project-id", "proj_test",
         "--worker-image", "example/worker@" + DIGEST, "--worker-env-file", str(worker),
