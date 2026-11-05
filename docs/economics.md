@@ -135,3 +135,61 @@ dispute window; carry-forward aging before a top-up is due; TAO/USD reference so
 and staleness cap; buyback share of earned revenue; foreign-miner policy; KYC tier contents; whether
 the existing 40% per-hotkey weight cap stays alongside proportional weighting and, if so, how its
 shortfall is treated.
+
+## Client rebate weights (planned; not in force)
+
+**Status.** The gateway computes client rebate weights in a dry run and sets none. No client entry
+appears in the vector until the owner records a policy version with an effective time, after counsel
+review and after the consensus test below passes. This page will state that time. Nothing here is an
+offer, forecast or promise of return.
+
+**What it is.** A client who pays for accepted outcome tasks may enroll an SN76 hotkey it registered
+itself. Validators then place a weight on that hotkey, and the network pays the client a rebate on its
+paid work, in SN76 alpha, directly to that hotkey. Ormas never holds, transfers or keeps alpha for a
+client. Alpha is a network token; its dollar value can rise or fall.
+
+**What counts.** Paid, accepted outcome tasks funded by card payments, settled at or after the later of
+the program start and the client's enrollment. An outcome task is a defined task with a verify command,
+offered to competing miners, delivered and independently accepted before it is paid. Fees, unspent
+credit, promotional credit and earlier work never count. A refund or dispute lowers later rebates;
+amounts already paid are not reclaimed.
+
+**The rule.**
+
+1. Each UTC day, a client's target is that day's eligible base times the rate in the published version
+   row.
+2. The rebate never exceeds what the client paid for that work. Delivered rebate is the emission the
+   chain actually paid to the client's hotkey, valued at the on-chain alpha price at the epoch block and
+   the published TAO/USD reference at the epoch time. An epoch without a price counts nothing, and the
+   client's weight is held at zero until it is priced.
+3. Every vote turns the unpaid amount into a weight, over the same horizon used for miners.
+4. Order inside the vector: miner weights first, never reduced; then the Protected bootstrap; then
+   clients, pro rata, inside a combined ceiling of 25% of the vote; the remainder goes to UID 0 and
+   burns. Unpaid amounts stay owed when the ceiling binds.
+5. Eligibility: US clients; sanctions screening at enrollment and before each day's weight; current
+   terms accepted; a verified hotkey registered on SN76 that is not a miner, validator, burn or pool
+   hotkey. The client pays its own registration. A hotkey that earns nothing may be deregistered by the
+   network; it can register again, and amounts owed are kept.
+6. One rule for everyone. If you or an affiliate operates an SN76 miner, you must declare the Client
+   accounts you control. An outcome on a declared account earns the Client rebate only when an
+   independent miner delivers it. When your own or an affiliate's miner delivers it, it earns no Client
+   rebate, and that miner earns only the base miner reward, without any bonus, on spend funded with
+   outside money. Ormas may withhold or cancel rebates obtained through self-dealing, duplicate accounts
+   or other abuse.
+
+Weights and payments to a client hotkey are public on chain, so anyone can estimate a client's rebate.
+
+**For validators: the feed.** Validators that follow the Ormas vector read `GET /v1/sn76/weight-vector`
+with a validator token issued by Ormas. The response is `{as_of, window, weights}`, with weights keyed
+by SS58 hotkey; while live client entries exist it also lists `client_hotkeys`. It carries no amounts,
+tenants or prices. Client hotkeys are ordinary entries: map each to its UID as for miners, send any
+unregistered hotkey's share to UID 0, and burn rather than submit a vector older than five minutes.
+
+**Why consensus decides.** Yuma clips each weight to what validators holding a majority of active stake
+support. A client entry set only by Ormas's validator is dropped: the client receives nothing and
+Ormas's validator trust falls. Validators holding most of the active stake currently reproduce the
+Ormas vector with a lag of up to about two epochs, which is how miner entries reach consensus today.
+The program goes live only when validators whose combined active stake (metagraph `total_stake`: alpha
+stake plus root TAO at the subnet's TAO weight) exceeds half reproduce the non-burn entries of the
+Ormas vector. Identical all-burn rows do not count, since independent burning produces them too. Until
+then client amounts accrue in the dry run and nothing is paid.
