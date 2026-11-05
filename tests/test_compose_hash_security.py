@@ -42,6 +42,18 @@ def test_checked_in_recipe_hashes_remain_admitted() -> None:
         "f36515ef902b61c6f1a682895e6d9489fec1e5ba79a250b8686d08c5f09d03e3",
     ]
     # The release also admits v3/KMS forms and still-deployed rollback recipes.
+    # Admitting another hash requires a reviewed edit of this exact list.
+    assert admitted == [
+        "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805",
+        "23a7c6f213120bfbba885f7f4ef5b714391488cc623fda6995e1776698cb5577",
+        "b1208d4e66db04d27c91fc13b6edb43140fb7f3af414b538c1377fb60b242d03",
+        "1e54e026ec643ee8612648c9222e8f2da2ac56b08571fe57a1bbe12b9b1f04d4",
+        "bad4eafac39cdcbff5ba15e4a6c7a9d457b0fe43f4c8ac1b34d18ae91897fe56",
+        "bfc4c4051be482392e94db121bc3790bde742eaab8afcadefe1ba41bd0ef5252",
+        "f36515ef902b61c6f1a682895e6d9489fec1e5ba79a250b8686d08c5f09d03e3",
+        "dd7c936b1031167de28950904cd55be2564ba43093c93ee19f76c9f01c3e3418",
+        "618ba303cf7c582137c5b85c920a8411774d6ddf594bbc4867f78e3881b271af",
+    ]
     assert set(actual).issubset(admitted)
 
 
