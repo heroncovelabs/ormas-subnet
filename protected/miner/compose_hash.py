@@ -21,7 +21,10 @@ Subcommands:
                 A monolith pin replaces the admitted hash only when the manifest
                 admits no other compose hash carrying a Transition note; otherwise
                 it refuses (--retire-others replaces, dropping those notes). A split
-                pin replaces the previous split hash and keeps the monolith's.
+                pin replaces the previous split hash and keeps the monolith's;
+                --keep-split HASH keeps a still-deployed split hash admitted beside
+                the new one (it must already be admitted with a Transition note).
+                Re-pinning an already admitted split hash is a no-op.
   check         exit 1 unless the manifest admits the recomputed hash
   digests       print the gateway's plugin, egress-list and worker-policy digests;
                 monolith plugin = grok sha256 from pins.env. Split shell plugin =
@@ -32,6 +35,9 @@ Subcommands:
 
 All commands accept --compose FILE (default docker-compose.yml). The selected
 compose's services select the measured env list, not the file's basename.
+Hashing commands accept --dstack 0.6.1 for v3 (manifest_version "3", init_script []).
+The default remains 0.5.x (v2). With v3, --kms-pinned adds the Phala production
+Dstack KMS CA pin that Phala adds when provisioning on production nodes.
 
 Stdlib only.
 """
@@ -72,7 +78,16 @@ SPLIT_ALLOWED_ENVS = [
     "ORMAS_AUTHORIZATION_JSON", "ORMAS_CELL_BOUNDS", "ORMAS_APPROVED_BY",
     "ORMAS_TASK_CELLS", "ORMAS_BIND_PROJECT_ID",
     "MINER_WORKER_IMAGE", "MINER_WORKER_ENV_JSON", "MINER_WORKER_REGISTRY_AUTH",
+    "ORMAS_PROTECTED_RELAY_POLICY_JSON", "SAYGM_API_KEY", "ENGY_API_KEY",
 ]
+# Public DER SPKI (hex), NOT a secret: Phala production Dstack KMS CA, P-256.
+# Verified across production KMS nodes in phala_kms_pinned_compose_2026_10_17.json;
+# changing this pin changes the measured app-compose hash.
+PHALA_PRODUCTION_KMS_CA_SPKI_HEX = (
+    "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42cc"
+    "df8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4ce"
+    "e610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f"
+)
 OVERRIDES = {
     "public_logs": False,
     "public_sysinfo": False,
@@ -93,6 +108,11 @@ _IMAGE_LINE = re.compile(r"^(    image: *)([^\s@]+)@([^\s#]+)( *\n|$)", re.M)
 # shape.  Any intended Compose change therefore needs an explicit code review
 # that updates this allowlist as well as the measured manifest.
 _RECIPE_POLICIES = {
+    # Reviewed relay split: shell-only relay envs, forwarding disabled, and dstack 0.6.x gid.
+    "738e08991c1c8b87ae047af17bf1fa734fa7110ab1f9b2dc0b1a461231bc9f25": {
+        "scratch-init": "ghcr.io/heroncovelabs/ormas-protected-shell",
+        "ormas-shell": "ghcr.io/heroncovelabs/ormas-protected-shell",
+    },
     "2f5119d8aa22ae47606aa448942807d6c1351d22df8f894948f6602d38572255": {
         "scratch-init": "ghcr.io/heroncovelabs/ormas-protected-miner",
         "miner": "ghcr.io/heroncovelabs/ormas-protected-miner",
@@ -168,14 +188,26 @@ def service_images(compose_text: str) -> dict[str, str]:
     return images
 
 
-def _app_compose_from_text(text: str, wrapper_path: Path) -> dict:
+def _app_compose_from_text(text: str, wrapper_path: Path, *,
+                           dstack: str = "0.5.x", kms_pinned: bool = False) -> dict:
+    if dstack not in ("0.5.x", "0.6.1"):
+        raise SystemExit("unsupported dstack version")
+    if kms_pinned and dstack != "0.6.1":
+        raise SystemExit("--kms-pinned requires --dstack 0.6.1")
     wrapper = json.loads(Path(wrapper_path).read_text())
     envs = SPLIT_ALLOWED_ENVS if "ormas-shell" in service_images(text) else ALLOWED_ENVS
-    return dict(wrapper, **OVERRIDES, allowed_envs=envs, docker_compose_file=text)
+    doc = dict(wrapper, **OVERRIDES, allowed_envs=envs, docker_compose_file=text)
+    if dstack == "0.6.1":
+        doc.update(manifest_version="3", init_script=[])
+    if kms_pinned:
+        doc.update(key_provider="kms", key_provider_id=PHALA_PRODUCTION_KMS_CA_SPKI_HEX)
+    return doc
 
 
-def app_compose(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> dict:
-    return _app_compose_from_text(Path(compose_path).read_text(), wrapper_path)
+def app_compose(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER, *,
+                dstack: str = "0.5.x", kms_pinned: bool = False) -> dict:
+    return _app_compose_from_text(Path(compose_path).read_text(), wrapper_path,
+                                  dstack=dstack, kms_pinned=kms_pinned)
 
 
 def _app_compose_hash(doc: dict) -> str:
@@ -185,8 +217,10 @@ def _app_compose_hash(doc: dict) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-def compose_hash(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER) -> str:
-    return _app_compose_hash(app_compose(compose_path, wrapper_path))
+def compose_hash(compose_path: Path = COMPOSE, wrapper_path: Path = WRAPPER, *,
+                 dstack: str = "0.5.x", kms_pinned: bool = False) -> str:
+    return _app_compose_hash(app_compose(compose_path, wrapper_path,
+                                       dstack=dstack, kms_pinned=kms_pinned))
 
 
 def image_digests(compose_text: str) -> dict[str, str]:
@@ -259,7 +293,8 @@ def _transition_note(notes: list[str], digest: str) -> bool:
     return any(note.startswith("Transition") and _names(note, digest) for note in notes)
 
 
-def _replace_split_pins(data: dict, digest: str, keep: str) -> tuple[list[str], list[str]]:
+def _replace_split_pins(data: dict, digest: str, keep: str,
+                        keep_split: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
     """Plan first admission, unchanged pin or replacement from the ORIGINAL manifest."""
     admitted = list(data.get("tdx", {}).get("allowed_compose_hashes_hex", []))
     notes = list(data.get("_notes", []))
@@ -267,22 +302,29 @@ def _replace_split_pins(data: dict, digest: str, keep: str) -> tuple[list[str], 
         raise SystemExit(
             f"pin: monolith compose hash {keep[:8]} is not admitted; "
             "compose/manifest drift: reconcile before pinning the split recipe")
+    for live in keep_split:
+        if live not in admitted or live == keep or not _transition_note(notes, live):
+            raise SystemExit(
+                f"pin: --keep-split {live[:8]} must be an admitted split hash with a Transition note")
     if "image_digests" in data:
-        old = [h for h in admitted if h != keep]
-        if len(old) != 1:
-            raise SystemExit(
-                "pin: split re-pin needs exactly one previous admitted split hash; "
-                f"found {len(old)} other admitted hashes in {admitted}. "
-                "Re-pin is ambiguous: reconcile the manifest (or the stale image_digests) by hand")
-        retired = old[0]
-        if not _transition_note(notes, retired):
-            raise SystemExit(
-                f"pin: previous split hash {retired[:8]} has no Transition note naming it; "
-                "fix the manifest notes before re-pinning the split recipe")
-        if retired == digest:
-            return admitted, notes  # No-op: do not filter the unchanged hash out first.
-        admitted = [digest if h == retired else h for h in admitted]
-        notes = [n for n in notes if not (n.startswith("Transition") and _names(n, retired))]
+        if digest in admitted and _transition_note(notes, digest):
+            return admitted, notes  # Unchanged pin: never re-plan an admitted split hash.
+        old = [h for h in admitted if h != keep and h not in keep_split]
+        if not old and keep_split:
+            admitted.append(digest)  # Every previous split hash stays live: admit beside them.
+        else:
+            if len(old) != 1:
+                raise SystemExit(
+                    "pin: split re-pin needs exactly one previous admitted split hash; "
+                    f"found {len(old)} other admitted hashes in {admitted}. "
+                    "Re-pin is ambiguous: reconcile the manifest (or the stale image_digests) by hand")
+            retired = old[0]
+            if not _transition_note(notes, retired):
+                raise SystemExit(
+                    f"pin: previous split hash {retired[:8]} has no Transition note naming it; "
+                    "fix the manifest notes before re-pinning the split recipe")
+            admitted = [digest if h == retired else h for h in admitted]
+            notes = [n for n in notes if not (n.startswith("Transition") and _names(n, retired))]
     elif digest not in admitted:
         admitted.append(digest)
     if not _transition_note(notes, digest):
@@ -322,14 +364,15 @@ def _pin(args: argparse.Namespace) -> int:
     if PLACEHOLDER in text:
         raise SystemExit("pin: compose still carries the placeholder digest")
     # Compute and validate the proposed state without changing either input file.
-    digest = _app_compose_hash(_app_compose_from_text(text, Path(args.wrapper)))
+    digest = _app_compose_hash(_app_compose_from_text(
+        text, Path(args.wrapper), dstack=args.dstack, kms_pinned=args.kms_pinned))
     manifest_path = Path(args.manifest)
     data = json.loads(manifest_path.read_text())
     primary = "ormas-shell" if "ormas-shell" in pins else "miner"
     split = "ormas-shell" in pins
     current = compose_hash() if split else digest
     if split:
-        admitted, notes = _replace_split_pins(data, digest, current)
+        admitted, notes = _replace_split_pins(data, digest, current, tuple(args.keep_split))
         # Inspect the original image_digests BEFORE recording the new split pins.
         data["image_digests"] = {name: pin.split(":", 1)[1] for name, pin in pins.items()}
     else:
@@ -376,7 +419,8 @@ def _pin(args: argparse.Namespace) -> int:
 
 def _check(args: argparse.Namespace) -> int:
     text = Path(args.compose).read_text()
-    digest = compose_hash(Path(args.compose), Path(args.wrapper))
+    digest = compose_hash(Path(args.compose), Path(args.wrapper),
+                          dstack=args.dstack, kms_pinned=args.kms_pinned)
     if PLACEHOLDER in text:
         print(f"compose not pinned (placeholder image digest); compose hash {digest}")
         return 1
@@ -396,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--compose", default=str(COMPOSE))
         p.add_argument("--wrapper", default=str(WRAPPER))
+        if name != "digests":
+            p.add_argument("--dstack", choices=("0.5.x", "0.6.1"), default="0.5.x",
+                           help="app-compose form: 0.5.x = v2 (default), 0.6.1 = v3")
+            p.add_argument("--kms-pinned", action="store_true",
+                           help="pin the Phala production Dstack KMS CA (requires --dstack 0.6.1)")
         if name in ("pin", "check"):
             p.add_argument("--manifest", default=str(MANIFEST))
         if name == "pin":
@@ -404,14 +453,18 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--expected-mr", default=str(EXPECTED_MR))
             p.add_argument("--retire-others", action="store_true",
                            help="monolith pin may replace hashes named in Transition notes")
+            p.add_argument("--keep-split", action="append", default=[], metavar="HASH",
+                           help="split pin keeps this still-deployed admitted split hash")
         if name == "digests":
             p.add_argument("--write-readme", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "hash":
-        print(compose_hash(Path(args.compose), Path(args.wrapper)))
+        print(compose_hash(Path(args.compose), Path(args.wrapper),
+                           dstack=args.dstack, kms_pinned=args.kms_pinned))
         return 0
     if args.cmd == "app-compose":
-        print(json.dumps(app_compose(Path(args.compose), Path(args.wrapper)), indent=2))
+        print(json.dumps(app_compose(Path(args.compose), Path(args.wrapper),
+                                     dstack=args.dstack, kms_pinned=args.kms_pinned), indent=2))
         return 0
     if args.cmd == "digests":
         try:

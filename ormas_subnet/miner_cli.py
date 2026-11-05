@@ -21,8 +21,9 @@ from ._gateway_url import require_secure_gateway_url
 from ._private_file import read_private_text
 from .client import OrmasGatewayError, OrmasMinerClient, load_token
 from .protected_env import (
-    MINER_ID, SPLIT_ALLOWED_ENVS, WORKER_DIGEST, json_object, parse_worker_env, provider_host,
-    read_input, sealed_json, sealed_text, write_private,
+    MINER_ID, RELAY_KINDS, RELAY_PRESETS, SPLIT_ALLOWED_ENVS, WORKER_DIGEST, json_object,
+    parse_worker_env, provider_host, read_input, read_relay_policy, relay_credential, relay_policy,
+    sealed_json, sealed_text, write_private,
 )
 
 DEFAULT_GATEWAY = "https://api.ormas.ai"
@@ -316,10 +317,37 @@ def _protected_env(args: argparse.Namespace) -> int:
         values["ORMAS_AUTHORIZATION_JSON"] = sealed_json("ORMAS_AUTHORIZATION_JSON", record)
     elif not args.cell_bounds or not args.approved_by:
         raise ValueError("ORMAS_CELL_BOUNDS: supply bounds and --approved-by or --authorization-file")
+    relay = RELAY_PRESETS.get(args.relay) or ("saygm-frontier" if args.relay_policy_file else None)
+    if not relay and (args.relay_model or args.provider_key_file):
+        raise ValueError("ORMAS_PROTECTED_RELAY_POLICY_JSON: --relay-model/--provider-key-file need --relay")
     try:
-        worker = parse_worker_env(read_input(args.worker_env_file, "MINER_WORKER_ENV_JSON"))
+        worker = parse_worker_env(read_input(args.worker_env_file, "MINER_WORKER_ENV_JSON"),
+                                  relay_mode=relay is not None)
     except ValueError:
         raise ValueError("MINER_WORKER_ENV_JSON: invalid worker environment object") from None
+    policy_text = digest = None
+    if relay:
+        # Shell-only: the policy (private model ids + salt) and the provider key
+        # never enter MINER_WORKER_ENV_JSON; the worker reaches inference via the relay.
+        if args.relay_policy_file:
+            if args.relay_model:
+                raise ValueError("ORMAS_PROTECTED_RELAY_POLICY_JSON: use --relay-policy-file OR --relay-model")
+            policy_text, digest = read_relay_policy(
+                read_input(args.relay_policy_file, "ORMAS_PROTECTED_RELAY_POLICY_JSON"))
+            if json_object(policy_text)["provider"] != relay:
+                raise ValueError("ORMAS_PROTECTED_RELAY_POLICY_JSON: policy kind differs from --relay")
+        else:
+            if not args.relay_model:
+                raise ValueError("ORMAS_PROTECTED_RELAY_POLICY_JSON: --relay needs --relay-model (repeatable) "
+                                 "or --relay-policy-file")
+            policy_text, digest = relay_policy(relay, args.relay_model)
+        sealed_json("ORMAS_PROTECTED_RELAY_POLICY_JSON", json_object(policy_text))
+        values["ORMAS_PROTECTED_RELAY_POLICY_JSON"] = policy_text
+        credential_env = RELAY_KINDS[relay][1]
+        if not args.provider_key_file:
+            raise ValueError(f"{credential_env}: relay mode needs --provider-key-file")
+        values[credential_env] = relay_credential(credential_env, read_input(
+            args.provider_key_file, credential_env).removesuffix("\n"))
     values["MINER_WORKER_ENV_JSON"] = sealed_json("MINER_WORKER_ENV_JSON", worker)
     if args.registry_auth_file:
         values["MINER_WORKER_REGISTRY_AUTH"] = sealed_text(
@@ -329,11 +357,17 @@ def _protected_env(args: argparse.Namespace) -> int:
     files = {out: "".join(f"{key}={values[key]}\n" for key in SPLIT_ALLOWED_ENVS)}
     providers = out.parent / "declared-providers.list"
     pricing = out.parent / "pricing.json"
-    if out in (providers, pricing):
+    relay_file, digest_file = out.parent / "relay-policy.json", out.parent / "relay-policy.digest"
+    if out in (providers, pricing, relay_file, digest_file):
         raise ValueError("env output must differ from companion file names")
     files[providers] = "".join(host + "\n" for host in hosts)
     if args.pricing_template:
         files[pricing] = json.dumps({"estimate_usd": "<estimate>", "limit_usd": "<limit>"}, indent=2) + "\n"
+    if policy_text is not None:
+        # Private copy for reuse (--relay-policy-file keeps the approved digest);
+        # the digest alone goes to the operator for slot approval.
+        files[relay_file] = policy_text + "\n"
+        files[digest_file] = digest + "\n"
     if not args.force and any(path.exists() or path.is_symlink() for path in files):
         raise ValueError("output exists; use --force to overwrite")
     try:
@@ -344,14 +378,19 @@ def _protected_env(args: argparse.Namespace) -> int:
         write_private(path, text, force=args.force)
     print(out)
     print(f"{len(SPLIT_ALLOWED_ENVS)} keys")
+    if digest is not None:
+        print(f"relay policy digest {digest}")
     return 0
 
 
 # Public counterpart of protected_health's fixed refusal vocabulary; never echo error text.
+# The gateway's "other" fallback is accepted separately below, not a stable audit reason.
 _RELEASE_REFUSALS = frozenset({
     "challenge_unknown", "release_consumed", "challenge_expired", "verifier_error",
-    "collateral_unavailable", "attestation_refused", "mint_error", "seal_error",
-    "release_error", "audit_write_failed", "worker_digest_mismatch", "worker_policy_required", "other",
+    "collateral_unavailable", "attestation_refused", "binding_mismatch", "mint_error", "seal_error",
+    "release_error", "audit_write_failed", "worker_digest_mismatch", "worker_policy_required",
+    "relay_policy_required", "relay_policy_mismatch",
+    "miner_slot_inactive", "protected_release_unproven",
 })
 _JOB_STATUSES = frozenset({"queued", "offering", "running", "done", "failed", "cancelled", "outcome_unknown", "pending"})
 
@@ -432,7 +471,8 @@ def _doctor_protected(args: argparse.Namespace) -> int:
     elif refusal is None:
         line("ok", "key-release", "no refusal recorded")
     elif (isinstance(refusal, dict) and isinstance(refusal.get("reason"), str)
-          and refusal["reason"] in _RELEASE_REFUSALS and _diagnostic_time(refusal.get("at"))):
+          and (refusal["reason"] in _RELEASE_REFUSALS or refusal["reason"] == "other")
+          and _diagnostic_time(refusal.get("at"))):
         at = _diagnostic_time(refusal["at"])
         resolved = release_at and datetime.fromisoformat(release_at) > datetime.fromisoformat(at)
         line("warn" if resolved else "fail", "key-release", f"{refusal['reason']} {at}")
@@ -531,6 +571,12 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--registry-auth-file", help="Optional private registry authentication file")
             sub.add_argument("--provider", action="append", default=[], help="Declared provider DNS host; repeatable")
             sub.add_argument("--pricing-template", action="store_true", help="Write pricing.json placeholders beside env")
+            sub.add_argument("--relay", choices=sorted(RELAY_PRESETS),
+                             help="Seal an inference relay policy for the shell (relay slot)")
+            sub.add_argument("--relay-model", action="append", default=[],
+                             help="Permitted provider model id; repeatable; required with --relay unless --relay-policy-file")
+            sub.add_argument("--relay-policy-file", help="Reuse a saved relay-policy.json (same digest)")
+            sub.add_argument("--provider-key-file", help="Private file holding the relay's provider key")
             sub.add_argument("--out", required=True, help="Sealed env output path (mode 0600)")
             sub.add_argument("--force", action="store_true", help="Replace env and companion output files")
             return _protected_env(sub.parse_args(argv[1:]))

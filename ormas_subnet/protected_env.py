@@ -1,9 +1,11 @@
 """Standalone split sealed-env codecs. No monorepo imports or secret diagnostics."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import socket
 import tempfile
 from pathlib import Path
@@ -17,7 +19,32 @@ SPLIT_ALLOWED_ENVS = (
     "ORMAS_AUTHORIZATION_JSON", "ORMAS_CELL_BOUNDS", "ORMAS_APPROVED_BY",
     "ORMAS_TASK_CELLS", "ORMAS_BIND_PROJECT_ID",
     "MINER_WORKER_IMAGE", "MINER_WORKER_ENV_JSON", "MINER_WORKER_REGISTRY_AUTH",
+    "ORMAS_PROTECTED_RELAY_POLICY_JSON", "SAYGM_API_KEY", "ENGY_API_KEY",
 )
+# Shell-only relay inputs (empty = CONNECT mode). Duplicates of
+# tensorbox_spec/privacy/inference_relay.RelayPolicy, checked by parity tests.
+RELAY_POLICY_SCHEMA = "ormas.protected-inference-relay-policy.v1"
+_RELAY_DIGEST_DOMAIN = b"ormas.protected-inference-relay-policy.v1\x00"
+RELAY_PRESETS = {"saygm-frontier": "saygm-frontier", "engy-zdr": "engy"}
+RELAY_KINDS = {
+    "saygm-frontier": ("frontier_gateway", "SAYGM_API_KEY"),
+    "engy": ("zero_retention", "ENGY_API_KEY"),
+}
+# EngyAdapter's approved canonical ids, not a default worker model ladder. In
+# this image the engy-zdr route sends data_collection: deny and does not request
+# zero-data-retention routing; that arrives with the next measured image.
+_ENGY_MODELS = frozenset({
+    "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "qwen3.8-27b",
+    "glm-5.3-flash", "glm-5.2", "glm-5.3", "kimi-k3",
+})
+_FRONTIER_MODEL = re.compile(r"[a-z0-9][a-z0-9.\-]*")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_CREDENTIAL = re.compile(r"[\x21-\x7e]+")
+_RELAY_BLOCKED_PARTS = frozenset((
+    "KEY", "KEYS", "TOKEN", "TOKENS", "SECRET", "SECRETS", "PASSWORD", "CREDENTIAL",
+    "CREDENTIALS", "AUTH", "AUTHORIZATION", "BEARER", "COOKIE", "SESSION",
+    "BASE", "URL", "URI", "ENDPOINT", "HOST", "PROXY", "ORG", "ORGANIZATION", "PROJECT",
+))
 _ENV_KEY = re.compile(r"[A-Z][A-Z0-9_]*")
 _PROXY_KEYS = frozenset(("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY"))
 WORKER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -44,7 +71,7 @@ def json_object(text):
     return result
 
 
-def parse_worker_env(text) -> dict[str, str]:
+def parse_worker_env(text, *, relay_mode: bool = False) -> dict[str, str]:
     """Same admission rules as worker_contract.parse_worker_env; values never echoed."""
     environment = json_object(text)
     for key, value in environment.items():
@@ -52,6 +79,8 @@ def parse_worker_env(text) -> dict[str, str]:
             raise ValueError("Invalid worker environment key")
         if key in _PROXY_KEYS or key.startswith(("ORMAS_", "MINER_WORKER_")):
             raise ValueError("Reserved worker environment key")
+        if relay_mode and _RELAY_BLOCKED_PARTS.intersection(key.split("_")):
+            raise ValueError("Provider credential or routing key in relay mode")
         if not isinstance(value, str):
             raise ValueError("Worker environment values must be strings")
         if "\x00" in value:
@@ -61,6 +90,48 @@ def parse_worker_env(text) -> dict[str, str]:
         except UnicodeError:
             raise ValueError("Worker environment value is not UTF-8") from None
     return environment
+
+
+def relay_policy(provider: str, models, salt: str | None = None) -> tuple[str, str]:
+    """(canonical policy JSON, policy digest) for a slot's private relay policy.
+
+    The JSON carries the private model ids and binding salt and goes to the
+    shell only; the digest is what the operator approves on the slot.
+    """
+    if provider not in RELAY_KINDS:
+        raise ValueError("relay: unsupported relay policy kind")
+    models = list(models)
+    if (not models or len(set(models)) != len(models)
+            or any(not isinstance(m, str) or not _FRONTIER_MODEL.fullmatch(m) for m in models)):
+        raise ValueError("relay: model ids must be distinct plain ids")
+    if provider == "engy" and any(model not in _ENGY_MODELS for model in models):
+        raise ValueError("relay: model ids must be approved Engy canonical ids")
+    salt = secrets.token_hex(32) if salt is None else salt
+    if not isinstance(salt, str) or not _HEX64.fullmatch(salt):
+        raise ValueError("relay: invalid binding salt")
+    canonical = json.dumps({
+        "schema": RELAY_POLICY_SCHEMA, "provider": provider,
+        "privacy_class": RELAY_KINDS[provider][0], "models": sorted(models), "binding_salt": salt,
+    }, sort_keys=True, separators=(",", ":"))
+    return canonical, hashlib.sha256(_RELAY_DIGEST_DOMAIN + canonical.encode("utf-8")).hexdigest()
+
+
+def read_relay_policy(text: str) -> tuple[str, str]:
+    """Re-canonicalize a saved policy so its digest (and slot approval) stays stable."""
+    data = json_object(text)
+    if set(data) != {"schema", "provider", "privacy_class", "models", "binding_salt"} or (
+            data["schema"] != RELAY_POLICY_SCHEMA or data["provider"] not in RELAY_KINDS
+            or data["privacy_class"] != RELAY_KINDS[data["provider"]][0]
+            or not isinstance(data["models"], list)):
+        raise ValueError("relay: invalid relay policy file")
+    return relay_policy(data["provider"], data["models"], data["binding_salt"])
+
+
+def relay_credential(key: str, value: str) -> str:
+    sealed_text(key, value)
+    if not _CREDENTIAL.fullmatch(value):
+        raise ValueError(f"{key}: invalid provider credential")
+    return value
 
 
 def sealed_text(key: str, value: str) -> str:
