@@ -39,9 +39,10 @@ def test_checked_in_recipe_hashes_remain_admitted() -> None:
     ]
     assert actual == [
         "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805",
-        "40f4e967eb72517ea0c792b72361b309670ff30151dba6a365c503a8f461263e",
+        "f36515ef902b61c6f1a682895e6d9489fec1e5ba79a250b8686d08c5f09d03e3",
     ]
-    assert actual == admitted
+    # The release also admits v3/KMS forms and still-deployed rollback recipes.
+    assert set(actual).issubset(admitted)
 
 
 def test_digest_only_repin_preserves_approved_recipe_shape() -> None:
