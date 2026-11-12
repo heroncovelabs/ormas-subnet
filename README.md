@@ -221,7 +221,9 @@ execution using [`docs/CLIENT_INSTALLER_CHECKSUMS.md`](docs/CLIENT_INSTALLER_CHE
   qualification must be proved separately. Task decisions use Ed25519; the chain
   wallet is a separate identity and is never passed into the task checker. The
   existing weight service relays a gateway-computed vector; packaging it with
-  checking does not create independent reward calculation.
+  checking does not create independent reward calculation. Client rebate
+  entries, when the program is in force, arrive in the same vector; see
+  [Client rebate weights](docs/economics.md#client-rebate-weights-planned-not-in-force).
 
 ## Other gateways
 
