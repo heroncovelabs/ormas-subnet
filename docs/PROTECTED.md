@@ -325,9 +325,9 @@ env path for an existing monolith):
 phala envs update --cvm-id '<your-cvm-id>' -e /private/miner.env
 ```
 
-Re-send every key in the measured order. Runner keys expire after 30 days; mint
-and install a replacement through **Miner → Runner keys**, then revoke the old
-key. Keep the same approved miner name.
+Re-send every key in the measured order. Runner keys do not expire; revoke a key
+to stop it. A new key cannot take over an existing miner name: to change the key
+on an existing miner, write to ops@ormas.ai.
 
 ## Costs
 
