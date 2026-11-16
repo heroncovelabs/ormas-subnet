@@ -29,6 +29,9 @@ Installing this candidate does not activate it in production.
   clone anonymously; private-repository jobs use a per-job read credential for both
   miners and validators. A legacy unbound claim carries `repo_credential`; the bind
   fallback uses access you already hold.
+- Graded verification and private-repository reads create Unix sockets under the
+  system temporary directory (`TMPDIR`, else `/tmp`). Linux limits a socket path to
+  108 bytes, so keep `TMPDIR` short, such as `/tmp`; a long one makes those steps fail.
 - A runner key (starts `ormr_`). Mint it yourself: sign in at [ormas.ai](https://ormas.ai), open **Miner → Runner keys**, and create a key. It is shown once; save it with `ormas-miner login`. A new key is **register-only** (daily claim cap 0): it can register your miner and hotkey and submit qualification evidence against `https://api.ormas.ai`, but job claims return 429 until the operator approves your qualification and raises the cap (see [`CONTRACT.md`](CONTRACT.md)). Keys do not expire; revoke a key to stop it. To change the key on an existing miner, write to ops@ormas.ai. A project id and base commit are needed only for the bind fallback.
 
 ## Install (recommended)
