@@ -25,17 +25,29 @@ SPLIT_ALLOWED_ENVS = (
 # tensorbox_spec/privacy/inference_relay.RelayPolicy, checked by parity tests.
 RELAY_POLICY_SCHEMA = "ormas.protected-inference-relay-policy.v1"
 _RELAY_DIGEST_DOMAIN = b"ormas.protected-inference-relay-policy.v1\x00"
-RELAY_PRESETS = {"saygm-frontier": "saygm-frontier", "engy-zdr": "engy"}
+RELAY_PRESETS = {
+    "saygm-frontier": "saygm-frontier", "engy-frontier": "engy", "engy-zdr": "engy-zdr",
+}
 RELAY_KINDS = {
     "saygm-frontier": ("frontier_gateway", "SAYGM_API_KEY"),
-    "engy": ("zero_retention", "ENGY_API_KEY"),
+    "engy": ("frontier_gateway", "ENGY_API_KEY"),
+    "engy-zdr": ("zero_retention", "ENGY_API_KEY"),
 }
-# EngyAdapter's approved canonical ids, not a default worker model ladder. In
-# this image the engy-zdr route sends data_collection: deny and does not request
-# zero-data-retention routing; that arrives with the next measured image.
+# Wire-neutral metadata, mirroring the private adapters' endpoint-name allowlists.
+# No endpoint field is serialized; unknown policy kinds/adapter labels are not admitted.
+RELAY_ENDPOINTS = {
+    "saygm-frontier": frozenset({"chat_completions", "messages", "responses"}),
+    "engy": frozenset({"chat_completions", "messages"}),
+    "engy-zdr": frozenset({"chat_completions"}),
+}
+# EngyAdapter's approved frontier ids, not a default worker model ladder or ZDR claim.
 _ENGY_MODELS = frozenset({
     "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "qwen3.8-27b",
-    "glm-5.3-flash", "glm-5.2", "glm-5.3", "kimi-k3",
+    "glm-5.3-flash", "glm-5.2", "glm-5.3", "kimi-k3", "kimi-k3.1-pro",
+})
+# Separate ZDR approval identity; only the four authorized/probed ids.
+_ENGY_ZDR_MODELS = frozenset({
+    "kimi-k3.1-pro", "glm-5.3", "deepseek-v4.1-flash", "qwen3.8-27b",
 })
 _FRONTIER_MODEL = re.compile(r"[a-z0-9][a-z0-9.\-]*")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -106,6 +118,8 @@ def relay_policy(provider: str, models, salt: str | None = None) -> tuple[str, s
         raise ValueError("relay: model ids must be distinct plain ids")
     if provider == "engy" and any(model not in _ENGY_MODELS for model in models):
         raise ValueError("relay: model ids must be approved Engy canonical ids")
+    if provider == "engy-zdr" and any(model not in _ENGY_ZDR_MODELS for model in models):
+        raise ValueError("relay: model ids must be approved Engy ZDR canonical ids")
     salt = secrets.token_hex(32) if salt is None else salt
     if not isinstance(salt, str) or not _HEX64.fullmatch(salt):
         raise ValueError("relay: invalid binding salt")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -35,78 +36,8 @@ class RuntimeRefusal(Exception):
     pass
 
 
-# These two historical acceptance cards delegated the verdict to pytest in the
-# candidate container.  A candidate import could call os._exit(0) before the
-# required assertions ran, and each card treated that status as acceptance.
-# PR #37 changed their docstrings only, so both byte identities for each card
-# remain revoked as immutable audit evidence.
-REVOKED_ACCEPTANCE_DRIVER_SHA256 = frozenset({
-    # claim_refusal_backoff_external.py: original, then PR #37 docstring variant
-    '545411aeba3d5ac8db574a733ed7d2cf21bec012b19a73a8de5c6a6cbbe6f442',
-    'e032021de2cda990e4a8656376932efd2c9e48c565aab8a008688a9acb2f2b88',
-    # validator_list_only_external.py: original, then PR #37 docstring variant
-    'af06a6db0a155f703848d916f2fef53c22fec1ac2b3147fd5f1bf438744d404a',
-    '36e853b3f76fbc41550404d731564091a7659d1a98f2d6871a30fc46a043b361',
-})
-
-
-_SYSTEM_EXECUTABLE_DIRS = (Path('/usr/bin'), Path('/bin'), Path('/usr/local/bin'))
-
-
-def _path_lineage(path):
-    while True:
-        yield path
-        if path.parent == path:
-            return
-        path = path.parent
-
-
-def _service_can_write(path):
-    try:
-        info = path.stat()
-    except OSError:
-        return True
-    groups = {os.getegid(), *os.getgroups()}
-    if info.st_uid == os.geteuid():
-        mode_write = info.st_mode & stat.S_IWUSR
-    elif info.st_gid in groups:
-        mode_write = info.st_mode & stat.S_IWGRP
-    else:
-        mode_write = info.st_mode & stat.S_IWOTH
-    if mode_write:
-        return True
-    try:
-        return os.access(path, os.W_OK, effective_ids=True)
-    except (NotImplementedError, TypeError):
-        return os.access(path, os.W_OK)
-
-
-def _trusted_executable(name):
-    """Resolve a host tool from fixed system paths that this UID cannot replace."""
-    if name not in {'git', 'docker'}:
-        raise RuntimeRefusal('runtime_executable_unavailable')
-    for directory in _SYSTEM_EXECUTABLE_DIRS:
-        candidate = directory / name
-        try:
-            resolved = candidate.resolve(strict=True)
-            info = resolved.stat()
-        except OSError:
-            continue
-        protected = (*_path_lineage(candidate.parent), *_path_lineage(resolved))
-        if (not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK)
-                or any(_service_can_write(path) for path in protected)):
-            continue
-        return resolved
-    raise RuntimeRefusal('runtime_executable_unavailable')
-
-
-def _host_environment(git, docker):
-    trusted_path = os.pathsep.join(dict.fromkeys((str(Path(git).parent),
-                                                  str(Path(docker).parent))))
-    return {"PATH": trusted_path, "HOME": "/nonexistent", "LANG": "C.UTF-8",
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1"}
+# Rootless daemons may start every container process with umask 0.
+UMASK_ARGV = ['/bin/sh', '-c', 'umask 022 && exec "$@"', 'ormas-umask']
 
 
 # These helpers live in the client-owned driver, never in the candidate. The
@@ -349,13 +280,13 @@ request.end(Buffer.from(cfg.body, "base64"));
 
 _CLEANUP_GUARD = r'''
 import json,os,shutil,subprocess,sys,time
-parent,seconds,scratch,containers,volumes,docker=json.loads(sys.argv[1])
+parent,seconds,scratch,containers,volumes=json.loads(sys.argv[1])
 deadline=time.monotonic()+seconds
 while time.monotonic()<deadline:
     try: os.kill(parent,0)
     except ProcessLookupError: break
     time.sleep(.2)
-for argv in ([docker,'rm','-f',*containers],[docker,'volume','rm',*volumes]):
+for argv in (['docker','rm','-f',*containers],['docker','volume','rm',*volumes]):
     try: subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15)
     except (OSError,subprocess.TimeoutExpired): pass
 if os.path.isdir(scratch):
@@ -365,169 +296,22 @@ if os.path.isdir(scratch):
     shutil.rmtree(scratch,ignore_errors=True)
 '''
 
-# These host-selected wrappers launch the requested process without a shell,
-# capture its untrusted output as data, and report spawn errors separately.
-# They run as container root only long enough to create a child with the
-# candidate uid/gid.  The child has no capabilities and cannot signal or read
-# the privileged parent; no candidate-controlled bytes become wrapper code.
-_PYTHON_CANDIDATE_OBSERVER = r'''
-import base64,json,os,selectors,signal,subprocess,sys,time
-cfg=json.loads(base64.b64decode(sys.argv[1],validate=True))
-proc=None
-output=bytearray()
-result=None
-try:
-    try:
-        identity={'user':cfg['uid'],'group':cfg['gid']}
-        if os.geteuid()==0: identity['extra_groups']=()
-        elif cfg['uid']!=os.geteuid() or cfg['gid']!=os.getegid():
-            raise PermissionError('candidate identity drop unavailable')
-        proc=subprocess.Popen(cfg['argv'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,start_new_session=True,**identity)
-    except OSError:
-        result={'returncode':127,'output':'','spawn_failure':True}
-    if proc is not None:
-        deadline=time.monotonic()+cfg['timeout_s']
-        with selectors.DefaultSelector() as selector:
-            selector.register(proc.stdout,selectors.EVENT_READ)
-            while selector.get_map():
-                remaining=deadline-time.monotonic()
-                if remaining<=0:
-                    result={'error':'candidate_observation_timeout'}
-                    break
-                for key,_ in selector.select(min(.1,remaining)):
-                    block=os.read(key.fileobj.fileno(),65536)
-                    if not block:
-                        selector.unregister(key.fileobj)
-                    elif len(output)+len(block)>cfg['cap']:
-                        result={'error':'candidate_observation_output_limit'}
-                        break
-                    else:
-                        output.extend(block)
-                if result is not None:
-                    break
-        if result is None:
-            try: code=proc.wait(timeout=max(.001,deadline-time.monotonic()))
-            except subprocess.TimeoutExpired: result={'error':'candidate_observation_timeout'}
-            else:
-                if code<0: code=min(255,128-code)
-                result={'returncode':code,'output':base64.b64encode(output).decode(),
-                        'spawn_failure':False}
-finally:
-    if proc is not None and proc.poll() is None:
-        try: os.killpg(proc.pid,signal.SIGKILL)
-        except ProcessLookupError: pass
-        proc.wait()
-    if proc is not None and proc.stdout is not None: proc.stdout.close()
-sys.stdout.write(json.dumps(result,separators=(',',':')))
-'''
-
-_NODE_CANDIDATE_OBSERVER = r'''
-const crypto=require('node:crypto');
-const fs=require('node:fs');
-const signalNumbers=require('node:os').constants.signals;
-const {spawnSync}=require('node:child_process');
-const cfg=JSON.parse(Buffer.from(process.argv[1],'base64').toString('utf8'));
-if(process.getuid()===0) process.setgroups([]);
-else if(cfg.uid!==process.getuid()||cfg.gid!==process.getgid()) throw new Error('candidate identity drop unavailable');
-const nonce=crypto.randomBytes(32).toString('hex');
-fs.writeSync(1,'\0ormas-observe-v1:'+nonce+'\0');
-const value=spawnSync(cfg.argv[0],cfg.argv.slice(1),{
-  env:process.env,stdio:['ignore',1,1],
-  timeout:cfg.timeout_s*1000,killSignal:'SIGKILL',
-  uid:cfg.uid,gid:cfg.gid
-});
-let code=125,spawnFailure=false,error='';
-if(value.error){
-  if(['ENOENT','EACCES','ENOEXEC'].includes(value.error.code))
-    {code=127;spawnFailure=true;}
-  else if(value.error.code==='ETIMEDOUT') error='candidate_observation_timeout';
-  else error='candidate_observation_failed';
-}else if(Number.isInteger(value.status)) code=value.status;
-else if(signalNumbers[value.signal]) code=Math.min(255,128+signalNumbers[value.signal]);
-fs.writeSync(1,'\0ormas-observe-v1:'+nonce+':'+code+':'+(spawnFailure?'1':'0')+':'+error+'\0');
-'''
-
-_CANDIDATE_OBSERVER_RUNTIMES = {
-    'linux-python-stdlib-v1': '/usr/local/bin/python3',
-    'linux-python-pytest-v1': '/usr/local/bin/python3',
-    'linux-node-test-v1': '/usr/local/bin/node',
-    'linux-node-browser-v1': '/usr/bin/node',
-    'linux-node-browser-http-v1': '/usr/bin/node',
-}
+# A candidate call whose process spawn failed (a program the image does not
+# provide, or an OS refusal) shows pytest's failing frame inside the standard
+# library's subprocess.py raising the OSError. The error type is tied to that
+# frame: in the long/auto/line tracebacks it follows the frame on the same
+# line, in the short traceback its ``E`` line follows the frame's source. A
+# test that itself raises FileNotFoundError on a data file, or a
+# CalledProcessError beside another test's unrelated OSError, is a plain red.
+_SPAWN_TYPES = rb'(?:FileNotFoundError|PermissionError|BlockingIOError|ProcessLookupError|OSError)\b'
+_SPAWN = re.compile(
+    rb'^\S*/python3\.\d+/subprocess\.py:\d+: (?:' + _SPAWN_TYPES
+    + rb'|in \w+\n(?:[ \t].*\n|\n)*?E\s+' + _SPAWN_TYPES + rb')', re.M)
 
 
-def _candidate_observer_wrapper(profile_id, argument):
-    runtime = _CANDIDATE_OBSERVER_RUNTIMES.get(profile_id)
-    if runtime is None:
-        raise RuntimeRefusal('unsupported_candidate_observer_runtime')
-    if profile_id.startswith('linux-python-'):
-        return [runtime, '-I', '-S', '-c', _PYTHON_CANDIDATE_OBSERVER, argument]
-    return [runtime, '-e', _NODE_CANDIDATE_OBSERVER, argument]
-
-
-def _candidate_observer_result(raw, cap):
-    try:
-        value = json.loads(raw)
-        if isinstance(value, dict) and set(value) == {'error'}:
-            if value['error'] not in {
-                'candidate_observation_timeout',
-                'candidate_observation_output_limit',
-                'candidate_observation_failed',
-            }:
-                raise ValueError
-            raise RuntimeRefusal(value['error'])
-        if not isinstance(value, dict) or set(value) != {
-            'returncode', 'output', 'spawn_failure',
-        }:
-            raise ValueError
-        code = value['returncode']
-        if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
-            raise ValueError
-        if not isinstance(value['spawn_failure'], bool) or not isinstance(value['output'], str):
-            raise ValueError
-        output = base64.b64decode(value['output'], validate=True)
-        if len(output) > cap:
-            raise ValueError
-        return code, output, value['spawn_failure']
-    except RuntimeRefusal:
-        raise
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-        raise RuntimeRefusal('candidate_observation_invalid') from None
-
-
-def _node_candidate_observer_result(raw, cap):
-    prefix = b'\0ormas-observe-v1:'
-    if not raw.startswith(prefix):
-        raise RuntimeRefusal('candidate_observation_invalid')
-    header_end = raw.find(b'\0', len(prefix))
-    if header_end < 0:
-        raise RuntimeRefusal('candidate_observation_invalid')
-    nonce = raw[len(prefix):header_end]
-    if re.fullmatch(rb'[0-9a-f]{64}', nonce) is None:
-        raise RuntimeRefusal('candidate_observation_invalid')
-    trailer = prefix + nonce + b':'
-    trailer_start = raw.rfind(trailer, header_end + 1)
-    if trailer_start < 0 or not raw.endswith(b'\0'):
-        raise RuntimeRefusal('candidate_observation_invalid')
-    metadata = raw[trailer_start + len(trailer):-1].split(b':', 2)
-    if len(metadata) != 3:
-        raise RuntimeRefusal('candidate_observation_invalid')
-    try:
-        code = int(metadata[0].decode('ascii'))
-    except (UnicodeError, ValueError):
-        raise RuntimeRefusal('candidate_observation_invalid') from None
-    if not 0 <= code <= 255 or metadata[1] not in {b'0', b'1'}:
-        raise RuntimeRefusal('candidate_observation_invalid')
-    error = metadata[2].decode('ascii', errors='replace')
-    if error:
-        if error not in {'candidate_observation_timeout', 'candidate_observation_failed'}:
-            raise RuntimeRefusal('candidate_observation_invalid')
-        raise RuntimeRefusal(error)
-    output = raw[header_end + 1:trailer_start]
-    if len(output) > cap:
-        raise RuntimeRefusal('candidate_observation_output_limit')
-    return code, output, metadata[1] == b'1'
+def candidate_spawn_failure(output):
+    """True when a failed candidate call's output shows a process spawn that failed."""
+    return bool(_SPAWN.search(output))
 
 
 class CandidateBridge:
@@ -606,11 +390,9 @@ class CandidateBridge:
                         self.used += size
                         self.http_observations += 1
                     else:
-                        code, output, spawn_failure = self.execute(
-                            argv, call_deadline, self.cap - self.used,
-                        )
+                        code, output = self.execute(argv, call_deadline, self.cap - self.used)
                         self.used += len(output)
-                        if spawn_failure:
+                        if code and candidate_spawn_failure(output):
                             self.spawn_failure = True
                         result = {'returncode': code, 'output': base64.b64encode(output).decode()}
                 except Exception as exc:
@@ -710,7 +492,7 @@ def structured_test_argv(cfg, candidate, report_path):
                 raise RuntimeRefusal('test_script_required')
             argv = shlex.split(script)
         argv += extra[1:] if extra[:1] == ['--'] else extra
-    if profile == 'linux-python-pytest-v1' and argv[:3] == ['/work/.venv/bin/python', '-m', 'pytest']:
+    if profile in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'} and argv[:3] == ['/work/.venv/bin/python', '-m', 'pytest']:
         args = argv[3:]
         selectors = []
         i = 0
@@ -807,7 +589,7 @@ def dependency_spec(profile_id, locks):
         if locks:
             raise RuntimeRefusal('unexpected_dependency_locks')
         return [], None
-    if profile_id == 'linux-python-pytest-v1':
+    if profile_id in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}:
         pins = []
         for line in locks['requirements.lock'].decode('utf-8').splitlines():
             if not line.strip() or line.lstrip().startswith('#'):
@@ -856,86 +638,488 @@ def dependency_spec(profile_id, locks):
     return artifacts, clean_manifest
 
 
-def _download(url, destination, *, hosts, deadline, budget, redirects=3):
+# Dependency download resilience. Measured on a Phala TDX CVM (2026-10-11,
+# coordination/protected_u6_live_gates_2026_10_11.md): ~38 downloads, each on a fresh
+# TLS connection, succeeded; the next handshake hung to the 20 s operation timeout,
+# once per run. One kept-alive connection per host removes the ~120 fresh handshakes a
+# 61-pin lock used to open. A request that still fails is retried on a new connection:
+# 3 attempts = the original, a reconnect for the one measured hang, and one more for an
+# independent transient. Every attempt keeps the existing min(20 s, remaining)
+# operation timeout; backoff 1 s then 2 s adds 3 s at most, under one 20 s timeout, and
+# the verification deadline still bounds the whole fetch.
+_DOWNLOAD_TIMEOUT_S = 20
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_DOWNLOAD_TRANSIENT = (OSError, http.client.HTTPException)  # includes timeouts and ssl.SSLError
+
+
+class _TransientDownload(Exception):
+    pass
+
+
+class _DeadlineSocket:
+    """Arm every send and receive with min(20 s, time left) so the verification
+    deadline bounds header and body reads absolutely, not per inactivity gap."""
+
+    def __init__(self, sock):
+        self.sock, self.deadline = sock, None
+        self.readers, self.closing = 0, False
+
+    def arm(self):
+        self.sock.settimeout(min(_DOWNLOAD_TIMEOUT_S, _remaining(self.deadline)))
+
+    def sendall(self, data):
+        self.arm()
+        return self.sock.sendall(data)
+
+    def makefile(self, mode='rb', *args, **kwargs):
+        if mode != 'rb':
+            raise ValueError('unsupported_socket_mode')
+        self.readers += 1
+        return io.BufferedReader(_DeadlineReader(self))
+
+    def close(self):
+        # Like socket.makefile: an open response body keeps the socket readable.
+        self.closing = True
+        if not self.readers:
+            self.sock.close()
+
+    def release(self):
+        self.readers -= 1
+        if self.closing and not self.readers:
+            self.sock.close()
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.owner.arm()
+        return self.owner.sock.recv_into(buffer)
+
+    def close(self):
+        if not self.closed:
+            self.owner.release()
+        super().close()
+
+
+class _DownloadSession:
+    """At most one open connection per host, pinned to an address validated at connect."""
+
+    def __init__(self):
+        self.connections = {}
+
+    def close(self):
+        for connection in self.connections.values():
+            connection.close()
+        self.connections.clear()
+
+    def discard(self, host):
+        connection = self.connections.pop(host, None)
+        if connection is not None:
+            connection.close()
+
+    def connection(self, host, deadline):
+        connection = self.connections.get(host)
+        if connection is not None:
+            return connection
+        timeout = min(_DOWNLOAD_TIMEOUT_S, _remaining(deadline))
+        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        ips = [row[4][0] for row in addresses]
+        if not ips or any(not ipaddress.ip_address(ip).is_global for ip in ips):
+            raise RuntimeRefusal('dependency_download_private_address')
+        raw_socket = socket.create_connection((ips[0], 443), timeout=timeout)
+        try:
+            tls_socket = ssl.create_default_context().wrap_socket(raw_socket, server_hostname=host)
+        except BaseException:
+            raw_socket.close()
+            raise
+        connection = http.client.HTTPSConnection(host, timeout=timeout, context=ssl.create_default_context())
+        connection.sock = _DeadlineSocket(tls_socket)
+        self.connections[host] = connection
+        return connection
+
+
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeRefusal('verification_timeout')
+    return remaining
+
+
+def _download(url, destination, *, hosts, deadline, budget, redirects=3, session=None):
     """HTTPS only; pin validated public IPs to the actual TLS connection.
 
     Ignore proxy/environment configuration. Redirects must satisfy the same host,
     port and address rules. A DNS rebinding cannot change the connected address.
+    Connect, TLS, read and transient HTTP failures retry on a fresh connection and
+    finally refuse as ``dependency_download_unavailable``.
     """
+    if session is None:
+        session = _DownloadSession()
+        try:
+            return _download(url, destination, hosts=hosts, deadline=deadline, budget=budget,
+                             redirects=redirects, session=session)
+        finally:
+            session.close()
     parsed = urlsplit(url)
     if (parsed.scheme != 'https' or parsed.hostname not in hosts or parsed.username or parsed.password
             or parsed.port not in (None, 443) or parsed.fragment):
         raise RuntimeRefusal('dependency_download_destination_refused')
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise RuntimeRefusal('verification_timeout')
-    addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
-    ips = [row[4][0] for row in addresses]
-    if not ips or any(not ipaddress.ip_address(ip).is_global for ip in ips):
-        raise RuntimeRefusal('dependency_download_private_address')
-    connection = http.client.HTTPSConnection(parsed.hostname, timeout=min(20, remaining), context=ssl.create_default_context())
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        _remaining(deadline)
+        try:
+            location = _download_once(parsed, destination, session=session, deadline=deadline, budget=budget)
+        except (_TransientDownload, *_DOWNLOAD_TRANSIENT):
+            session.discard(parsed.hostname)
+            destination.unlink(missing_ok=True)
+            if attempt == _DOWNLOAD_ATTEMPTS:
+                raise RuntimeRefusal('dependency_download_unavailable') from None
+            time.sleep(min(2 ** (attempt - 1), _remaining(deadline)))
+            continue
+        if isinstance(location, int):
+            return location
+        if redirects <= 0 or not location:
+            raise RuntimeRefusal('dependency_download_redirect_refused')
+        return _download(urljoin(url, location), destination, hosts=hosts, deadline=deadline,
+                         budget=budget, redirects=redirects - 1, session=session)
+
+
+def _download_once(parsed, destination, *, session, deadline, budget):
+    """Byte count on 200, the Location string on a redirect; raise otherwise."""
+    connection = session.connection(parsed.hostname, deadline)
+    connection.sock.deadline = deadline
+    connection.request('GET', parsed.path + ('?' + parsed.query if parsed.query else ''),
+                       headers={'User-Agent': 'Ormas-public-runtime/1'})
+    response = connection.getresponse()
+    if response.status in (301, 302, 303, 307, 308):
+        session.discard(parsed.hostname)
+        return response.getheader('Location') or ''
+    if response.status in _DOWNLOAD_RETRY_STATUS:
+        raise _TransientDownload()
+    if response.status != 200:
+        session.discard(parsed.hostname)
+        raise RuntimeRefusal('dependency_download_unavailable')
+    count = 0
+    with destination.open('xb') as stream:
+        while True:
+            _remaining(deadline)
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            count += len(chunk)
+            if count > budget:
+                raise RuntimeRefusal('dependency_download_byte_limit')
+            stream.write(chunk)
+    if response.length:
+        # EOF before the declared Content-Length: a truncated transfer, not a file.
+        raise _TransientDownload()
+    if response.will_close:
+        session.discard(parsed.hostname)
+    return count
+
+
+# Cross-job public-wheel cache. Hosts normally point this at
+# $HOME/.cache/ormas/verifier-packages. Unset or empty keeps the old network path.
+_PACKAGE_CACHE_ENV = 'ORMAS_VERIFIER_PACKAGE_CACHE'
+_PACKAGE_CACHE_MANIFEST = 'wheels.json'
+_PACKAGE_CACHE_UNSET = object()
+
+
+class _CacheInvalid(Exception):
+    pass
+
+
+def _cache_directory(path, *, create):
     try:
-        raw_socket = socket.create_connection((ips[0], 443), timeout=min(20, remaining))
-        tls_socket = ssl.create_default_context().wrap_socket(raw_socket, server_hostname=parsed.hostname)
-        connection.sock = tls_socket
-        connection.request('GET', parsed.path + ('?' + parsed.query if parsed.query else ''), headers={'User-Agent': 'Ormas-public-runtime/1'})
-        response = connection.getresponse()
-        if response.status in (301, 302, 303, 307, 308):
-            if redirects <= 0 or not response.getheader('Location'):
-                raise RuntimeRefusal('dependency_download_redirect_refused')
-            return _download(urljoin(url, response.getheader('Location')), destination, hosts=hosts,
-                             deadline=deadline, budget=budget, redirects=redirects - 1)
-        if response.status != 200:
-            raise RuntimeRefusal('dependency_download_unavailable')
-        count = 0
-        with destination.open('xb') as stream:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeRefusal('verification_timeout')
-                tls_socket.settimeout(min(20, remaining))
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                count += len(chunk)
-                if count > budget:
-                    raise RuntimeRefusal('dependency_download_byte_limit')
-                stream.write(chunk)
+        if create:
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return False
+        if create:
+            path.chmod(0o700)
+            info = path.lstat()
+        return stat.S_IMODE(info.st_mode) == 0o700
+    except OSError:
+        return False
+
+
+def _package_cache_dir(candidate, artifacts, mounted=()):
+    configured = os.environ.get(_PACKAGE_CACHE_ENV)
+    if not configured:
+        return None
+    try:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            return None
+        root = Path(os.path.abspath(str(root)))
+        current = Path(root.anchor)
+        for part in root.parts[1:]:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                return None
+        root = Path(os.path.realpath(str(root)))
+        for job_path in (candidate, artifacts, *mounted):
+            if job_path is None:
+                continue
+            job = Path(os.path.realpath(str(job_path)))
+            if root == job or root in job.parents or job in root.parents:
+                return None
+        return root if _cache_directory(root, create=True) else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _cache_pin_dir(root, pin):
+    key = hashlib.sha256((pin['name'] + '\0' + pin['version']).encode('utf-8')).hexdigest()
+    return root / key
+
+
+def _open_cache_file(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise _CacheInvalid()
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            raise _CacheInvalid()
+        stream = os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+    return stream
+
+
+def _discard_cache_file(path):
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _read_cache_manifest(pin_dir, pin):
+    with _open_cache_file(pin_dir / _PACKAGE_CACHE_MANIFEST) as stream:
+        document = json.load(stream)
+    if (not isinstance(document, dict) or document.get('name') != pin['name']
+            or document.get('version') != pin['version']
+            or not isinstance(document.get('wheels'), list) or not document['wheels']):
+        raise _CacheInvalid()
+    records = []
+    for entry in document['wheels']:
+        if not isinstance(entry, dict):
+            raise _CacheInvalid()
+        name, digest = entry.get('filename'), entry.get('sha256')
+        if (not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.+!-]+\.whl', name)
+                or digest not in pin['hashes'] or name in {record[0] for record in records}):
+            raise _CacheInvalid()
+        records.append((name, digest))
+    return records
+
+
+def _copy_cached_wheel(source, target, digest, budget):
+    temporary = None
+    try:
+        if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            raise _CacheInvalid()
+        with _open_cache_file(source) as stream:
+            if target.exists():
+                output = None
+            else:
+                fd, temporary = tempfile.mkstemp(prefix='.ormas-cache-', dir=target.parent)
+                output = os.fdopen(fd, 'wb')
+            try:
+                hasher, count = hashlib.sha256(), 0
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    if count > budget:
+                        raise _CacheInvalid()
+                    hasher.update(chunk)
+                    if output is not None:
+                        output.write(chunk)
+            finally:
+                if output is not None:
+                    output.close()
+        if hasher.hexdigest() != digest:
+            raise _CacheInvalid()
+        if temporary is not None:
+            os.replace(temporary, target)
+            temporary = None
         return count
-    finally:
-        connection.close()
+    except BaseException:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        raise
 
 
-def fetch_dependencies(cfg, candidate, artifacts, deadline):
+def _restore_cached_wheels(root, pin, artifacts, budget):
+    if root is None:
+        return None
+    pin_dir = _cache_pin_dir(root, pin)
+    if not _cache_directory(pin_dir, create=False):
+        return None
+    manifest = pin_dir / _PACKAGE_CACHE_MANIFEST
+    try:
+        records = _read_cache_manifest(pin_dir, pin)
+    except (OSError, ValueError, RecursionError, MemoryError, _CacheInvalid):
+        _discard_cache_file(manifest)
+        return None
+    created, restored = [], []
+    for name, digest in records:
+        target = artifacts / name
+        was_present = target.exists()
+        try:
+            size = _copy_cached_wheel(pin_dir / name, target, digest, budget)
+        except (OSError, _CacheInvalid):
+            _discard_cache_file(pin_dir / name)
+            _discard_cache_file(manifest)
+            for path in created:
+                path.unlink(missing_ok=True)
+            return None
+        if not was_present:
+            created.append(target)
+        restored.append((name, digest, size))
+        budget -= size
+    return restored
+
+
+def _sync_cache_directory(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                     | getattr(os, 'O_NOFOLLOW', 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _atomic_cache_write(target, *, source=None, data=None, digest=None):
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix='.tmp-', dir=target.parent)
+        with os.fdopen(fd, 'wb') as output:
+            stream = source.open('rb') if source is not None else io.BytesIO(data)
+            try:
+                hasher = hashlib.sha256()
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    output.write(chunk)
+            finally:
+                if source is not None:
+                    stream.close()
+            if digest is not None and hasher.hexdigest() != digest:
+                raise _CacheInvalid()
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        _sync_cache_directory(target.parent)
+    except BaseException:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        raise
+
+
+def _store_cached_wheels(root, pin, artifacts, records):
+    if root is None:
+        return
+    pin_dir = _cache_pin_dir(root, pin)
+    if not _cache_directory(pin_dir, create=True):
+        return
+    manifest = pin_dir / _PACKAGE_CACHE_MANIFEST
+    try:
+        unique = {}
+        for name, digest in records:
+            unique.setdefault(name, digest)
+        for name, digest in unique.items():
+            _atomic_cache_write(pin_dir / name, source=artifacts / name, digest=digest)
+        document = {'name': pin['name'], 'version': pin['version'], 'wheels': [
+            {'filename': name, 'sha256': digest} for name, digest in unique.items()]}
+        _atomic_cache_write(manifest, data=json.dumps(document, sort_keys=True).encode('utf-8'))
+    except (OSError, _CacheInvalid):
+        _discard_cache_file(manifest)
+
+
+def fetch_dependencies(cfg, candidate, artifacts, deadline, mounted=()):
     raw_locks = {name: (candidate / name).read_bytes() for name in cfg['lock_files']}
     spec, clean_manifest = dependency_spec(cfg['profile_id'], raw_locks)
     budget = min(1024 * 1024 * 1024, cfg['limits']['disk_mib'] * 1024 * 1024 // 4)
+    cache_dir = _package_cache_dir(candidate, artifacts, mounted)
+    session = _DownloadSession()
+    try:
+        return _fetch_dependencies(cfg, spec, clean_manifest, raw_locks, artifacts, deadline, budget, session,
+                                   cache_dir)
+    finally:
+        session.close()
+
+
+def _fetch_dependencies(cfg, spec, clean_manifest, raw_locks, artifacts, deadline, budget, session,
+                        cache_dir=_PACKAGE_CACHE_UNSET):
     used = 0
-    if cfg['profile_id'] == 'linux-python-pytest-v1':
+    if cache_dir is _PACKAGE_CACHE_UNSET:
+        cache_dir = _package_cache_dir(None, artifacts)
+    if cfg['profile_id'] in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}:
         for index, pin in enumerate(spec):
+            cached = _restore_cached_wheels(cache_dir, pin, artifacts, budget - used)
+            if cached is not None:
+                # A complete, validated manifest replaces the metadata request.
+                used += sum(size for _, _, size in cached)
+                continue
             metadata = artifacts / ('metadata-' + str(index) + '.json')
             used += _download('https://pypi.org/pypi/' + quote(pin['name'], safe='') + '/' + quote(pin['version'], safe='') + '/json',
-                              metadata, hosts={'pypi.org'}, deadline=deadline, budget=min(4 * 1024 * 1024, budget - used))
+                              metadata, hosts={'pypi.org'}, deadline=deadline, budget=min(4 * 1024 * 1024, budget - used), session=session)
             document = json.loads(metadata.read_bytes())
             wheels = [entry for entry in document.get('urls', []) if isinstance(entry, dict)
                       and entry.get('packagetype') == 'bdist_wheel' and entry.get('digests', {}).get('sha256') in pin['hashes']]
             if not wheels:
                 raise RuntimeRefusal('locked_wheel_unavailable')
+            records = []
             for entry in wheels:
                 name = entry.get('filename', '')
                 if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.+!-]+\.whl', name):
                     raise RuntimeRefusal('invalid_wheel_name')
                 target = artifacts / name
+                digest = entry['digests']['sha256']
+                records.append((name, digest))
                 if target.exists():
+                    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                        raise RuntimeRefusal('dependency_integrity_failed')
                     continue
-                used += _download(entry['url'], target, hosts={'files.pythonhosted.org'}, deadline=deadline, budget=budget - used)
-                if hashlib.sha256(target.read_bytes()).hexdigest() != entry['digests']['sha256']:
+                used += _download(entry['url'], target, hosts={'files.pythonhosted.org'}, deadline=deadline, budget=budget - used, session=session)
+                if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                     raise RuntimeRefusal('dependency_integrity_failed')
             metadata.unlink()
+            # The manifest is renamed last: readers never mistake a partial fill for a hit.
+            _store_cached_wheels(cache_dir, pin, artifacts, records)
     elif clean_manifest is not None:
         for index, artifact in enumerate(spec):
             target = artifacts / (str(index) + '.tgz')
-            used += _download(artifact['url'], target, hosts={'registry.npmjs.org'}, deadline=deadline, budget=budget - used)
+            used += _download(artifact['url'], target, hosts={'registry.npmjs.org'}, deadline=deadline, budget=budget - used, session=session)
             if hashlib.new(artifact['algorithm'], target.read_bytes()).hexdigest() != artifact['digest']:
                 raise RuntimeRefusal('dependency_integrity_failed')
         (artifacts / 'npmrc-user').touch()
@@ -948,22 +1132,19 @@ def fetch_dependencies(cfg, candidate, artifacts, deadline):
 def installer_argv(profile_id):
     if profile_id == 'linux-python-stdlib-v1':
         return []
-    if profile_id == 'linux-python-pytest-v1':
+    if profile_id in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}:
         return ['/bin/sh', '-c', 'python3 -m venv /work/.venv && /work/.venv/bin/python -m pip --isolated install --disable-pip-version-check --no-index --no-deps --find-links=/artifacts --require-hashes --only-binary=:all: -r requirements.lock']
     if profile_id in {'linux-node-test-v1', 'linux-node-browser-v1', 'linux-node-browser-http-v1'}:
         return ['/bin/sh', '-c', 'mkdir /work/.ormas-install && cp /artifacts/package*.json /work/.ormas-install/ && cd /work/.ormas-install && for artifact in /artifacts/*.tgz; do [ ! -f "$artifact" ] || npm cache add "$artifact" --cache /work/.ormas-cache --offline --ignore-scripts --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global; done && npm ci --offline --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org --cache=/work/.ormas-cache --userconfig=/artifacts/npmrc-user --globalconfig=/artifacts/npmrc-global && if [ -d node_modules ]; then mv node_modules /work/node_modules; fi']
     raise RuntimeRefusal('unsupported_runtime_profile')
 
 
-def _bounded(argv, *, cwd, deadline, cap, env=None, stderr_to_stdout=True):
+def _bounded(argv, *, cwd, deadline, cap, env=None):
     """Drain combined output without allowing a pipe or memory deadlock."""
     if time.monotonic() >= deadline:
         raise RuntimeRefusal("verification_timeout")
-    proc = subprocess.Popen(
-        argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT if stderr_to_stdout else subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
     output = bytearray()
     try:
         with selectors.DefaultSelector() as selector:
@@ -1006,10 +1187,10 @@ def _source_file(root_fd, name, directory_modes):
         os.close(fd)
 
 
-def safe_git_argv(git, *args):
+def safe_git_argv(*args):
     # Command-line settings override repository config, including includes. Git's
     # fsmonitor is executable code even for an otherwise read-only ls-files/status.
-    return [git, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    return ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
             '-c', 'core.excludesFile=/dev/null', *args]
 
 
@@ -1023,10 +1204,9 @@ def validate_repository_gitlinks(value):
     return dict(value)
 
 
-def _indexed_gitlinks(source, deadline, env, git):
-    code, raw = _bounded(safe_git_argv(git, 'ls-files', '--stage', '-z'),
-                        cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env,
-                        stderr_to_stdout=False)
+def _indexed_gitlinks(source, deadline, env):
+    code, raw = _bounded(safe_git_argv('ls-files', '--stage', '-z'),
+                        cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
     if code:
         raise RuntimeRefusal('source_inventory_unavailable')
     links = {}
@@ -1059,17 +1239,15 @@ def _empty_gitlink(root_fd, name, directory_modes):
         os.close(fd)
 
 
-def _snapshot(source, target, cfg, deadline, env, git):
+def _snapshot(source, target, cfg, deadline, env):
     # Unversioned exclusions are not transferable to a fresh validator clone.
     # Refuse them instead of silently hiding material or exposing ignored files.
-    code, local_excludes = _bounded(safe_git_argv(git, 'config', '--local', '--includes', '--get', 'core.excludesFile'),
-                                    cwd=source, deadline=deadline, cap=4096, env=env,
-                                    stderr_to_stdout=False)
+    code, local_excludes = _bounded(safe_git_argv('config', '--local', '--includes', '--get', 'core.excludesFile'),
+                                    cwd=source, deadline=deadline, cap=4096, env=env)
     if code == 0 and local_excludes.strip():
         raise RuntimeRefusal('repository_exclusion_override_unsupported')
-    code, exclude_path = _bounded(safe_git_argv(git, 'rev-parse', '--git-path', 'info/exclude'),
-                                  cwd=source, deadline=deadline, cap=4096, env=env,
-                                  stderr_to_stdout=False)
+    code, exclude_path = _bounded(safe_git_argv('rev-parse', '--git-path', 'info/exclude'),
+                                  cwd=source, deadline=deadline, cap=4096, env=env)
     if code:
         raise RuntimeRefusal('source_inventory_unavailable')
     path = Path(os.fsdecode(exclude_path.strip()))
@@ -1080,14 +1258,13 @@ def _snapshot(source, target, cfg, deadline, env, git):
             raise RuntimeRefusal('repository_exclusion_override_unsupported')
         if any(line.strip() and not line.lstrip().startswith('#') for line in path.read_text().splitlines()):
             raise RuntimeRefusal('repository_exclusion_override_unsupported')
-    code, raw = _bounded(safe_git_argv(git, "ls-files", "-z", "--cached", "--others", "--exclude-standard"),
-                         cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env,
-                         stderr_to_stdout=False)
+    code, raw = _bounded(safe_git_argv("ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+                         cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
     if code:
         raise RuntimeRefusal("source_inventory_unavailable")
     names = sorted(set(os.fsdecode(n) for n in raw.split(b"\0") if n))
     gitlinks = validate_repository_gitlinks(cfg.get('repository_gitlinks', {}))
-    if _indexed_gitlinks(source, deadline, env, git) != gitlinks:
+    if _indexed_gitlinks(source, deadline, env) != gitlinks:
         raise RuntimeRefusal('repository_gitlink_changed')
     if len(names) > cfg["limits"]["max_files"]:
         raise RuntimeRefusal("source_file_limit")
@@ -1140,7 +1317,7 @@ def _snapshot(source, target, cfg, deadline, env, git):
         # Recheck opaque boundaries after the copy; never recurse into a submodule.
         for name in gitlinks:
             _empty_gitlink(root_fd, name, directory_modes)
-        if _indexed_gitlinks(source, deadline, env, git) != gitlinks:
+        if _indexed_gitlinks(source, deadline, env) != gitlinks:
             raise RuntimeRefusal('repository_gitlink_changed')
     finally:
         os.close(root_fd)
@@ -1217,7 +1394,7 @@ def _validate_config(cfg):
     if isinstance(cfg, dict) and cfg.get('profile_id') == 'linux-node-browser-http-v1':
         keys.add('service')
     if isinstance(cfg, dict) and 'repository_gitlinks' in cfg:
-        if (cfg.get('profile_id') != 'linux-python-pytest-v1'
+        if (cfg.get('profile_id') not in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}
                 or not isinstance(cfg.get('limits'), dict)
                 or 'source_max_bytes' not in cfg['limits']):
             raise RuntimeRefusal('repository_gitlinks_unsupported')
@@ -1236,7 +1413,7 @@ def _validate_config(cfg):
     bounds = {"timeout_s": 600, "cpus": 2, "memory_mib": 4096, "disk_mib": 4096,
               "output_bytes": 1048576, "max_files": 10000, "max_bytes": 67108864}
     if isinstance(limits, dict) and 'source_max_bytes' in limits:
-        if cfg.get('profile_id') != 'linux-python-pytest-v1':
+        if cfg.get('profile_id') not in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}:
             raise RuntimeRefusal('invalid_runtime_limits')
         bounds['source_max_bytes'] = 134217728
     if not isinstance(limits, dict) or set(limits) != set(bounds):
@@ -1256,8 +1433,6 @@ def _validate_config(cfg):
             or any(p in ('', '.', '..', '.git', '.venv', 'node_modules') for p in name.split('/'))
             or not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{64}', sha) for name, sha in files.items()):
         raise RuntimeRefusal('invalid_acceptance_files')
-    if REVOKED_ACCEPTANCE_DRIVER_SHA256.intersection(files.values()):
-        raise RuntimeRefusal('acceptance_driver_revoked')
     if not cfg["argv"]:
         raise RuntimeRefusal("invalid_runtime_argv")
     if not isinstance(cfg["env"], dict) or set(cfg["env"]) - {"LANG", "LC_ALL", "TZ", "PYTHONDONTWRITEBYTECODE"}:
@@ -1303,12 +1478,15 @@ def run_verifier(cfg, *, cwd=None):
     source = Path(cwd or os.getcwd()).resolve()
     deadline = time.monotonic() + cfg["limits"]["timeout_s"]
     cap = cfg["limits"]["output_bytes"]
+    host_env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home()),
+                "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    for exe in ("docker", "git"):
+        path = shutil.which(exe, path=host_env["PATH"])
+        if path is None or Path(path).resolve().is_relative_to(source):
+            raise RuntimeRefusal("runtime_executable_unavailable")
     uid, gid = os.getuid(), os.getgid()
     if uid == 0:
         raise RuntimeRefusal("runtime_nonroot_required")
-    git = str(_trusted_executable('git'))
-    docker = str(_trusted_executable('docker'))
-    host_env = _host_environment(git, docker)
     token = "ormas-verify-" + uuid.uuid4().hex
     verifier, installer, volume = token + "-check", token + "-install", token + "-data"
     candidate_container, driver_volume = token + '-candidate', token + '-driver'
@@ -1325,8 +1503,7 @@ def run_verifier(cfg, *, cwd=None):
     # verifier. It has only this invocation's exact container/volume/temp names.
     guard = subprocess.Popen([sys.executable, '-I', '-S', '-c', _CLEANUP_GUARD,
                               json.dumps([os.getpid(), cfg['limits']['timeout_s'] + 40, str(scratch),
-                                          [installer, verifier, candidate_container],
-                                          [volume, driver_volume], docker])],
+                                          [installer, verifier, candidate_container], [volume, driver_volume]])],
                              cwd='/', env=host_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
 
@@ -1342,7 +1519,7 @@ def run_verifier(cfg, *, cwd=None):
     try:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             old_handlers[sig] = signal.signal(sig, cancel)
-        _snapshot(source, candidate, cfg, deadline, host_env, git)
+        _snapshot(source, candidate, cfg, deadline, host_env)
         driver = scratch / 'driver'
         driver.mkdir()
         acceptance_projection(candidate, driver, cfg)
@@ -1350,8 +1527,8 @@ def run_verifier(cfg, *, cwd=None):
         artifacts.mkdir()
         report_path = '/tmp/' + uuid.uuid4().hex + '.xml'
         test_argv, report_kind = structured_test_argv(cfg, driver, report_path)
-        fetch_dependencies(cfg, candidate, artifacts, deadline)
-        code, info = command([docker, "info", "--format", "{{json .}}"], required=False)
+        fetch_dependencies(cfg, candidate, artifacts, deadline, (source, scratch))
+        code, info = command(["docker", "info", "--format", "{{json .}}"], required=False)
         try:
             runtime_info = json.loads(info)
         except (ValueError, UnicodeError):
@@ -1364,27 +1541,27 @@ def run_verifier(cfg, *, cwd=None):
         # Docker. Only projection readers need it. Candidate processes retain
         # their nonzero UID and original group, distinct from the keeper/probe.
         reader_gid = 0 if rootless else gid
-        code, _ = command([docker, "image", "inspect", cfg["image"]], required=False)
+        code, _ = command(["docker", "image", "inspect", cfg["image"]], required=False)
         if code:
-            command([docker, "pull", "--platform", cfg["platform"], cfg["image"]])
+            command(["docker", "pull", "--platform", cfg["platform"], cfg["image"]])
         # Reap only expired volumes from this primitive. Docker refuses a volume
         # still in use, so concurrent current executions cannot lose their data.
-        _, old_volumes = command([docker, "volume", "ls", "-q", "--filter", "label=ormas.verifier=v1"])
+        _, old_volumes = command(["docker", "volume", "ls", "-q", "--filter", "label=ormas.verifier=v1"])
         for old_volume in old_volumes.decode().splitlines():
-            code, metadata = command([docker, "volume", "inspect", old_volume], required=False)
+            code, metadata = command(["docker", "volume", "inspect", old_volume], required=False)
             # Another verifier can remove its finished volume after the list.
             # Reaping is opportunistic; never delete an uninspected volume.
             if code:
                 continue
             expiry = json.loads(metadata)[0].get("Labels", {}).get("ormas.expires", "")
             if expiry.isdigit() and int(expiry) < int(time.time()):
-                command([docker, "volume", "rm", old_volume], required=False)
+                command(["docker", "volume", "rm", old_volume], required=False)
         for name in (volume, driver_volume):
-            command([docker, "volume", "create", "--driver", "local", "--label", "ormas.verifier=v1",
+            command(["docker", "volume", "create", "--driver", "local", "--label", "ormas.verifier=v1",
                      "--label", f"ormas.expires={int(time.time()) + cfg['limits']['timeout_s'] + 60}",
                      "--opt", "type=tmpfs", "--opt", "device=tmpfs", "--opt",
                      f"o=size={max(1, min(cfg['limits']['disk_mib'] // 4, cfg['limits']['memory_mib'] // 4))}m,uid={uid},gid={gid},mode=0700", name])
-        common = [docker, "run", "--rm", "--pull", "never", "--platform", cfg["platform"],
+        common = ["docker", "run", "--rm", "--pull", "never", "--platform", cfg["platform"],
                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
                   "--tmpfs", "/tmp:rw,exec,size=256m", "--memory", f"{max(1, cfg['limits']['memory_mib'] // 4)}m",
                   "--cpus", str(cfg["limits"]["cpus"] / 2), "--pids-limit", "128", "--shm-size", "128m",
@@ -1392,7 +1569,7 @@ def run_verifier(cfg, *, cwd=None):
                   "-e", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1"]
         for key, value in sorted(cfg["env"].items()):
             common += ["-e", key + "=" + value]
-        if cfg['profile_id'] == 'linux-python-pytest-v1':
+        if cfg['profile_id'] in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}:
             common += ['-e', 'PATH=/work/.venv/bin:/usr/local/bin:/usr/bin:/bin']
         bridge_root = scratch / 'bridge'
         bridge_root.mkdir(mode=0o700)
@@ -1402,37 +1579,16 @@ def run_verifier(cfg, *, cwd=None):
         (helpers / 'ormas_acceptance.js').write_text(NODE_HTTP_HELPER if 'service' in cfg else NODE_ACCEPTANCE_HELPER)
         def observe(argv, call_deadline, call_cap):
             # CLI options end at the fixed container id. Client argv never reaches
-            # the host shell or controls Docker options/container selection.  A
-            # root wrapper drops to the candidate identity before launch and
-            # frames output so candidate text cannot forge spawn metadata.
-            timeout_s = max(1, int(call_deadline - time.monotonic()))
-            argument = base64.b64encode(json.dumps({
-                'argv': argv, 'uid': uid, 'gid': gid,
-                'timeout_s': timeout_s, 'cap': call_cap,
-            }, separators=(',', ':')).encode()).decode()
-            wrapper = _candidate_observer_wrapper(cfg['profile_id'], argument)
-            code, raw = _bounded(
-                [docker, 'exec', '--user', '0:0', candidate_container,
-                 '/usr/bin/timeout', '--signal=KILL', str(timeout_s + 1), *wrapper],
-                cwd=scratch, deadline=call_deadline,
-                cap=max(16384, call_cap * 2 + 16384), env=host_env,
-            )
-            if code:
-                raise RuntimeRefusal('candidate_observation_wrapper_failed')
-            if cfg['profile_id'].startswith('linux-python-'):
-                return _candidate_observer_result(raw, call_cap)
-            return _node_candidate_observer_result(raw, call_cap)
+            # the host shell or controls Docker options/container selection.
+            return _bounded(['docker', 'exec', '--user', f'{uid}:{gid}', candidate_container, *UMASK_ARGV,
+                             '/usr/bin/timeout', '--signal=KILL', str(max(1, int(call_deadline - time.monotonic())))] + argv,
+                            cwd=scratch, deadline=call_deadline, cap=call_cap, env=host_env)
         bridge = CandidateBridge(bridge_root / 'socket', observe, deadline=deadline, cap=cap)
         bridge.start()
         for name, data_volume, projection in ((candidate_container, volume, candidate), (verifier, driver_volume, driver)):
             options = common + ['--mount', f'type=volume,source={data_volume},target=/work,volume-nocopy']
             driver_options = []
-            if name == candidate_container:
-                # The trusted observer needs only these two capabilities to
-                # create the unprivileged candidate child. no-new-privileges
-                # prevents the child from regaining them through exec.
-                options += ['--cap-add', 'SETUID', '--cap-add', 'SETGID']
-            else:
+            if name == verifier:
                 driver_options = ['--mount', f'type=bind,source={bridge_root},target=/ormas/bridge,readonly',
                                   '--mount', f'type=bind,source={helpers},target=/ormas/helpers,readonly',
                                   '-e', 'PYTHONPATH=/ormas/helpers', '-e', 'NODE_PATH=/ormas/helpers',
@@ -1448,7 +1604,7 @@ def run_verifier(cfg, *, cwd=None):
                 # Prove the selected daemon's actual namespace mapping before
                 # granting group access or running anything from the checkout.
                 for kind, host_id in (('uid', uid), ('gid', gid)):
-                    _, mapping = command([docker, 'exec', '--user', f'{uid}:{gid}', name,
+                    _, mapping = command(['docker', 'exec', '--user', f'{uid}:{gid}', name,
                                           '/bin/cat', f'/proc/self/{kind}_map'], limit=4096)
                     _check_rootless_map(mapping, host_id)
                 for projection_root in (candidate, driver, artifacts, helpers):
@@ -1458,11 +1614,11 @@ def run_verifier(cfg, *, cwd=None):
                 bridge_root.chmod(0o710)
                 (bridge_root / 'socket').chmod(0o660)
             command(options + ['--name', installer, '--network', 'none', '--user', f'{uid}:{reader_gid}', '--mount',
-                               f'type=bind,source={projection},target=/source,readonly', cfg['image'],
+                               f'type=bind,source={projection},target=/source,readonly', cfg['image'], *UMASK_ARGV,
                                'cp', '-a', '/source/.', '/work/'])
             if cfg['install_argv']:
                 command(options + ['--name', installer, '--network', 'none', '--user', f'{uid}:{reader_gid}', '--mount',
-                                   f'type=bind,source={artifacts},target=/artifacts,readonly', cfg['image'],
+                                   f'type=bind,source={artifacts},target=/artifacts,readonly', cfg['image'], *UMASK_ARGV,
                                    '/usr/bin/timeout', '--signal=KILL', str(max(1, int(deadline - time.monotonic())))]
                         + cfg['install_argv'])
         if 'service' in cfg:
@@ -1477,8 +1633,8 @@ def run_verifier(cfg, *, cwd=None):
                         'timeout_ms': max(1, int((call_deadline - time.monotonic()) * 1000) - 250)}
                 argument = base64.b64encode(json.dumps(spec, separators=(',', ':')).encode()).decode()
                 code, raw = _bounded(
-                    [docker, 'exec', '--user', f'{probe_uid}:{probe_uid}', '--workdir', '/',
-                     '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', candidate_container,
+                    ['docker', 'exec', '--user', f'{probe_uid}:{probe_uid}', '--workdir', '/',
+                     '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=', candidate_container, *UMASK_ARGV,
                      '/usr/bin/node', '-e', NODE_HTTP_PROBE, argument],
                     cwd=scratch, env=host_env, deadline=call_deadline,
                     cap=min(1500000, call_cap * 2 + 32768))
@@ -1494,9 +1650,9 @@ def run_verifier(cfg, *, cwd=None):
                 except (ValueError, TypeError, KeyError):
                     raise RuntimeRefusal('candidate_http_response_invalid') from None
             service = CandidateService(
-                [docker, 'exec', '--user', f'{uid}:{gid}', '--workdir', '/work',
+                ['docker', 'exec', '--user', f'{uid}:{gid}', '--workdir', '/work',
                  '-e', 'PORT=' + str(frozen['port']), '-e', 'NODE_OPTIONS=', '-e', 'NODE_PATH=',
-                 candidate_container, '/usr/bin/node', *frozen['argv'][1:]],
+                 candidate_container, *UMASK_ARGV, '/usr/bin/node', *frozen['argv'][1:]],
                 cwd=scratch, env=host_env, deadline=deadline)
             startup_deadline = min(deadline, time.monotonic() + 20)
             while True:
@@ -1510,7 +1666,7 @@ def run_verifier(cfg, *, cwd=None):
                         raise
                     time.sleep(.1)
             bridge.http_execute = http_observe
-        code, output = command([docker, "exec", '--user', f'{uid}:{reader_gid}', verifier] + test_argv, required=False)
+        code, output = command(["docker", "exec", '--user', f'{uid}:{reader_gid}', verifier, *UMASK_ARGV] + test_argv, required=False)
         # Drain any observation already accepted by the host before deciding.
         # A late transport/refusal result must not be hidden by a test report.
         bridge.close()
@@ -1518,7 +1674,7 @@ def run_verifier(cfg, *, cwd=None):
         sys.stdout.buffer.flush()
         report = output
         if report_kind == 'junit-file':
-            report_code, report = command([docker, 'exec', verifier, 'cat', report_path], required=False)
+            report_code, report = command(['docker', 'exec', verifier, *UMASK_ARGV, 'cat', report_path], required=False)
             if report_code:
                 raise RuntimeRefusal('structured_test_report_missing')
         outcome = structured_result(report_kind, report)
@@ -1538,8 +1694,7 @@ def run_verifier(cfg, *, cwd=None):
         return 86 if outcome == 'assertion' else 0
     finally:
         # Cleanup has its own small deadline even after the test exhausts its budget.
-        for argv in ([docker, "rm", "-f", installer, verifier, candidate_container],
-                     [docker, "volume", "rm", volume, driver_volume]):
+        for argv in (["docker", "rm", "-f", installer, verifier, candidate_container], ["docker", "volume", "rm", volume, driver_volume]):
             try:
                 subprocess.run(argv, env=host_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
             except (OSError, subprocess.TimeoutExpired):

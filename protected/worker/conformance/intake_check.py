@@ -6,9 +6,11 @@ The shell text parser accepts COPY, but its apply gate refuses the unchanged sou
 """
 
 import errno
+import fnmatch
 import json
 import math
 import os
+import posixpath
 import re
 import stat
 import sys
@@ -170,6 +172,10 @@ def _path_is_allowed(path: str, patterns: Sequence[str]) -> bool:
 
 
 
+# Secret entries from dogfood_onboarding.DEFAULT_EXCLUDE_FILE_PATTERNS.
+SECRET_PATH_PATTERNS = (".env", ".env.*", "*.key", "*.pem")
+
+
 _MESSAGES = {
     "artifact_name": "Invalid artifact name",
     "artifact_symlink": "Artifact must not be a symlink",
@@ -190,6 +196,7 @@ _MESSAGES = {
     "quoted_path": "Quoted patch paths are forbidden",
     "path_not_allowed": "Patch exceeds the allowed scope",
     "immutable_path": "Patch touches immutable scope",
+    "secret_path": "Patch touches a secret path",
     "duplicate_path": "Patch touches a path more than once",
     "malformed_patch": "Malformed unified diff",
 }
@@ -455,6 +462,14 @@ def _patterns(values, code: str) -> tuple[str, ...]:
         raise PatchIntakeError(code) from None
 
 
+def _root_covering(path: str) -> bool:
+    normalized = posixpath.normpath(path)
+    return (normalized in {".", "/", "*", "**", ".."}
+            or normalized.startswith(("/", "../"))
+            or re.match(r"[*?\[]", normalized) is not None
+            or all(part in {"*", "**"} for part in normalized.split("/")))
+
+
 def _validate_patch_scope(patch_text: str, *, allowed_paths, immutable_paths) -> PatchScope:
     """Validate the entire diff before exposing any admitted scope."""
     if not isinstance(patch_text, str):
@@ -503,6 +518,12 @@ def _validate_patch_scope(patch_text: str, *, allowed_paths, immutable_paths) ->
             or any(_path_is_allowed(key, immutable_keys) for key in touched_keys)):
         raise PatchIntakeError("immutable_path")
     allowed = _patterns(allowed_paths, "path_not_allowed")
+    # No packet kind yet: any root-covering entry makes this session scope.
+    if any(_root_covering(pattern) for pattern in allowed):
+        if any(fnmatch.fnmatchcase(component, pattern)
+               for key in touched_keys for component in key.split("/")
+               for pattern in SECRET_PATH_PATTERNS):
+            raise PatchIntakeError("secret_path")
     if any(not _path_is_allowed(path, allowed) for path in touched):
         raise PatchIntakeError("path_not_allowed")
     return PatchScope(tuple(files))

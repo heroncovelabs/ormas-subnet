@@ -59,7 +59,8 @@ The historical `claim_refusal_backoff_external.py` and
 accepted its process status. A candidate-controlled import could terminate
 that process with status zero before the required assertions ran. The exact
 digests of both cards, including their later docstring-only variants, are
-revoked during preparation, packet validation and verifier startup. Preserve
+revoked during preparation and packet validation; the same check at verifier
+startup arrives with the next embedded verifier compiler. Preserve
 an affected frozen packet as audit evidence, drain or expire it, and create a
 new agreement with a separately reviewed acceptance driver; do not rewrite or
 accept the existing packet in place.
@@ -179,13 +180,8 @@ and validator operator. Completion remains pending until the frozen acceptance
 policy is satisfied. The gateway is the receipt and settlement authority.
 
 New languages, interfaces and environments expand through versioned qualifications.
-An in-flight task normally keeps its frozen catalog and checker policy. The miner
-also accepts the deployed `2026-10-14.4` catalog (`sha256:ff7c1e51…`) with compiler
-`214eadfb…` as an explicit draining pair. That older embedded verifier predates
-trusted-tool hardening; the allowance is not compiler-wide. The public `.4`
-(`sha256:398f6c9f…`, compiler `2ba99054…`) remains the default, and revoked acceptance
-drivers and other revoked compilers (including `6208cd15…`) remain refused.
-A verifier compiler security revocation overrides execution compatibility: inventory and drain
+An in-flight task normally keeps its frozen catalog and checker policy. A verifier
+compiler security revocation overrides execution compatibility: inventory and drain
 or expire affected queued, leased and recovery-pending packets, recompile the frozen
 inputs with an active compiler, and requeue under a new agreement. Keep the original
 packet as audit evidence rather than accepting or rewriting it in place. Other check

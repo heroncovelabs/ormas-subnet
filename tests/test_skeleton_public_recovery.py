@@ -223,8 +223,9 @@ def _freeze_legacy_failure(
 
 
 @pytest.mark.parametrize("limit_offer", [False, True])
+@pytest.mark.parametrize("legacy_record", [False, True])
 def test_restart_replays_ambiguous_public_completion_without_another_solve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_offer: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_offer: bool, legacy_record: bool,
 ) -> None:
     """The completion body must survive a process loss before its response.
 
@@ -263,6 +264,12 @@ def test_restart_replays_ambiguous_public_completion_without_another_solve(
     first = MinerSkeleton(client, config, solve)
     with pytest.raises(KeyboardInterrupt, match="synthetic process loss"):
         first.run_once()
+
+    if legacy_record:
+        store = PublicRecovery(tmp_path / "work", client.base_url, "miner-public")
+        pending = store.pending()
+        pending.pop("work_packet")
+        store.save(pending)
 
     restarted = MinerSkeleton(client, config, solve)
     restarted.run_once()
@@ -323,8 +330,9 @@ def test_public_base_exit_zero_fails_non_red_without_solve(
     assert body["receipt"]["prompt_tokens"] == 0
 
 
+@pytest.mark.parametrize("legacy_record", [False, True])
 def test_restart_reports_interrupted_pre_artifact_work_without_solving_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_record: bool,
 ) -> None:
     lease, draft = _lease_and_draft()
     client = _RecoveryClient(lease, draft, [_OUTCOME_UNKNOWN])
@@ -338,6 +346,12 @@ def test_restart_reports_interrupted_pre_artifact_work_without_solving_again(
     first = MinerSkeleton(client, _config(tmp_path / "work"), interrupted_solve)
     with pytest.raises(KeyboardInterrupt, match="during solve"):
         first.run_once()
+
+    if legacy_record:
+        store = PublicRecovery(tmp_path / "work", client.base_url, "miner-public")
+        pending = store.pending()
+        pending.pop("work_packet")
+        store.save(pending)
 
     before_restart = len(client.events)
     restarted = MinerSkeleton(client, _config(tmp_path / "work"), interrupted_solve)
@@ -399,7 +413,9 @@ def test_private_solver_failure_uses_valid_wire_class_and_keeps_local_type(
 
     assert len(client.completions) == 1
     capture = client.completions[0]["capture"]
-    assert capture["failure_class"] == "failed"
+    # main's wire contract keeps the typed local class (tests/regressions/
+    # test_public-failure-report-wire-capture.py); no exception text crosses.
+    assert capture["failure_class"] == "solve_error"
     assert "error" not in capture
     assert "SECRET_PRIVATE_EXCEPTION_CANARY" not in repr(client.completions[0])
     assert skeleton.last_run["failure_class"] == "solve_error"
@@ -597,6 +613,92 @@ def test_corrupt_recovery_record_refuses_new_work_without_another_solve(
     assert client.claims == 1
     assert client.publications == 0
     assert client.completions == []
+
+
+@pytest.mark.parametrize("visibility", ["public", "private"])
+def test_restart_republishes_frozen_artifact_with_retained_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, visibility: str,
+) -> None:
+    """Exercise real publication after a process loss, including its draft reads."""
+    lease, draft = _lease_and_draft()
+    draft.work_packet["execution_requirements"] = {"repository_visibility": visibility}
+    draft.work_packet = MappingProxyType(draft.work_packet)
+    artifact = b"frozen-public-artifact"
+    published = {
+        "result_ref": f"refs/heads/ormas/job/{draft.task_id}",
+        "result_commit": "d" * 40,
+        "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
+        "tree_sha": "f" * 40,
+    }
+    client = _RecoveryClient(
+        lease, draft, [_DONE],
+        publication_results=[KeyboardInterrupt("during publication"), published],
+    )
+    solve_calls: list[str] = []
+    credential_reads: list[tuple] = []
+    fetches: list[tuple] = []
+    credential = {"kind": "github_app_read_token", "token": "synthetic-read-token"}
+    draft.repo_credential = credential if visibility == "private" else None
+
+    def solve(current_draft, _workdir):
+        solve_calls.append(current_draft.task_id)
+        return _successful_result()
+
+    def build_artifact(_draft, _workdir, _result, target):
+        target.write(artifact)
+        target.seek(0)
+        return len(artifact), published["artifact_sha256"], published["tree_sha"]
+
+    def public_git(argv, *, cwd):
+        if argv[0] == "fetch":
+            fetches.append((argv, None))
+            return b""
+        if argv[0] == "rev-parse":
+            return published["tree_sha"].encode()
+        assert argv == ["rev-list", "--parents", "-n", "1", published["result_commit"]]
+        return f"{published['result_commit']} {draft.base_commit}".encode()
+
+    def repository_git(argv, *, cwd, repo_url, credential):
+        assert repo_url == draft.repo_url
+        fetches.append((argv, credential))
+        return b""
+
+    def read_credential(*args):
+        credential_reads.append(args)
+        return {"repo_credential": credential}
+
+    _patch_public_loop(monkeypatch, client, patch_publish=False)
+    monkeypatch.setattr("ormas_subnet.skeleton._build_public_artifact", build_artifact)
+    monkeypatch.setattr("ormas_subnet.skeleton._public_git", public_git)
+    monkeypatch.setattr("ormas_subnet.outcomes_support.repository_git", repository_git)
+    client.read_repository_credential = read_credential
+    root = tmp_path / "work"
+    first = MinerSkeleton(client, _config(root), solve)
+    with pytest.raises(KeyboardInterrupt, match="during publication"):
+        first.run_once()
+
+    pending = PublicRecovery(root, client.base_url, "miner-public").pending()
+    restarted = MinerSkeleton(client, _config(root), solve)
+    assert restarted.run_once() is True
+
+    assert pending["work_packet"] == dict(draft.work_packet)
+    assert pending["task_id"] == draft.task_id
+    assert pending["base_commit"] == draft.base_commit
+    assert pending["repo_url"] == draft.repo_url
+    assert pending["packet_hash"] == draft.work_packet_sha256
+    assert "repo_credential" not in pending
+    assert solve_calls == [draft.task_id]
+    assert client.claims == 1
+    assert client.publications == 2
+    assert client.completed is True
+    assert client.completions[0]["terminal"]["result_commit"] == published["result_commit"]
+    assert fetches == [(["fetch", "--no-tags", draft.repo_url, published["result_commit"]],
+                        credential if visibility == "private" else None)]
+    assert credential_reads == ([(draft.task_id, "miner-public", lease.lease_id)]
+                                if visibility == "private" else [])
+    assert list((root / ".ormas-recovery").glob("*/pending.json")) == []
+    assert all("synthetic-read-token" not in record.read_text()
+               for record in (root / ".ormas-recovery").glob("*/*.json"))
 
 
 def test_lease_lost_while_republishing_archives_recovery_without_another_solve(
@@ -805,92 +907,6 @@ def test_raising_settle_hook_sends_no_public_completion_until_it_recovers(
     assert MinerSkeleton(client, config, solve).run_once() is True
     assert [c["terminal"]["settled_price_usd"] for c in client.completions] == [0.75]
     assert store.pending() is None
-
-
-@pytest.mark.parametrize("visibility", ["public", "private"])
-def test_restart_republishes_frozen_artifact_with_retained_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, visibility: str,
-) -> None:
-    """Exercise real publication after a process loss, including its draft reads."""
-    lease, draft = _lease_and_draft()
-    draft.work_packet["execution_requirements"] = {"repository_visibility": visibility}
-    draft.work_packet = MappingProxyType(draft.work_packet)
-    artifact = b"frozen-public-artifact"
-    published = {
-        "result_ref": f"refs/heads/ormas/job/{draft.task_id}",
-        "result_commit": "d" * 40,
-        "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
-        "tree_sha": "f" * 40,
-    }
-    client = _RecoveryClient(
-        lease, draft, [_DONE],
-        publication_results=[KeyboardInterrupt("during publication"), published],
-    )
-    solve_calls: list[str] = []
-    credential_reads: list[tuple] = []
-    fetches: list[tuple] = []
-    credential = {"kind": "github_app_read_token", "token": "synthetic-read-token"}
-    draft.repo_credential = credential if visibility == "private" else None
-
-    def solve(current_draft, _workdir):
-        solve_calls.append(current_draft.task_id)
-        return _successful_result()
-
-    def build_artifact(_draft, _workdir, _result, target):
-        target.write(artifact)
-        target.seek(0)
-        return len(artifact), published["artifact_sha256"], published["tree_sha"]
-
-    def public_git(argv, *, cwd):
-        if argv[0] == "fetch":
-            fetches.append((argv, None))
-            return b""
-        if argv[0] == "rev-parse":
-            return published["tree_sha"].encode()
-        assert argv == ["rev-list", "--parents", "-n", "1", published["result_commit"]]
-        return f"{published['result_commit']} {draft.base_commit}".encode()
-
-    def repository_git(argv, *, cwd, repo_url, credential):
-        assert repo_url == draft.repo_url
-        fetches.append((argv, credential))
-        return b""
-
-    def read_credential(*args):
-        credential_reads.append(args)
-        return {"repo_credential": credential}
-
-    _patch_public_loop(monkeypatch, client, patch_publish=False)
-    monkeypatch.setattr("ormas_subnet.skeleton._build_public_artifact", build_artifact)
-    monkeypatch.setattr("ormas_subnet.skeleton._public_git", public_git)
-    monkeypatch.setattr("ormas_subnet.outcomes_support.repository_git", repository_git)
-    client.read_repository_credential = read_credential
-    root = tmp_path / "work"
-    first = MinerSkeleton(client, _config(root), solve)
-    with pytest.raises(KeyboardInterrupt, match="during publication"):
-        first.run_once()
-
-    pending = PublicRecovery(root, client.base_url, "miner-public").pending()
-    restarted = MinerSkeleton(client, _config(root), solve)
-    assert restarted.run_once() is True
-
-    assert pending["work_packet"] == dict(draft.work_packet)
-    assert pending["task_id"] == draft.task_id
-    assert pending["base_commit"] == draft.base_commit
-    assert pending["repo_url"] == draft.repo_url
-    assert pending["packet_hash"] == draft.work_packet_sha256
-    assert "repo_credential" not in pending
-    assert solve_calls == [draft.task_id]
-    assert client.claims == 1
-    assert client.publications == 2
-    assert client.completed is True
-    assert client.completions[0]["terminal"]["result_commit"] == published["result_commit"]
-    assert fetches == [(["fetch", "--no-tags", draft.repo_url, published["result_commit"]],
-                        credential if visibility == "private" else None)]
-    assert credential_reads == ([(draft.task_id, "miner-public", lease.lease_id)]
-                                if visibility == "private" else [])
-    assert list((root / ".ormas-recovery").glob("*/pending.json")) == []
-    assert all("synthetic-read-token" not in record.read_text()
-               for record in (root / ".ormas-recovery").glob("*/*.json"))
 
 
 @pytest.mark.parametrize("version", [1, 2])

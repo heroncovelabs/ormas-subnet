@@ -166,6 +166,10 @@ def test_private_v2_postpublication_fetch_uses_read_key_and_checks_topology(
         return 8, "d" * 64, TREE
 
     class Client:
+        def heartbeat_task(self, *args, **kwargs):
+            del args, kwargs
+            return {"ok": True}
+
         def publish_result(self, task_id, runner_id, lease_id, *, source, length):
             assert (task_id, runner_id, lease_id) == ("job_private", "runr_private", "lease")
             assert length == 8 and source.read() == b"artifact"
@@ -228,11 +232,7 @@ def test_private_checker_git_failure_posts_error_and_keeps_polling(
         allowed_paths=["demo.py"], immutable_paths=["tests/test_demo.py"],
         execution_contract=contract,
     )
-    assignment = {"assignment_id": "asgn_private", "validator_id": "val_test",
-                  "decision_protocol_version": "ormas-validator-decision-v2",
-                  "decision_nonce": "9" * 64,
-                  "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
-                  "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
+    assignment = {"assignment_id": "asgn_private", **fields,
                   "evidence_digest_sha256": evidence_digest_hex(fields),
                   "repo_credential": _credential()}
     gateway = _FakeValidatorGateway(assignment=assignment)

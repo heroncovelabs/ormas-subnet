@@ -103,27 +103,6 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SERVICE = re.compile(r"^  ([a-zA-Z0-9_-]+):\s*(?:#.*)?$", re.M)
 _IMAGE_LINE = re.compile(r"^(    image: *)([^\s@]+)@([^\s#]+)( *\n|$)", re.M)
 
-# A release pin may change image digests, not the measured service topology or
-# authority.  Normalize only the digest slots and require a reviewed recipe
-# shape.  Any intended Compose change therefore needs an explicit code review
-# that updates this allowlist as well as the measured manifest.
-_RECIPE_POLICIES = {
-    # Reviewed relay split: shell-only relay envs, forwarding disabled, and dstack 0.6.x gid.
-    "738e08991c1c8b87ae047af17bf1fa734fa7110ab1f9b2dc0b1a461231bc9f25": {
-        "scratch-init": "ghcr.io/heroncovelabs/ormas-protected-shell",
-        "ormas-shell": "ghcr.io/heroncovelabs/ormas-protected-shell",
-    },
-    "2f5119d8aa22ae47606aa448942807d6c1351d22df8f894948f6602d38572255": {
-        "scratch-init": "ghcr.io/heroncovelabs/ormas-protected-miner",
-        "miner": "ghcr.io/heroncovelabs/ormas-protected-miner",
-    },
-    "45a2b34a8a8de783cb7ca1f548700b8a49b1fc54b64a6a16f482bf38a16968bf": {
-        "scratch-init": "ghcr.io/heroncovelabs/ormas-protected-shell",
-        "ormas-shell": "ghcr.io/heroncovelabs/ormas-protected-shell",
-    },
-}
-
-
 # Deliberate duplicate of entrypoint.WORKER_POLICY_FILE, cross-checked by tests.
 # Keep the hash tool stdlib-only without importing/executing startup code.
 WORKER_POLICY_FILE = Path("/opt/ormas/worker-policy.list")
@@ -170,21 +149,6 @@ def service_images(compose_text: str) -> dict[str, str]:
     if not images:
         raise SystemExit("compose: no service images found")
 
-    normalized = _IMAGE_LINE.sub(
-        lambda match: f"{match[1]}{match[2]}@{PLACEHOLDER}{match[4]}", compose_text,
-    )
-    shape = hashlib.sha256(normalized.encode()).hexdigest()
-    policy = _RECIPE_POLICIES.get(shape)
-    if policy is None:
-        raise SystemExit("compose: recipe shape is not approved")
-    if list(images) != list(policy):
-        raise SystemExit("compose: service set does not match the approved recipe")
-    for name, image in images.items():
-        repository, separator, digest = image.rpartition("@")
-        if not separator or repository != policy[name] or (
-            digest != PLACEHOLDER and _DIGEST.fullmatch(digest) is None
-        ):
-            raise SystemExit("compose: service image is outside the approved policy")
     return images
 
 

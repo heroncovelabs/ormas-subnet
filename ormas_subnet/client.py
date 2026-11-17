@@ -266,6 +266,10 @@ class OrmasMinerClient:
                 base_url=self.base_url,
                 headers={"Authorization": f"Bearer {self.token}"},
                 timeout=60.0,
+                # Retain idle channels through the 15s poll without changing pool caps.
+                limits=httpx.Limits(
+                    max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0,
+                ),
                 follow_redirects=False,
                 trust_env=False,
             )
@@ -381,6 +385,59 @@ class OrmasMinerClient:
             raise ValueError("invalid queue payload")
         return payload
 
+    def list_graded_rounds(self, runner_id: str) -> list[dict[str, Any]]:
+        """GET the runner's Graded inbox, using the usual bearer/device binding."""
+        from urllib.parse import quote
+
+        if not isinstance(runner_id, str) or not runner_id.strip():
+            raise ValueError("runner_id must be a non-empty string")
+        path = f"/api/runner/v1/graded-rounds?runner_id={quote(runner_id, safe='')}"
+        headers = self._headers()
+        resp = self._client.get(path) if headers is None else self._client.get(path, headers=headers)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        if (not isinstance(payload, dict) or not isinstance(payload.get("requests"), list)
+                or any(not isinstance(entry, dict) for entry in payload["requests"])):
+            raise ValueError("invalid graded rounds payload")
+        return payload["requests"]
+
+    def answer_graded_round(
+        self, runner_id: str, request_id: str, *, job_id: str,
+        decision: str, contract_digest: str,
+    ) -> dict[str, Any]:
+        """Answer a round using its original contract digest and exact wire body."""
+        from urllib.parse import quote
+
+        body = dict(runner_id=runner_id, job_id=job_id, decision=decision,
+                    contract_digest=contract_digest)
+        if any(not isinstance(value, str) or not value.strip()
+               for value in (*body.values(), request_id)):
+            raise ValueError("graded round identifiers must be non-empty strings")
+        if decision not in {"revision_agree", "revision_decline", "change_order_decline"}:
+            raise ValueError("invalid graded round decision")
+        segment = quote(request_id, safe="")
+        if segment in {".", ".."}:
+            segment = segment.replace(".", "%2E")
+        resp = self._post(f"/api/runner/v1/graded-rounds/{segment}", body)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def submit_change_order_quote(
+        self, runner_id: str, job_id: str, *, client_request_id: str,
+        contract_digest: str, terms: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Quote configured firm/limit terms against the amended contract digest."""
+        identity = dict(runner_id=runner_id, job_id=job_id,
+                        client_request_id=client_request_id, contract_digest=contract_digest)
+        if any(not isinstance(value, str) or not value.strip() for value in identity.values()):
+            raise ValueError("graded quote identifiers must be non-empty strings")
+        if not isinstance(terms, dict) or "job_id" in terms:
+            raise ValueError("quote terms must contain only kind and pricing fields")
+        _validate_window_offer({"job_id": job_id, **terms})
+        resp = self._post("/api/runner/v1/offers", {**identity, **terms})
+        self._raise_for_status(resp)
+        return resp.json()
+
     def submit_offer(self, runner_id: str, offer: dict[str, Any]) -> dict[str, Any]:
         """POST an own offer; a replacement returns a new bid identity.
 
@@ -413,6 +470,32 @@ class OrmasMinerClient:
         self._raise_for_status(resp)
         return resp.json()
 
+    def get_offer_for_job(self, runner_id: str, job_id: str) -> dict[str, Any]:
+        """GET this runner's offer for one job after a lost POST.
+
+        ``GET /api/runner/v1/offers?runner_id=&job_id=`` is a read. It never
+        resubmits the offer. The same bearer and device headers as
+        ``get_offer`` are sent. Non-2xx responses raise ``OrmasGatewayError``.
+        """
+        from urllib.parse import quote
+
+        if not isinstance(runner_id, str) or not runner_id.strip():
+            raise ValueError("runner_id must be a non-empty string")
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job_id must be a non-empty string")
+        path = (
+            "/api/runner/v1/offers"
+            f"?runner_id={quote(runner_id, safe='')}"
+            f"&job_id={quote(job_id, safe='')}"
+        )
+        headers = self._headers()
+        resp = self._client.get(path) if headers is None else self._client.get(path, headers=headers)
+        self._raise_for_status(resp)
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("invalid offer recovery payload")
+        return payload
+
     def withdraw_offer(self, bid_id: str) -> dict[str, Any]:
         """DELETE an open own offer; a nonopen bid raises typed 409 not_open."""
         path = self._offer_path(bid_id)
@@ -425,6 +508,7 @@ class OrmasMinerClient:
         self, runner_id: str, *, ask_usd: float | None = None,
         offers: list[dict[str, Any]] | None = None,
         claim_request_id: str | None = None,
+        job_id: str | None = None,
     ) -> tuple[TaskLease, TaskDraft] | None:
         """POST /api/runner/v1/leases — typed lease+draft, or None when idle (HTTP 204).
 
@@ -443,7 +527,12 @@ class OrmasMinerClient:
         ``claim_request_id`` is an optional opaque id for this claim request.
         It is sent only when provided. The returned lease exposes the gateway's
         echo when present.
+
+        ``job_id`` limits the claim to that one job (the gateway's requested
+        job). It is sent only when provided.
         """
+        if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):
+            raise ValueError("job_id must be a non-empty string")
         if offers is not None and ask_usd is not None:
             raise ValueError("offers cannot be combined with ask_usd")
         if ask_usd is not None and (
@@ -462,6 +551,8 @@ class OrmasMinerClient:
             body["ask_usd"] = float(ask_usd)
         if claim_request_id is not None:
             body["claim_request_id"] = claim_request_id
+        if job_id is not None:
+            body["job_id"] = job_id
         resp = self._post("/api/runner/v1/leases", body)
         self._raise_for_status(resp)
         if getattr(resp, "status_code", None) == 204:
@@ -525,6 +616,25 @@ class OrmasMinerClient:
         source.seek(0)
         response = self._client.post(f'/api/runner/v1/leases/{task_segment}/publication',
             content=iter(lambda: source.read(65536), b''), headers=headers, timeout=180.0)
+        self._raise_for_status(response)
+        return response.json()
+
+    def upload_graded_artifact(
+        self, task_id: str, runner_id: str, lease_token: str, *, source, length: int,
+    ) -> dict[str, Any]:
+        """Upload a raw-file bundle to private custody, never to the repository."""
+        task_id = require_task_id(task_id)
+        headers = dict(self._headers() or {})
+        headers.update({
+            'X-Ormas-Runner-Id': runner_id, 'X-Ormas-Lease-Token': lease_token,
+            'Content-Type': 'application/vnd.ormas.public-artifact.v1',
+            'Content-Length': str(length),
+        })
+        source.seek(0)
+        response = self._client.post(
+            f'/api/runner/v1/leases/{task_id}/graded-artifact',
+            content=iter(lambda: source.read(65536), b''), headers=headers, timeout=180.0,
+        )
         self._raise_for_status(response)
         return response.json()
 

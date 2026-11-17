@@ -224,6 +224,12 @@ def test_doctor_protected_gateway_only(gateway, capsys):
     assert request.headers["X-Ormas-Runner-Device"] == "device"
 
 
+def test_release_refusals_match_gateway_vocabulary():
+    # Standalone miners do not install the private gateway package.
+    health = pytest.importorskip("tensorbox_spec.customer_api.protected_health")
+    assert cli._RELEASE_REFUSALS == health._REFUSAL_REASONS
+
+
 @pytest.mark.parametrize("changes,expected,code", [
     ({"slot_approved": False}, "fail slot: not approved", 1),
     ({"approved_worker_policy": False}, "warn worker-policy: no policy approved yet", 0),
@@ -237,6 +243,8 @@ def test_doctor_protected_gateway_only(gateway, capsys):
     ({"declared_worker_digests": []}, "warn worker-digest: none declared", 0),
     ({"last_release": None}, "warn worker-digest: no release recorded", 0),
     ({"last_release": {"worker_image_digest": OTHER_DIGEST, "at": STAMP}}, "fail worker-digest: mismatch", 1),
+    ({"last_refusal": {"reason": "binding_mismatch", "at": STAMP}}, "fail key-release: binding_mismatch " + STAMP, 1),
+    ({"last_refusal": {"reason": "other", "at": STAMP}}, "fail key-release: other " + STAMP, 1),
     ({"last_refusal": {"reason": "worker_digest_mismatch", "at": STAMP}}, "fail key-release: worker_digest_mismatch " + STAMP, 1),
     ({"last_refusal": {"reason": "worker_policy_required", "at": STAMP}}, "fail key-release: worker_policy_required " + STAMP, 1),
     ({"audit_status": "unavailable"}, "fail key-release: audit unavailable", 1),

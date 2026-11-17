@@ -48,7 +48,7 @@ mining logic.
 | 400 | `invalid_request_error` | Missing/unknown/forbidden field, bad DTO value, `failure_class_mismatch` |
 | 401 | `authentication_error` | Missing/invalid token, device mismatch, rate-limited by repeated auth failures |
 | 404 | `not_found_error` | Unknown runner/repo/task, or the tenant's runner feature is off |
-| 409 | `conflict_error` | `lease_lost`; `validator_rekey_proof_required`; `validator_rekey_mint_fence_pending`; `validator_rekey_cleanup_pending`; or `validator_decision_v2_required` |
+| 409 | `conflict_error` | `lease_lost` — the lease no longer belongs to you; `validator_rekey_proof_required` — decision-key replacement lacks valid current-key proof |
 | 429 | `rate_limited` | Daily per-token claim cap exceeded (message `"daily_claim_cap"`) |
 | 503 | `service_unavailable` | Pricing/quoting subsystem unavailable (message `"runner_pricing_unavailable"`) |
 | 500 | `internal_error` | Settlement produced no receipt (should not happen; report it) |
@@ -60,12 +60,7 @@ same shape as a `200`, replay-safe).
 ## Validator decision-key registration and re-key
 
 `POST /api/validator/v1/registrations` uses the validator bearer token and
-`{"schema_version":"ormas-validator-v1","pubkey_hex":"<Ed25519 key hex>",
-"decision_protocol_versions":["ormas-validator-decision-v1",
-"ormas-validator-decision-v2"]}`. Patched validators advertise both decision
-protocols. An omitted advertisement identifies a legacy v1-only binary during
-the compatibility phase. Once v2 is activated, legacy registrations fail with
-409 `validator_decision_v2_required`.
+`{"schema_version":"ormas-validator-v1","pubkey_hex":"<Ed25519 key hex>"}`.
 First registration (including a CVM rebind with no current key) and same-key
 registration are unchanged. Replacing an existing key without valid proof returns
 409 `conflict_error`, message `validator_rekey_proof_required`.
@@ -84,31 +79,27 @@ The lifetime reuses the Protected validator gate's existing
 in the shared Outcomes table `outcomes_validator_rekey_challenges`; miner hotkey
 nonces have a different identity/key binding and are not reused.
 
-Re-key has two distinct retryable 409 states:
+### Review slots and the signed slot proof (U3a, 2026-10-14)
 
-- `validator_rekey_mint_fence_pending` means an old-key repository-token mint may
-  still be in flight. The registry compare-and-swap did not run, so key A and its
-  generation remain the registry anchor, but a durable verified re-key intent has
-  already removed A's assignment, decision, and credential-release authority.
-  Retry the exact key-B registration after ordinary custody cleanup or attended
-  fence clearance. The original A-signed proof remains valid for that immutable
-  intent even after its challenge expires. If a restart lost the original request
-  body, the authenticated validator may omit the proof only for the intent's exact
-  key-B target; any supplied proof must exactly match the stored proof identity.
-  A new challenge cannot replace the intent. The response never includes
-  reservation, assignment, repository-token, or credential ids.
-- `validator_rekey_cleanup_pending` means key B and its generation are already
-  current, while a delivered old-assignment repository token is being revoked.
-  Old-key decisions and replacement-assignment polling remain unavailable. Retry
-  an ordinary same-key registration for B with the same bearer; no A-signed proof
-  is required or accepted for this resume step.
+Registration may also carry `slots` (integer 1–64): the number of reviews this checker
+process runs at once. Omitting it is a legacy checker; its qualification alone sets
+its slot total. On the slotted (`v3`) contract the gateway reserves at most
+min(qualified slots, `slots`) assignments per checker subject. The `v1` and
+operator-run `v2` contracts stay one reservation per subject.
 
-Callers must branch on the fixed message instead of interpreting every 409 as an
-atomic rollback. Neither state permits a fallback to the old assignment or nonce.
-The pending key-B intent never expires, cancels, or retargets automatically. Losing
-or subsequently distrusting B's private key is therefore a fail-closed availability
-incident that requires an owner-reviewed recovery; do not delete the intent or restore
-A's authority as an application retry.
+A checker started with `--slots N` above 1 first runs a boot probe: N spawned
+processes each hold `--slot-memory-mib` (default 1536) resident at the same time;
+the measured count is capped by usable CPUs. It then serves the measured count and
+registers `slot_proof`:
+`{schema_version: "ormas.checker-slot-proof.v2", subject_id, pubkey_hex,
+measured_concurrent_assignments, per_slot_memory_mib, cpu_count, measured_at, signature}`.
+`signature` is the decision key's Ed25519 signature over
+`b"ormas-checker-slot-proof:v2\x00"` plus the compact sorted-key JSON of every
+other field. The response adds `slot_proof: "accepted" | "refused"`. An operator
+may then approve up to the measured count (`public-qualifications checker-approve
+--slots N`); without an accepted proof, `slots > 1` is refused. Protected checkers
+run parallel slots too: the parent attests each assignment and hands its review
+child only that assignment's read token.
 
 The reference client's `register(current_sign_fn=...)` performs the challenge step
 only on that fixed 409 and retries registration once. The CLI accepts the retained
@@ -118,69 +109,6 @@ Protected assignment release remains bound to its attested decision key.
 A validator started with a Protected attestor processes only rows whose
 `service_level` is exactly `protected`; it never clones or signs a Standard or
 unlabeled row with the Protected process identity.
-
-## Validator decision signatures
-
-Every assignment carries `decision_protocol_version`. In the explicit
-`compat-v1` deployment phase, the patched gateway creates v1 assignments so
-old and patched validators can both drain work while the fleet is upgraded.
-After the gateway proves that the configured validator count is registered and
-every active validator affirmatively advertises v2, changing the gateway mode
-to `v2` writes a durable activation marker and all newly created or moved
-assignments use v2.
-
-For v2, the validator signs the UTF-8 bytes of the
-`ormas-validator-decision-v2` domain, a NUL byte, and compact sorted-key JSON
-with exactly `protocol_version`, `validator_id`, `assignment_id`, `decision_nonce`,
-`validator_key_generation`, `validator_pubkey_hex`, `decision_expires_at`,
-`decision`, and `evidence_digest_sha256`. `validator_pubkey_hex` is the exact
-normalized lowercase 32-byte Ed25519 public key snapshotted at assignment
-issuance. `decision_nonce` is a fresh 256-bit value for each review attempt;
-the assignment id also binds the wire operation. Public work freezes the public
-acceptance deadline as `decision_expires_at`; ordinary work uses the configured
-`OUTCOMES_VALIDATOR_DECISION_TTL_S` (with the existing positive public-acceptance
-timeout as the compatibility fallback). Expiry is exclusive: a decision created
-at or after that timestamp is refused. The gateway rebuilds this message from the
-authenticated validator and its stored assignment; none of those binding fields
-is accepted from the request.
-
-Verification uses the assignment's snapshotted key. The atomic decision INSERT
-also requires that exact key and generation to remain the validator registry's
-current authority and that the stored expiry still equals the signed expiry. A
-proven re-key increments the generation. Every live undecided v2 assignment from
-an older generation is replaced with a fresh assignment id and nonce for the new
-key; interruption can leave the old attempt unavailable, never transferable to
-the new key. V1 rows are bound to their snapshotted key where the gateway can
-reconstruct it. Rekey therefore invalidates an outstanding v1 drain row instead
-of letting the new key inherit its digest-only authority.
-
-A successfully inserted decision, its assignment marker, and its recovery event
-are one durable database operation. Finalization evaluates the assignment,
-qualification contract, quorum, and deadlines at each persisted decision's
-`created_at`, so a timely vote remains authoritative if recovery runs after the
-deadline or after a later re-key/revocation. The event stays pending until its
-history row, retry or settlement, receipt-keyed debit handoff, terminal job state,
-and webhook outbox handoff are durable. Exact POST replay and the periodic sweep
-resume that same event.
-
-The activation statement atomically snapshots the finite set of v1 assignment
-IDs permitted to drain. Only those exact IDs retain digest-only verification;
-their signed identity cannot be recycled into new v1 work. A retry after an
-`error` or a stale reassignment after activation is a fresh v2 attempt with a
-fresh nonce. Missing or unknown versions fail closed, and v2 never falls back
-to v1 after a signature mismatch. The gateway rejects old-binary registrations
-and old-gateway NULL/v1 writes after activation.
-
-`OUTCOMES_VALIDATOR_DECISION_PROTOCOL` is required and has two values:
-
-- `compat-v1`: gateway-first compatibility phase; legal only before activation
-  and before any v2 row exists.
-- `v2`: require full fleet proof, atomically activate once, and stay on v2.
-
-After the activation marker or any v2 row exists, configuring `compat-v1`
-fails startup. Application rollback is therefore roll-forward only. Preserve
-the database, activation marker, v1 drain snapshot, assignments, and decision
-events while replacing a bad binary with a fixed v2-capable build.
 
 ## Lifecycle
 
@@ -235,6 +163,11 @@ Register (or re-register) this miner.
 | `miner_id` | str, optional | Chosen public miner identity. Lowercase, 3–40 chars, `[a-z0-9][a-z0-9-]*`. Globally unique (409 if another runner holds it); the same runner may re-register with its own id. When set, claims, receipts (`worker_id`) and the hotkey identity become `miner:<miner_id>` instead of `miner:<tenant>`. Omit for a byte-identical-to-today body |
 
 **Response**: `{"runner_id": str, "poll_interval_s": int, "lease_ttl_s": int, "heartbeat_s": int, "protocol": "ormas-runner-v1", "miner_id"?: str, "qualification"?: object}`. `miner_id` is echoed only when the runner registered one.
+
+Clients may enqueue or update buyer policies (including manual and time-value), clocks,
+fallback, `min_sample` and `prefer_affiliation="independent"`; only `only_miners`,
+`prefer_miners` and `qualification` require an operator-owned tenant, with fair-price
+and reserve checks unchanged.
 
 `qualification` appears only when this token's daily claim cap is 0 and the operator has
 approved a miner slot for `miner:<miner_id>`. The gateway then reserves one qualification
@@ -408,7 +341,8 @@ new `bid_id`; the old open bid becomes `replaced`.
 `get_offer(bid_id)` reads an own bid only. Encode the id as one URL segment.
 The response is `{"bid_id": str, "status": str, "award_id"?: str}`. Statuses
 include `open`, `awarded`, `not_awarded`, `withdrawn`, `replaced`,
-`no_capacity` and `award_lapsed`. An awarded offer that is never claimed within
+`no_capacity` (miner or acceptance capacity), and
+`award_lapsed`. An awarded offer that is never claimed within
 three gateway poll intervals becomes terminal `award_lapsed`. The gateway records
 one failed delivery commitment for that miner and comparable task shape. It creates
 no receipt, customer debit, settled price, calibration or delivery-time sample.
@@ -416,7 +350,13 @@ That commitment survives any later delivery of the job. The job can receive its
 next award or return to the queue. A miner may submit a fresh bid at identical terms
 after observing its own `award_lapsed` status. Saved awards recover through this
 explicit status; other award identity mismatches require recovery. Pending offer
-POSTs and execution start/completion records retain their existing fences.
+POSTs are recovered with `GET /api/runner/v1/offers?runner_id=&job_id=`
+(`get_offer_for_job(runner_id, job_id)`). The response shape is
+`{job_id, window_closed, bid|null}`. A bid carries `bid_id`, `status`,
+`terms`, `ack_by_at`, `window_closes_at`, and `award_id` / `job_status` when
+awarded. `window_closed` answers closure from the job row. The read never
+replays the POST. The reference miner performs it on restart before offering
+again. Execution start/completion records retain their existing fences.
 Losing offers become `not_awarded`. If the earlier winner
 fails to claim, the gateway may reopen a `not_awarded` bid and award it at its
 frozen terms. The gateway owns these status transitions. This route exposes
@@ -466,9 +406,15 @@ has reconciled awards. The default legacy route accepts on arrival within the
 client's undisclosed spending limit. Saved window identities remain required
 for every window award returned by either claim path.
 
-Recovery limits: the gateway provides neither an own-offer listing nor a POST
-idempotency key. A lost POST acknowledgement leaves a durable unresolved intent;
-the miner refuses further claims until an operator recovers its own bid identity.
+Recovery limits: offer submission has no POST idempotency key. A lost
+acknowledgement leaves a durable pending intent. On restart, before offering
+again, the reference miner performs one
+`GET /api/runner/v1/offers?runner_id=&job_id=`. That read never replays the
+POST. It adopts a matching own bid, or clears the intent when the window is
+closed and no adoptable bid remains, and does not resubmit that job in the
+same poll. A 5xx, transport error, malformed body, untyped 404 from an older
+gateway, or a still-open window with no bid keeps the intent and refuses the
+poll. There is no miner-side timeout.
 The queue also omits a window identity for reopened jobs. The reference miner
 retains unchanged bid records and avoids automatic same-price resubmission
 for such a job. It reconciles gateway-owned reopening and awards at the saved
@@ -531,11 +477,25 @@ lease echoes the originally stored id (null if none), without replacing it.
 - `204 No Content` — nothing queued for this miner right now.
 - `200` — `{"lease": <TaskLease wire>, "draft": <TaskDraft wire>}`.
 
-Below its registered capacity, a runner receives a new lease. At capacity, the
-claim returns an already-running lease (same lease token, refreshed draft)
-instead of another one. An empty offers list may also re-serve a running lease
-below capacity. `claim_request_id` is on the payload only when this request sent
-a valid id, and then it is the original stored value.
+Below its registered capacity, a runner first tries work already awarded to it,
+subject to all current admission, qualification and capacity checks. A stale
+running lease does not preempt an eligible pending award. If no matching award
+can be leased, an eligible stale running lease is recovered before unawarded
+queued work. An empty offers list can claim an existing award or recover a stale
+lease, but still declines new legacy jobs.
+
+At capacity, no additional job is leased. A single-slot runner can recover its
+own running lease. Where sibling holders are possible (multiple registered slots
+or multiple running leases), only a stale lease can be re-served; live holders
+receive no duplicate lease. Staleness uses the existing two-missed-heartbeat
+rule. Re-serving retains the lease token and stored expiry; only a heartbeat
+renews the lease.
+
+The optional `job_id` in the gateway request body applies to new claims and recovery:
+a successful response always identifies that job, never an unrelated running
+lease. Naming a job does not permit replay of a live sibling's lease.
+`claim_request_id` is on the lease only when this request sent a valid id, and a
+re-served lease carries its original stored value.
 
 Offer-specific fields from a successful limit claim (`lease` projection):
 
@@ -551,6 +511,11 @@ Offer-specific fields from a successful limit claim (`lease` projection):
 
 A firm claim has `offer_kind: "firm"`, its price as `outcome_price_usd`, and
 `estimate_usd: null` and `limit_usd: null`. Legacy responses omit these offer fields.
+
+An `offers` claim whose accepted offer carried `wall_s` also has `wall_s` (seconds)
+and `solve_deadline_at` (ISO-8601 UTC): the grant time plus `wall_s`, fixed when the
+lease was granted. Heartbeat renewal and re-serving never move it. Both keys are
+omitted when the accepted offer had no `wall_s`, and on every non-`offers` claim.
 
 **`TaskLease`**: `lease_id` (also the *lease token* used in every subsequent
 call for this task), `task_id`, `expires_at`, `selected_cell`, `provider_pin`,
@@ -573,6 +538,18 @@ task description), `verify_command`, `allowed_paths`, `budget_usd`,
 `work_packet` (the full frozen packet — task, acceptance criteria, etc.),
 `work_packet_sha256`, `attempt`, `parent_job_id` (non-empty on a repair),
 `repair_findings`, `repair_evidence` (present only on a repair attempt).
+
+`work_packet.execution_policy.max_turns` remains in the wire format as advisory
+metadata for compatibility. It is neither an attempt stop criterion nor a
+validator success criterion. An attempt ends on delivery, the miner's dollar
+fence, or the wall clock (`wall_timeout_s`). Miners may choose internal per-phase
+turn heuristics as part of their own harness.
+
+Advisory does not remove wire-shape or integrity validation: policy digests,
+packet hashes, signed assignment evidence, and the existing dollar and wall-clock
+boundaries still apply. This contract records the turn-limit retirement; it does
+not assert that every worker or runtime path has migrated or that a new release
+has deployed it.
 
 ### Public execution and acceptance additions (September 23 development candidate)
 
@@ -599,13 +576,7 @@ The gateway and SDK recompile and compare the executable/configuration against t
 frozen catalog. They do not trust a client-supplied wrapper merely because its shape
 looks valid. Historical catalogs remain loadable for evidence and profile
 interpretation, while execution also requires the catalog's verifier compiler hash
-to be on the explicit active allowlist or match an explicit catalog/compiler draining
-pair. The deployed `2026-10-14.4` catalog (`sha256:ff7c1e51…`) is draining only with
-compiler `214eadfb…`; this does not make that compiler active for any other catalog.
-The public `2026-10-14.4` (`sha256:398f6c9f…`, compiler `2ba99054…`) remains the default.
-Compare catalogs by digest, not revision label. The draining verifier predates
-trusted-tool hardening; packet validation still rejects revoked acceptance drivers.
-Other revoked compilers, including `6208cd15…`, fail closed even for an
+to be on the explicit active allowlist. A revoked compiler fails closed even for an
 already admitted packet. Before revocation rollout, inventory queued, leased and
 recovery-pending packets using that compiler; drain or expire them, then recompile
 their frozen inputs with an active compiler and requeue them under a new agreement.
@@ -708,6 +679,11 @@ the canonical branch before completion. Replays bind the same artifact and resul
 an ambiguous publication cannot silently become a different commit. Completion
 still uses the existing authenticated endpoint and gateway receipt authority.
 
+Publication requires the lease to have at least the publication timeout remaining.
+The runner renews the lease immediately before publishing. A 409
+`public_publication_attempt_unavailable` means insufficient lease headroom or an
+active attempt lock; renew the lease and retry once.
+
 The SDK journals the full lease, including its offer id, kind and ceiling, the
 bounded artifact and exact completion before external effects. The saved terminal
 includes the settled price; replay uses it without calling pricing callbacks again.
@@ -718,6 +694,78 @@ retains a tombstone. An interruption before the artifact was saved reports abort
 with an unknown outcome. Corrupt/unsafe journal state refuses further work rather
 than guessing. No journal creates a second queue or settlement receipt.
 
+### Graded artifact custody
+
+A lease whose `work_packet` contains `acceptance_level: "graded"` and a
+`graded_contract` delivers to private gateway custody, **not** `/publication` or a
+miner-pushed branch. This SDK support does not enable external Graded admission:
+the gateway still refuses miners outside its admitted operator tenants with
+409 `graded_runner_not_admitted`.
+
+`POST /api/runner/v1/leases/{task_id}/graded-artifact` uses the same bearer and
+optional device headers as other lease calls, plus `X-Ormas-Runner-Id`,
+`X-Ormas-Lease-Token`, `Content-Length` and
+`Content-Type: application/vnd.ormas.public-artifact.v1`. Its body is exactly the
+raw-file framing and canonical header described above. The packet must supply
+`delivery_limits: {max_bytes, max_files}`, both positive integers; there are no
+implicit artifact limits. Bodies must fit `max_bytes`, changed-file entries
+(including deletions) must fit `max_files`, and the header is at most 1 MiB.
+The public serializers enforce path safety and immutable paths and serialize
+committed regular files only. `build_raw_file_artifact` enforces `allowed_paths`
+by default; `build_graded_artifact` does not require or enforce that list, matching
+the gateway. Graded scope is judged against the contract's expected/permitted paths.
+
+A successful acknowledgement is exactly
+`{"status":"held","artifact_digest":"<lowercase SHA256 of the entire framed body>"}`.
+It confirms retained custody, not publication, acceptance or payment. The miner
+must require both `held` and its own matching digest before completing. It renews
+the lease before upload and replays identical bytes after transport loss or 5xx,
+using the gateway's heartbeat cadence and lease lifetime for retry timing. A
+changed digest or status refuses completion. The existing private recovery journal
+retains the artifact before upload and the exact completion before sending it;
+restart replays those bytes without solving again, reading a repository credential,
+pushing, or fetching a client result commit. A retained Graded artifact needs no
+surviving checkout to replay. The reference miner clones its frozen base without
+credentials; a base unavailable through that route fails closed, never borrowing
+a legacy write credential. Private-repository Graded jobs at the Standard service
+level therefore fail safely: the gateway does not yet mint a lease-scoped Graded
+read credential.
+
+Errors use the standard error envelope:
+
+| HTTP | Codes / meaning |
+|---|---|
+| 400 | `graded_artifact_lease_required` for missing lease headers; `public_artifact_type_invalid`, `public_artifact_length_invalid`, `public_artifact_truncated`, `public_artifact_header_limit`, `public_artifact_header_invalid`, `public_artifact_base_mismatch`, `public_artifact_file_limit`, `public_artifact_byte_limit`, `public_artifact_path_invalid`, `public_artifact_path_collision`, `public_artifact_immutable`, `public_artifact_hash_mismatch` for invalid bundles |
+| 401 | Invalid bearer or device binding |
+| 409 | `graded_runner_not_admitted`, `lease_lost`, `miner_slot_inactive`, `graded_artifact_contract_required`, `graded_artifact_conflict`, `graded_artifact_binding_mismatch`, `graded_artifact_corrupt`, `graded_artifact_digest_mismatch` |
+| 503 | `public_publication_busy` when the shared upload slot is unavailable; `graded_artifact_readback_failed` or `graded_artifact_unavailable` for retryable custody failures |
+
+Other `graded_*` validation refusals return 409 `graded_artifact_binding_mismatch`,
+not the raw validation code; `graded_artifact_readback_failed` remains retryable 503.
+Only transport loss and 5xx are retried automatically, including during the
+pre-upload renewal. A permanent 4xx upload refusal reports `publish_failed` with
+no result identity and closes the journal on acknowledgement or terminal refusal
+of that failure report. A 409 `lease_lost`, from upload or heartbeat, closes the
+local record without completing against the revoked lease. An ambiguous failure
+report stays frozen for recovery; a mismatched hold acknowledgement retains the
+artifact. None of these paths falls back to push or public publication.
+
+Graded completion uses the ordinary `/complete` route with `result_ref: null`,
+`result_commit: ""` and **no** `pr_url` or `pr_error`. Even a locally verified result
+supplies no result identity: the gateway binds completion to the exact-lease hold
+and its own candidate identity. Supplied refs, commits or PR fields refuse with
+409 `graded_publication_forbidden`; a verified delivery without its hold refuses
+with 409 `graded_artifact_required`. Completion starts grading and returns a
+`pending_acceptance` receipt, not a self-certified payment. The gateway releases
+the artifact only after accepted disposition and confirmed settlement accounting.
+
+Graded acceptance belongs to an eligible gateway-operated acceptance seat. The
+public reference validator does not advertise that capability. If a Graded
+assignment (any top-level `graded_*` evidence key, or `acceptance_level: "graded"`)
+nevertheless reaches it, it skips the
+assignment before credentials, cloning, fetching, signing or posting any decision.
+It continues to process Verified assignments normally. Standard is the service
+level of this custody cut; this is not Protected artifact sealing.
 Recovery records created before the scope-gated artifact format (journal version 1)
 do not prove that the frozen immutable-path policy was checked. A restart can still
 turn a pre-artifact record into an aborted completion, but holds version 1 artifact
@@ -844,7 +892,8 @@ their per-job routing to qualify for network acceptance.
 `local:ormas/job/<task_id>` — anything else is rejected), `settlement_state`
 (free-form, not validated server-side today), `rating` (nullable, `"1"`–`"5"`
 as a string), `result_commit` (40-hex sha, required non-empty when
-`verification_state == "verified"`). `settled_price_usd` is optional and omitted
+`verification_state == "verified"`, except Graded custody, which requires an
+empty commit and null ref as described above). `settled_price_usd` is optional and omitted
 when null. A verified limit delivery supplies a finite value from zero through
 `limit_usd`; the client is charged exactly that price on accepted delivery.
 Firm/legacy terminals and non-deliveries omit `settled_price_usd`.
@@ -948,8 +997,9 @@ pending receipts before validator acceptance makes them payable. Client copy is
 fixed: “Ormas could not confirm Protected execution; nothing was charged.”
 Standard jobs do not read the release store and keep their existing settlement
 rules. Receipts expose only the successful release's `worker_image_digest`, not
-provider policy contents. `/health` counts these receipt-backed refusals in its
-Protected block when the watch store is available.
+provider policy contents. The operator's authenticated health route counts these
+receipt-backed refusals in its Protected block when the watch store is available.
+Public `/health` exposes health booleans and release identity, not job counts.
 
 ### Pricing callbacks in the reference skeleton
 

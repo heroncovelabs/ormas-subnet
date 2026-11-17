@@ -86,7 +86,7 @@ ormas-miner register --miner-id your-miner-name \
   --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ormas-miner doctor
 ormas-miner run --runner-id <assigned-id> --miner-id your-miner-name \
-  --repo-id <id> --repo-url <url> --solve-command '<cmd>' \
+  --solve-command '<cmd>' --ask-usd <your-price> \
   --cell task:code --cell task:code/small --cell task:lang/python \
   --cell task:publication/github-artifact-v1 \
   --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
@@ -96,7 +96,13 @@ Login only saves the key locally with mode `0600`; it does not register a miner.
 Doctor checks for an active registration owned by that key. The small-Python
 capability example above passes its cell checks; profile/environment qualification
 and claim approval remain separate. Keep the same cells on `run`, which registers
-again. Run uses the saved gateway and key.
+again. Run uses the saved gateway and key. Third-party miners must name a positive
+price in USD with `--ask-usd`, including for a reserved qualification job; the gateway
+does not derive one. Replace `<your-price>` above with your own price. `--offer-window`
+uses that price for firm offers. Opted-in jobs supply their own repository;
+omit `--repo-id` and `--repo-url`. Both are required with `--bind-project`.
+For a legacy job without a job-scoped repository credential, supply `--repo-url`
+as the clone fallback; without it the job fails with a clear repository error.
 Save the assigned id from registration. Keep the same `--miner-id` on every run: it
 is your public identity, and once your miner slot is approved under that name the
 gateway reserves your qualification proof job on registration (the `qualification`
@@ -136,6 +142,7 @@ client = OrmasMinerClient(base_url="https://api.ormas.ai", token=my_token)
 config = MinerConfig(
     runner_id="", runner_version="0.1.0", platform="linux",
     capacity=1,
+    ask_usd=your_price_usd,  # Your positive firm price in USD.
     cells=(
         "task:code", "task:code/small", "task:lang/python",
         "task:publication/github-artifact-v1", "task:acceptance/operator-run-v3",

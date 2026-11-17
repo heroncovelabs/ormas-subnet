@@ -96,8 +96,53 @@ Exit 0 with `patch.diff` but missing or invalid `metering.json` means `metering_
 
 `patch.diff` is UTF-8, NUL-free Git-style unified diff: agreeing `diff --git`, `---`/`+++` paths and counted hunks. Add only `new file mode 100644`; delete `100644`/`100755`; use `/dev/null` on the absent side. Modify preserves mode. **Renames need both from/to paths in scope and hunks; COPY blocks are refused at shell apply** (`apply_scope_mismatch`, unchanged source). Empty-file add/delete and hunkless moves fail. Preserve file bytes: diff line endings must match them; the parser tolerates trailing CR on header lines, but `git apply` is byte-exact. `\ No newline at end of file` marks missing final LF.
 
-Scope is anchored: exact names are exact-only; `dir/**` is a subtree, `*`/`?` stay within segments, `**` spans directories, `[` is literal. No unsafe/traversal/absolute/drive/backslash/control/quoted paths, `.git` components, `.gitattributes`, `.gitmodules`, binary patches, symlink/gitlink entries, mode changes or duplicate case/NFC aliases. Immutable checks include case/NFC aliases. Text refusals: `patch_not_utf8`, `patch_nul`, `not_a_git_diff`, `path_traversal`, `path_mismatch`, `control_path`, `symlink_entry`, `gitlink_entry`, `mode_change`, `binary_patch`, `quoted_path`, `path_not_allowed`, `immutable_path`, `duplicate_path`, `malformed_patch`.
+Scope is anchored: exact names are exact-only; `dir/**` is a subtree, `*`/`?` stay within segments, `**` spans directories, `[` is literal. No unsafe/traversal/absolute/drive/backslash/control/quoted paths, `.git` components, `.gitattributes`, `.gitmodules`, binary patches, symlink/gitlink entries, mode changes or duplicate case/NFC aliases. Immutable checks include case/NFC aliases. If any allowed entry is root-covering (including a leading glob), secret basenames and directory components matching `.env`, `.env.*`, `*.key` or `*.pem` are refused on case/NFC aliases. Bounded explicit paths are unchanged. Structural checks precede immutable checks, then secret checks, then the allowlist. Text refusals: `patch_not_utf8`, `patch_nul`, `not_a_git_diff`, `path_traversal`, `path_mismatch`, `control_path`, `symlink_entry`, `gitlink_entry`, `mode_change`, `binary_patch`, `quoted_path`, `path_not_allowed`, `immutable_path`, `secret_path`, `duplicate_path`, `malformed_patch`.
 
 **Live:** Docker archive intake reports `artifact_invalid` / `artifact_too_large`; solve maps launcher/process/missing-on-0 failures to `worker_failed`, exit 2 to a bounded no-patch retry (or terminal `worker_no_patch` when authority is exhausted / `metering_unknown` when cost is unknown), wall kill to `worker_timeout`, cancellation to `worker_cancelled`. Text/apply/verifier failures are `patch_rejected` / `apply_rejected` / `verify_failed`; offer failures become `offer_invalid`. **Local harness only:** `read_patch` diagnostics `artifact_name`, `artifact_symlink`, `artifact_not_regular`, `artifact_missing`, `artifact_empty` (plus its `artifact_too_large`); `copy_unsupported` adds the apply restriction without changing the shell text parser. Conformance requires Python ≥ 3.12 and Unicode 15.0.0.
+
+## Miner-private failure evidence
+
+The shell adds optional `protected_failure` to `ormas.outcomes-failure-evidence.v1`.
+This is **not** a worker output or a new `metering.json` field. It is available only
+on the miner's own authenticated failure-evidence routes (miner session and miner
+token); other miners cannot read it. Client status (including MCP), receipts,
+webhooks and public projections omit the entire summary and its diagnostic keys.
+
+| Field | Shell observation |
+| --- | --- |
+| `reason_code` | Closed shell refusal token, such as `metering_unknown`; unknown codes become `other`, never free text. |
+| `relay_refusals` | Counts by closed relay reason code, including `job_spend_authority_unavailable`, `job_spend_cap`, `spend_unbounded`, `upstream_http_error`, `model_not_allowed` and `served_model_mismatch`. Unknown codes aggregate into `other`. |
+| `requested_models` | Deduplicated canonical identifiers observed by the relay, including supported aliases and adapter-qualified ids denied by the slot policy. Only ids named by the slot policy or adapter are retained; arbitrary denied strings are represented by refusal counts alone. Miner-private; never client-visible. |
+| `worker_exit_code` | Observed Docker worker exit status. Omitted if the worker never started, no exit was observed, or the launcher returned a synthetic kill status. |
+| `metering_written` | `true` when a regular `metering.json` artifact was retrieved (even if its JSON is invalid); `false` when Docker reported the archive path absent. Omitted when not observed: no worker, interrupted retrieval, or invalid/oversized archive. Absence is not `false`, and presence is not valid or complete metering. |
+
+The relay summary is bound to a fresh shell-generated invocation UUID, not merely
+the job id. The shell creates a private 0600 file outside the worker volume; the
+relay updates it under a file lock before returning refusals, and the launcher
+reads and removes it on completion. Late requests cannot write into the next
+invocation. A failure reports the final invocation, not a previous attempt's meter.
+Post-exit archive or cleanup failures preserve the observed exit and relay snapshot
+before cleanup removes the private file. They remain launcher failures, not retryable
+worker no-patch outcomes. Meter presence stays omitted if retrieval failed before it
+was observed. If relay observations are unavailable, their fields are omitted.
+No stdout/stderr, request/response content, environment values, credentials, or
+provider identity are included. Worker-printed refusal markers do not classify a
+verifier failure: only the trusted runtime exit 98 plus its marker does.
+
+Representation bounds (not execution limits): the closed relay vocabulary has
+33 buckets, each at most 34 ASCII characters; counters saturate at the existing
+JSON exact-integer ceiling, 2^53. Canonical ids use the adapters' plain-id grammar
+`[a-z0-9][a-z0-9.-]*`. The producer's finite model domain is the union of the actual
+slot policy and the adapter's qualified set (Frontier has no enumerated set, so its
+slot supplies the domain). Each id occurs at most once. Maximum count is that
+union's cardinality; maximum length is its longest id; maximum compact JSON size
+is calculated from every id and every closed counter at its ceiling. Aliases are
+canonicalized before observation. No catalog-snapshot count or length cap applies.
+The locked private file contains only those policy-bounded observations; the
+launcher reads its current snapshot size. Gateway ingest has no private slot policy:
+it revalidates the canonical grammar and closed fields, then keeps only ids in the
+adapters' enumerated qualified sets (Frontier ids are dropped there) — membership,
+with no count cap. These miner-provided fields
+remain private diagnostics, never spend/retry authority or delivery evidence.
 
 After stopping the worker, the shell reads capped output, checks original authority, applies on a fresh checkout and runs its verifier. **Only shell verification and independent acceptance decide delivery**, never worker self-checks.

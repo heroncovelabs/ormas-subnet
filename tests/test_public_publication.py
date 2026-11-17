@@ -44,6 +44,11 @@ class _PublishClient:
     def __init__(self, *, commit: str, tree: str) -> None:
         self.commit = commit
         self.tree = tree
+        self.heartbeats: list[tuple[str, str, str, bool]] = []
+
+    def heartbeat_task(self, task_id, runner_id, lease_token, *, renew):
+        # The skeleton renews the lease before each publish.
+        self.heartbeats.append((task_id, runner_id, lease_token, renew))
 
     def publish_result(self, task_id, runner_id, lease_token, *, source, length):
         del runner_id, lease_token

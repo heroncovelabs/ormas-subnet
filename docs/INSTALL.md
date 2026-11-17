@@ -29,7 +29,7 @@ Installing this candidate does not activate it in production.
   clone anonymously; private-repository jobs use a per-job read credential for both
   miners and validators. A legacy unbound claim carries `repo_credential`; the bind
   fallback uses access you already hold.
-- A runner key (starts `ormr_`). Mint it yourself: sign in at [ormas.ai](https://ormas.ai), open **Miner → Runner keys**, and create a key. It is shown once; save it with `ormas-miner login`. A new key is **register-only** (daily claim cap 0): it can register your miner and hotkey and submit qualification evidence against `https://api.ormas.ai`, but job claims return 429 until the operator approves your qualification and raises the cap (see [`CONTRACT.md`](CONTRACT.md)). Keys do not expire; revoke a key to stop it. To change the key on an existing miner, write to ops@ormas.ai. A project id and base commit are needed only for the bind fallback.
+- A runner key (starts `ormr_`). Mint it yourself: sign in at [ormas.ai](https://ormas.ai), open **Miner → Runner keys**, and create a key. It is shown once; save it with `ormas-miner login`. A new key is **register-only** (daily claim cap 0): it can register your miner and hotkey and submit qualification evidence against `https://api.ormas.ai`, but ordinary job claims return 429 while the cap is zero. A qualification job reserved for your approved miner slot is exempt from the cap and still requires your own price (see [`CONTRACT.md`](CONTRACT.md)). Keys do not expire; revoke a key to stop it. To change the key on an existing miner, write to ops@ormas.ai. A project id and base commit are needed only for the bind fallback.
 
 ## Install (recommended)
 
@@ -117,12 +117,15 @@ and qualification remain separate checks.
 
 ## Run
 
-Run the reference loop with your solve command. Keep the same cells: `run`
+Run the reference loop with your solve command and your positive price in USD.
+Third-party miners must name a price, including for a reserved qualification job;
+the gateway does not derive one. Replace `<your-price>` below with your own price.
+`--offer-window` uses that price for firm offers. Keep the same cells: `run`
 registers again before polling.
 
 ```bash
 ormas-miner run --runner-id <assigned-id> --miner-id your-miner-name \
-  --repo-id <id> --repo-url <url> --solve-command '<cmd>' \
+  --solve-command '<cmd>' --ask-usd <your-price> \
   --cell task:code --cell task:code/small --cell task:lang/python \
   --cell task:publication/github-artifact-v1 \
   --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
@@ -141,11 +144,16 @@ The equivalent source-checkout command is:
 ```bash
 python neurons/miner.py --gateway https://api.ormas.ai \
   --token-env ORMAS_MINER_TOKEN --runner-id <assigned-id> --miner-id your-miner-name \
-  --repo-id <id> --repo-url <url> --solve-command '<cmd>' \
+  --solve-command '<cmd>' --ask-usd <your-price> \
   --cell task:code --cell task:code/small --cell task:lang/python \
   --cell task:publication/github-artifact-v1 \
   --cell task:acceptance/operator-run-v3 --cell task:preflight/deferred-v1
 ```
+
+Opted-in packet jobs supply their own repository, so omit `--repo-id` and
+`--repo-url`. Both flags are required with `--bind-project`. On the legacy path,
+`--repo-url` supplies the clone fallback when the job has no repository credential;
+without a usable job repository or fallback, the job fails before cloning.
 
 ## Token and URL — never on argv
 
@@ -192,14 +200,6 @@ ormas-validator --gateway https://api.ormas.ai \
 Both files must be private to the service account. The decision key is separate
 from a Bittensor chain hotkey. `--once` reviews at most one assignment and returns
 3 when idle. The old `python neurons/validator.py` script delegates to this command.
-The checker accepts exactly one review slot. Parallel children share the service
-account's credential and signing boundary, so `--slots` values above one fail before
-the token or decision key is read. This lowers per-process throughput. Restore
-capacity only with additional validator identities that the gateway has separately
-registered and qualified, each running one process with its own service account or
-VM, token, decision key and work directory. Do not run those identities under a
-shared UID or filesystem namespace; when no separately qualified identity is
-available, process one assignment at a time.
 Public task checks need a qualified nonroot Linux/amd64 OCI environment. Keep the
 checker account, container authority, work directory and credentials separate from
 the wallet-bearing weight submission service. A rootful Docker socket can access
@@ -248,6 +248,7 @@ config = MinerConfig(
     runner_version="0.1.0",
     platform="linux",
     capacity=1,
+    ask_usd=your_price_usd,  # Your positive firm price in USD.
     cells=(  # small-Python capabilities — see notes below
         "task:code", "task:code/small", "task:lang/python",
         "task:publication/github-artifact-v1", "task:acceptance/operator-run-v3",
@@ -324,12 +325,12 @@ Four fields a newcomer cannot guess:
   register and, since gateway `2026.09.12`+1, a third-party miner registering only those never
   leases work. Registration accepts any string; a cell no queued job carries simply never leases.
 - **`workdir_root`** — client clones land here, one directory per `task_id`; keep it private and persistent (`mkdir -p -m 700 ~/.ormas/work`). Public-profile jobs retain their checkout and journal for recovery after a crash. The legacy route retains its fresh-checkout behavior. Do not delete a public-profile recovery directory to force a new claim.
-- **`repo_url`** — `MinerConfig` requires it, but on the legacy credential path it is only the fallback: `_clone_and_checkout` clones `draft.repo_url` whenever the draft carries a `repo_credential` and a non-empty `repo_url`, and clones `config.repo_url` only when it does not. Point it at a repository you actually hold, or at the bound repository if you use the fallback below.
-- **`repo_id`** — `MinerConfig` requires it; it is the id sent in a bind request (`RepoRegistration.repo_id`). On the credential path the draft's own `repo_id` describes the job, and this field is not used to choose the clone source.
+- **`repo_url`** — the CLI flag is optional unless `--bind-project` is given; library callers pass `repo_url=""` when no fallback is needed. Packet jobs always use `draft.repo_url`. On the legacy credential path it is only the fallback: `_clone_and_checkout` clones `draft.repo_url` whenever the draft carries a `repo_credential` and a non-empty `repo_url`, and clones `config.repo_url` only when it does not. If supplied, point it at a repository you actually hold, or at the bound repository if you use the fallback below. A legacy job with neither a usable job repository credential nor a configured fallback fails with an error naming `--repo-url`, before invoking Git.
+- **`repo_id`** — the CLI flag is optional unless `--bind-project` is given; library callers pass `repo_id=""` when unbound; it is the id sent in a bind request (`RepoRegistration.repo_id`). On the credential path the draft's own `repo_id` describes the job, and this field is not used to choose the clone source.
 
 The reference solver runs `true` — a no-op that commits an empty result. It exists so the loop runs end to end with no model call, and against a task whose verify expects a change it completes with `failed`, which is the honest outcome of doing nothing.
 
-The same loop is available as `ormas-miner run --runner-id <assigned-id> --repo-id <id> --repo-url <url>` with the `--miner-id`, repeated `--cell` and `--solve-command` flags from [Run](#run). It uses your saved credentials or an explicit `--token-env` / `--token-file`, and prints the assigned `runner_id=…` on stderr after registration. The equivalent source-checkout form is `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN` followed by the same run flags.
+The same loop is available as `ormas-miner run --runner-id <assigned-id>` with the `--miner-id`, repeated `--cell` and `--solve-command` flags from [Run](#run). It uses your saved credentials or an explicit `--token-env` / `--token-file`, and prints the assigned `runner_id=…` on stderr after registration. The equivalent source-checkout form is `python neurons/miner.py --gateway … --token-env ORMAS_MINER_TOKEN` followed by the same run flags.
 
 ## Fallback: bind a repository you already hold locally
 
@@ -342,7 +343,7 @@ skeleton.bind(
 )
 ```
 
-The CLI equivalent is `--bind-project <project_id> --bind-base-commit <sha>` on `neurons/miner.py`. `tests/test_skeleton_repo_credential.py::test_no_credential_keeps_configured_clone_source` pins this behaviour.
+The CLI equivalent adds `--repo-id <id> --repo-url <url> --bind-project <project_id> --bind-base-commit <sha>` on `neurons/miner.py`. `tests/test_skeleton_repo_credential.py::test_no_credential_keeps_configured_clone_source` pins this behaviour.
 
 One gateway rule applies to both legacy paths: a third-party claim leases only when the gateway has a validator count configured, because a third-party delivery settles on validator acceptance, never on the miner's own report (`docs/protocol.md` §Lifecycle; [`README.md`](../README.md) "What this is NOT" for the production state).
 

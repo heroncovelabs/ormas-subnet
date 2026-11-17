@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
-from urllib.parse import unquote
+import json
+from urllib.parse import parse_qs, unquote
 
 import pytest
 
@@ -30,6 +31,7 @@ class OfferTransport:
         self.legacy = set()
         self.queue_response = None
         self.lease_response = None
+        self.recovery_response = None
         self.source = None
 
     def conflict(self, message):
@@ -95,6 +97,30 @@ class OfferTransport:
                     if job["job_id"] == self.bids[self.award]["terms"]["job_id"]:
                         job.update(awarded_to_you=True, bid_id=self.award, award_id="awd_1")
             return _FakeResponse(200, {"jobs": jobs})
+        if path.startswith("/api/runner/v1/offers?"):
+            # Lost-POST recovery: this runner's own bid, or window_closed when absent.
+            if isinstance(self.recovery_response, BaseException):
+                raise self.recovery_response
+            if self.recovery_response is not None:
+                return self.recovery_response
+            job_id = (parse_qs(path.split("?", 1)[1]).get("job_id") or [None])[0]
+            own = [(bid_id, bid) for bid_id, bid in self.bids.items()
+                   if (bid.get("terms") or {}).get("job_id") == job_id]
+            if not own:
+                return _FakeResponse(200, {"job_id": job_id, "window_closed": True, "bid": None})
+            bid_id, bid = own[-1]
+            payload = {
+                "bid_id": bid_id,
+                "status": bid["status"],
+                "terms": deepcopy(bid["terms"]),
+                "ack_by_at": "2026-10-08T00:00:01Z",
+                "window_closes_at": "2026-10-08T00:10:00Z",
+            }
+            closed = bid["status"] != "open"
+            if self.award == bid_id:
+                payload.update(status="awarded", award_id="awd_1", job_status="offering")
+                closed = True
+            return _FakeResponse(200, {"job_id": job_id, "window_closed": closed, "bid": payload})
         bid_id = unquote(path.rsplit("/", 1)[1])
         if self.error is not None:
             if isinstance(self.error, BaseException):
@@ -381,7 +407,7 @@ def test_not_awarded_can_reopen_and_win_at_frozen_terms(tmp_path):
     assert transport.source.completed["terminal"]["verification_state"] == "verified"
 
 
-@pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed"])
+@pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "acceptance_capacity", "award_lapsed"])
 def test_losing_status_never_executes(tmp_path, status):
     transport, miner = window_miner(tmp_path)
     assert miner.run_once() is False
@@ -395,7 +421,7 @@ def test_losing_status_never_executes(tmp_path, status):
     assert transport.bids["bid_1"]["status"] == status
 
 
-@pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed"])
+@pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "acceptance_capacity", "award_lapsed"])
 def test_explicitly_changed_terms_can_submit_after_terminal_bid(tmp_path, status):
     terms = {"job_id": "task_1", "kind": "firm", "price_usd": 1.25}
     transport, miner = window_miner(tmp_path, lambda _: dict(terms))
@@ -425,7 +451,7 @@ def test_award_race_keeps_original_binding(tmp_path, race):
     assert all(body["offers"] == [] for body in claims(transport))
 
 
-@pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "award_lapsed"])
+@pytest.mark.parametrize("status", ["not_awarded", "withdrawn", "replaced", "no_capacity", "acceptance_capacity", "award_lapsed"])
 def test_terminal_bids_outside_queue_are_not_refreshed(tmp_path, status):
     transport, miner = window_miner(tmp_path)
     assert miner.run_once() is False
@@ -548,16 +574,44 @@ def test_window_ordinary_errors_propagate(tmp_path, error):
     assert claims(transport) == []
 
 
-def test_ambiguous_post_restart_refuses_unbound_execution(tmp_path):
+@pytest.mark.parametrize("variant", ["recorded", "untyped_404"])
+def test_ambiguous_post_restart_refuses_unbound_execution(tmp_path, variant):
     transport, miner = window_miner(tmp_path)
-    transport.error = RuntimeError("response lost")
+    original = transport.post
+
+    def lost(path, json=None, headers=None):
+        if isinstance(path, str) and path.endswith("/offers"):
+            body = dict(json or {})
+            transport.calls.append(("POST", path, body, headers))
+            transport.bids["bid_1"] = {
+                "terms": {k: v for k, v in body.items() if k != "runner_id"},
+                "status": "open",
+            }
+            raise RuntimeError("response lost")
+        return original(path, json=json, headers=headers)
+
+    transport.post = lost
     with pytest.raises(RuntimeError, match="response lost"):
         miner.run_once()
-    transport.error = None
+    transport.post = original
     restarted = MinerSkeleton(miner.client, miner.config, miner.solve_fn)
-    with pytest.raises(RecoveryRequired, match="offer|bid"):
-        restarted.run_once()
-    assert claims(transport) == []
+    if variant == "untyped_404":
+        transport.recovery_response = _FakeResponse(404, {"detail": "Not Found"})
+        with pytest.raises(RecoveryRequired, match="offer|bid"):
+            restarted.run_once()
+        assert claims(transport) == []
+        pending = json.loads(next(tmp_path.rglob("offers.json")).read_text())["pending"]
+        assert pending == {"job_id": "task_1", "kind": "firm", "price_usd": 1.25}
+        return
+    before = len(offers(transport))
+    assert restarted.run_once() is False
+    assert len(offers(transport)) == before
+    state = json.loads(next(tmp_path.rglob("offers.json")).read_text())
+    assert state["pending"] is None
+    assert state["current"]["task_1"] == "bid_1"
+    assert state["bids"]["bid_1"]["status"] == "open"
+    assert state["bids"]["bid_1"]["terms"]["price_usd"] == 1.25
+    assert transport.source.completed is None
 
 
 def test_public_recovery_precedes_all_offer_calls(tmp_path, monkeypatch):

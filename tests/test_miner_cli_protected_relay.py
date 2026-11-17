@@ -1,4 +1,4 @@
-"""protected-env seals SayGM frontier and Engy ZDR relay policies and keys for the shell."""
+"""protected-env seals SayGM and Engy frontier relay policies and keys for the shell."""
 from __future__ import annotations
 
 import json
@@ -15,7 +15,7 @@ SAYGM = "saygm_key_canary_0123456789"
 ENGY = "engy_key_canary_0123456789"
 ENGY_MODELS = [
     "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "qwen3.8-27b",
-    "glm-5.3-flash", "glm-5.2", "glm-5.3", "kimi-k3",
+    "glm-5.3-flash", "glm-5.2", "glm-5.3", "kimi-k3", "kimi-k3.1-pro",
 ]
 DIGEST = "sha256:" + "a" * 64
 
@@ -126,14 +126,14 @@ def engy_key(tmp_path):
     return ["--provider-key-file", str(key)]
 
 
-def test_engy_zdr_seals_policy_and_key_for_the_shell(args, engy_key, tmp_path, capsys):
-    models = ["--relay-model", "kimi-k3", "--relay-model", "deepseek-v4.1-flash"]
-    assert cli.main([*args, "--relay", "engy-zdr", *models, *engy_key]) == 0
+def test_engy_frontier_seals_policy_and_key_for_the_shell(args, engy_key, tmp_path, capsys):
+    models = ["--relay-model", "kimi-k3.1-pro", "--relay-model", "deepseek-v4.1-flash"]
+    assert cli.main([*args, "--relay", "engy-frontier", *models, *engy_key]) == 0
     fields = _fields(tmp_path)
     sealed = fields["ORMAS_PROTECTED_RELAY_POLICY_JSON"]
     policy = json.loads(sealed)
-    assert policy["provider"] == "engy" and policy["privacy_class"] == "zero_retention"
-    assert policy["models"] == ["deepseek-v4.1-flash", "kimi-k3"]
+    assert policy["provider"] == "engy" and policy["privacy_class"] == "frontier_gateway"
+    assert policy["models"] == ["deepseek-v4.1-flash", "kimi-k3.1-pro"]
     assert fields["ENGY_API_KEY"] == ENGY and fields["SAYGM_API_KEY"] == ""
     assert "ENGY" not in fields["MINER_WORKER_ENV_JSON"]
     assert ENGY not in fields["MINER_WORKER_ENV_JSON"] and ENGY not in sealed
@@ -148,13 +148,13 @@ def test_engy_zdr_seals_policy_and_key_for_the_shell(args, engy_key, tmp_path, c
         assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o600
 
 
-def test_engy_zdr_saved_policy_keeps_digest(args, engy_key, tmp_path):
-    assert cli.main([*args, "--relay", "engy-zdr", "--relay-model", "kimi-k3",
+def test_engy_frontier_saved_policy_keeps_digest(args, engy_key, tmp_path):
+    assert cli.main([*args, "--relay", "engy-frontier", "--relay-model", "kimi-k3.1-pro",
                      *engy_key]) == 0
     first = (tmp_path / "relay-policy.digest").read_text()
     saved = tmp_path / "keep.json"
     saved.write_text((tmp_path / "relay-policy.json").read_text())
-    assert cli.main([*args, "--relay", "engy-zdr", "--relay-policy-file", str(saved),
+    assert cli.main([*args, "--relay", "engy-frontier", "--relay-policy-file", str(saved),
                      *engy_key, "--force"]) == 0
     assert (tmp_path / "relay-policy.digest").read_text() == first
     assert _fields(tmp_path)["ENGY_API_KEY"] == ENGY
@@ -175,10 +175,10 @@ def test_engy_policy_digest_is_deterministic():
     ["engy/kimi-k3"], ["kimi-k3[1m]"], ["kimi-k3", "minimax-h3"],
     ["kimi-k3", "kimi-k3"],
 ])
-def test_engy_zdr_refuses_missing_or_unqualified_models(args, engy_key, tmp_path,
+def test_engy_frontier_refuses_missing_or_unqualified_models(args, engy_key, tmp_path,
                                                         capsys, models):
     flags = [value for model in models for value in ("--relay-model", model)]
-    assert cli.main([*args, "--relay", "engy-zdr", *flags, *engy_key]) == 1
+    assert cli.main([*args, "--relay", "engy-frontier", *flags, *engy_key]) == 1
     output = capsys.readouterr()
     assert ("model ids" if models else "--relay-model") in output.err
     assert ENGY not in output.out + output.err
@@ -186,9 +186,9 @@ def test_engy_zdr_refuses_missing_or_unqualified_models(args, engy_key, tmp_path
     assert not (tmp_path / "relay-policy.json").exists()
 
 
-def test_engy_zdr_refuses_missing_key_and_worker_credentials(args, engy_key, tmp_path,
+def test_engy_frontier_refuses_missing_key_and_worker_credentials(args, engy_key, tmp_path,
                                                             capsys):
-    flags = ["--relay", "engy-zdr", "--relay-model", "kimi-k3"]
+    flags = ["--relay", "engy-frontier", "--relay-model", "kimi-k3"]
     assert cli.main([*args, *flags]) == 1
     assert "ENGY_API_KEY" in capsys.readouterr().err
     (tmp_path / "worker.json").write_text(json.dumps({"ENGY_API_KEY": ENGY}))
@@ -196,3 +196,118 @@ def test_engy_zdr_refuses_missing_key_and_worker_credentials(args, engy_key, tmp
     output = capsys.readouterr()
     assert "MINER_WORKER_ENV_JSON" in output.err and ENGY not in output.out + output.err
     assert not (tmp_path / "miner.env").exists()
+
+
+def test_engy_frontier_canonical_policy_vector():
+    text, digest = protected_env.relay_policy("engy", ["kimi-k3.1-pro", "kimi-k3"], "cd" * 32)
+    assert json.loads(text) == {
+        "schema": protected_env.RELAY_POLICY_SCHEMA, "provider": "engy",
+        "privacy_class": "frontier_gateway", "models": ["kimi-k3", "kimi-k3.1-pro"],
+        "binding_salt": "cd" * 32,
+    }
+    assert digest == "7144f4a827ace7096807bcc04aea448a10796df72999b03641ca4bc0d2a8e079"
+    assert protected_env.read_relay_policy(text) == (text, digest)
+
+
+def test_engy_zdr_refuses_old_unqualified_model(args, engy_key, tmp_path, capsys):
+    assert cli.main([*args, "--relay", "engy-zdr", "--relay-model", "kimi-k3", *engy_key]) == 1
+    output = capsys.readouterr()
+    assert "model ids" in output.err and ENGY not in output.out + output.err
+    assert not (tmp_path / "miner.env").exists()
+    assert not (tmp_path / "relay-policy.json").exists()
+    assert not (tmp_path / "relay-policy.digest").exists()
+
+
+def test_engy_legacy_zero_retention_policy_is_rejected():
+    old = json.dumps({
+        "schema": protected_env.RELAY_POLICY_SCHEMA, "provider": "engy",
+        "privacy_class": "zero_retention", "models": ["kimi-k3"], "binding_salt": "cd" * 32,
+    })
+    with pytest.raises(ValueError, match="invalid relay policy file"):
+        protected_env.read_relay_policy(old)
+
+
+def test_engy_legacy_saved_policy_cannot_overwrite_an_approved_digest(args, engy_key,
+                                                                      tmp_path, capsys):
+    old = json.dumps({
+        "schema": protected_env.RELAY_POLICY_SCHEMA, "provider": "engy",
+        "privacy_class": "zero_retention", "models": ["kimi-k3"], "binding_salt": "cd" * 32,
+    }, sort_keys=True, separators=(",", ":"))
+    originals = {"miner.env": "previous-sealed-env\n", "relay-policy.json": old + "\n",
+                 "relay-policy.digest": "762737d74cdea9769ecfeff3a18dd7d3966b43873d419b35aab77299420a6370\n"}
+    for name, content in originals.items():
+        (tmp_path / name).write_text(content)
+        (tmp_path / name).chmod(0o600)
+    assert cli.main([*args, "--relay", "engy-frontier", "--relay-policy-file",
+                     str(tmp_path / "relay-policy.json"), *engy_key, "--force"]) == 1
+    output = capsys.readouterr()
+    assert "invalid relay policy file" in output.err and ENGY not in output.out + output.err
+    assert {name: (tmp_path / name).read_text() for name in originals} == originals
+
+
+ZDR_MODELS = ["kimi-k3.1-pro", "glm-5.3", "deepseek-v4.1-flash", "qwen3.8-27b"]
+
+
+def test_engy_zdr_canonical_vector_and_approval_separation():
+    text, digest = protected_env.relay_policy("engy-zdr", ZDR_MODELS, "cd" * 32)
+    assert json.loads(text)["provider"] == "engy-zdr"
+    assert json.loads(text)["privacy_class"] == "zero_retention"
+    assert json.loads(text)["models"] == sorted(ZDR_MODELS)
+    assert digest == "f83cdd7b2f70644ea7862cab07ebd266897b65418f779c78fda33b28410afef9"
+    assert protected_env.read_relay_policy(text) == (text, digest)
+    assert protected_env.relay_policy("engy-zdr", list(reversed(ZDR_MODELS)), "cd" * 32) == (text, digest)
+    assert protected_env.relay_policy("engy", ZDR_MODELS, "cd" * 32)[1] != digest
+    assert protected_env._ENGY_ZDR_MODELS == frozenset(ZDR_MODELS)
+
+
+@pytest.mark.parametrize("model", ZDR_MODELS)
+def test_engy_zdr_cli_seals_and_reuses_only_the_existing_key(args, engy_key, tmp_path, capsys, model):
+    assert cli.main([*args, "--relay", "engy-zdr", "--relay-model", model, *engy_key]) == 0
+    fields = _fields(tmp_path)
+    sealed = fields["ORMAS_PROTECTED_RELAY_POLICY_JSON"]
+    assert json.loads(sealed)["provider"] == "engy-zdr"
+    assert json.loads(sealed)["privacy_class"] == "zero_retention"
+    assert fields["ENGY_API_KEY"] == ENGY and fields["SAYGM_API_KEY"] == ""
+    assert ENGY not in fields["MINER_WORKER_ENV_JSON"]
+    digest = (tmp_path / "relay-policy.digest").read_text().strip()
+    assert protected_env.read_relay_policy(sealed) == (sealed, digest)
+    assert cli.main([*args, "--relay", "engy-zdr", "--relay-policy-file",
+                     str(tmp_path / "relay-policy.json"), *engy_key, "--force"]) == 0
+    assert (tmp_path / "relay-policy.digest").read_text().strip() == digest
+    output = capsys.readouterr()
+    assert ENGY not in output.out + output.err and model not in output.out + output.err
+
+
+@pytest.mark.parametrize("model", sorted(set(ENGY_MODELS) - set(ZDR_MODELS)) + ["unknown", "kimi-k3-tee"])
+def test_engy_zdr_codec_refuses_non_zdr_models(model):
+    with pytest.raises(ValueError):
+        protected_env.relay_policy("engy-zdr", [model], "cd" * 32)
+
+
+def test_engy_zdr_does_not_reinterpret_legacy_saved_policy(args, engy_key, tmp_path):
+    old = json.dumps(dict(schema=protected_env.RELAY_POLICY_SCHEMA, provider="engy",
+                         privacy_class="zero_retention", models=ZDR_MODELS, binding_salt="cd" * 32))
+    path = tmp_path / "legacy.json"
+    path.write_text(old)
+    assert cli.main([*args, "--relay", "engy-zdr", "--relay-policy-file", str(path), *engy_key]) == 1
+    assert not (tmp_path / "miner.env").exists()
+
+
+def test_engy_zdr_chat_only_metadata_does_not_change_policy_wire_or_digest():
+    endpoints = getattr(protected_env, "RELAY_ENDPOINTS", None)
+    assert isinstance(endpoints, dict), "codec endpoint metadata must mirror the relay allowlist"
+    assert endpoints["engy-zdr"] == frozenset({"chat_completions"})
+    for label in ("messages", "responses", "unknown-adapter", "chat-completions", ""):
+        assert label not in endpoints["engy-zdr"]
+    assert "messages" in endpoints["engy"]  # existing frontier Messages remains admitted
+    assert endpoints.get("unknown-adapter", frozenset()) == frozenset()
+    text, digest = protected_env.relay_policy("engy-zdr", ZDR_MODELS, "cd" * 32)
+    assert set(json.loads(text)) == {"schema", "provider", "privacy_class", "models", "binding_salt"}
+    assert digest == "f83cdd7b2f70644ea7862cab07ebd266897b65418f779c78fda33b28410afef9"
+    assert protected_env.read_relay_policy(text) == (text, digest)
+
+
+@pytest.mark.parametrize("provider", ["unknown-adapter", "engy-zdr/messages", "engy-zdr-unknown"])
+def test_engy_zdr_chat_only_codec_refuses_unknown_policy_adapters(provider):
+    with pytest.raises(ValueError):
+        protected_env.relay_policy(provider, ZDR_MODELS, "cd" * 32)

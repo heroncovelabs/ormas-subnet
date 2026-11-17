@@ -86,12 +86,7 @@ def _full_row(base: str, result: str) -> dict[str, Any]:
         job_id="job_p", miner_id="miner:other", base_commit=base, result_commit=result,
         repo_url=REPO_URL, verify_command="grep -q mined out.txt", allowed_paths=["out.txt"],
         immutable_paths=[])
-    return {"assignment_id": "asg_p", "validator_id": "val_p",
-            "decision_protocol_version": "ormas-validator-decision-v2",
-            "decision_nonce": "4" * 64,
-            "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
-            "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
-            "evidence_digest_sha256": evidence_digest_hex(fields),
+    return {"assignment_id": "asg_p", **fields, "evidence_digest_sha256": evidence_digest_hex(fields),
             "repo_credential": None, "service_level": "protected"}
 
 
@@ -260,15 +255,8 @@ def test_failing_evidence_source_never_reaches_release(tmp_path):
     assert gateway.releases == []
 
 
-def test_protected_mode_refuses_parallel_slots(tmp_path):
-    gateway = _ProtectedGateway(_full_row("a" * 40, "b" * 40))
-    daemon, _ = _daemon(gateway, tmp_path)
-    with pytest.raises(ValueError):
-        daemon.serve(2, 0.01, until=lambda: True)
-
-
+# U3a: Protected parallel slots are supported (tests/test_validator_slot_concurrency.py).
 @pytest.mark.parametrize("env, argv_extra, message", [
-    ({"ORMAS_PROTECTED_EVIDENCE_SOURCE": "dstack"}, ["--slots", "2"], "--slots must be exactly 1"),
     ({"ORMAS_PROTECTED_EVIDENCE_SOURCE": "fake"}, [], "must be 'dstack'"),
 ])
 def test_cli_refuses_unsafe_protected_configuration(monkeypatch, capsys, env, argv_extra, message):
@@ -322,16 +310,12 @@ def test_protected_checker_skips_standard_row_and_reviews_later_protected_row(
         job_id="job_s", miner_id="miner:other", base_commit=base, result_commit=result,
         repo_url=str(repo), verify_command="grep -q mined out.txt", allowed_paths=["out.txt"],
         immutable_paths=[])
-    standard = {"assignment_id": "asg_s", "validator_id": "val_p",
-                "decision_protocol_version": "ormas-validator-decision-v2",
-                "decision_nonce": "5" * 64,
-                "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
-                "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
+    standard = {"assignment_id": "asg_s", **fields,
                 "evidence_digest_sha256": evidence_digest_hex(fields),
                 "repo_credential": None, "service_level": "standard"}
-    legacy = {**standard, "assignment_id": "asg_legacy", "decision_nonce": "6" * 64}
+    legacy = {**standard, "assignment_id": "asg_legacy"}
     legacy.pop("service_level")
-    unknown = {**standard, "assignment_id": "asg_unknown", "decision_nonce": "7" * 64,
+    unknown = {**standard, "assignment_id": "asg_unknown",
                "service_level": "future-tier"}
     protected = _full_row(base, result)
     gateway = _StandardThenProtectedGateway(protected, [standard, legacy, unknown])
@@ -353,7 +337,7 @@ def test_protected_checker_skips_standard_row_and_reviews_later_protected_row(
     monkeypatch.setattr(daemon, "sign_fn", record_sign)
     assert daemon.run_once() is True
     assert cloned == [protected["assignment_id"]]
-    assert len(signed) == 1 and '"assignment_id":"asg_p"' in signed[0]
-    assert all(row["assignment_id"] not in signed[0] for row in (standard, legacy, unknown))
+    # main signs the v1 decision message: the protected row's evidence digest only.
+    assert signed == [protected["evidence_digest_sha256"]]
     assert [d["decision"] for d in gateway.decisions] == ["accept"]
     assert daemon._protected_tokens == {}

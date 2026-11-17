@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.0.4 — 2026-11-15
+
+- The reference miner answers Graded rounds, including offer-window awards, and
+  keeps claiming after a refused reply. Revision jobs carry their round lineage
+  and are claimed under the parent's frozen bid.
+- Refused or mismatched award leases are journaled and survive a restart.
+- Verified Git catalogs and their compiler identities are included. The active
+  compiler set adds `5bc3da22728e0e7cd0c7b447194b36f77e273310f1c2ce822e4d1ce07348b4ac`;
+  revoked compilers stay refused.
+- Verifier containers run with umask 022. An opt-in local package cache
+  (`ORMAS_VERIFIER_PACKAGE_CACHE`) reuses locked wheels; unset keeps the old behaviour.
+- Patch-scope checks refuse secret paths in root-covering scopes, and raw artifact
+  paths validate without private modules, so the package runs standalone.
+- Idle TLS channels persist across normal polls.
+- Upgrade as for 0.0.2: drain running leases and awards on the old build, back up
+  state, then register again and run `ormas-miner doctor`.
+
 ## 0.0.2 — 2026-10-14
 
 - Accept frozen packets on the deployed `2026-10-14.4` catalog

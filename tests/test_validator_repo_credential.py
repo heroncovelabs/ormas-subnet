@@ -46,11 +46,7 @@ def _assignment(repo: Path, base: str, result: str, credential: dict | None) -> 
         job_id="job_1", miner_id="miner:other", base_commit=base, result_commit=result,
         repo_url=str(repo), verify_command="grep -q mined out.txt", allowed_paths=["out.txt"], immutable_paths=[],
     )
-    a = {"assignment_id": "asgn_cred", "validator_id": "val_test",
-         "decision_protocol_version": "ormas-validator-decision-v2",
-         "decision_nonce": "b" * 64,
-         "validator_key_generation": 1, "validator_pubkey_hex": "ab" * 32,
-         "decision_expires_at": "2099-01-01T00:00:00Z", **fields,
+    a = {"assignment_id": "asgn_cred", **fields,
          "evidence_digest_sha256": evidence_digest_hex(fields), "repo_credential": credential}
     return a
 

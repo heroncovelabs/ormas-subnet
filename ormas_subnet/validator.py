@@ -7,8 +7,7 @@ same ``repo_url``, runs the same ``verify_command`` the miner ran, and reaches i
 own accept/reject conclusion from git ground truth, never from the miner's
 self-report. See ``docs/design/validator_acceptance_v2_2026_09_10.md`` §4.2-§4.3.
 
-``canonical_evidence_fields``/``evidence_digest_hex`` and
-``decision_signature_message`` below are a COPY of
+``canonical_evidence_fields``/``evidence_digest_hex`` below are a COPY of
 ``tensorbox_spec.customer_api.outcomes_validators``'s functions of the same name —
 this package must never import ``tensorbox_spec`` (``tests/test_import_graph.py``),
 so the digest math is duplicated, not shared. Keep the two byte-identical (same
@@ -55,43 +54,24 @@ from .verification_context import evidence_root
 
 __all__ = [
     "VALIDATOR_PROTOCOL_V1",
-    "VALIDATOR_DECISION_PROTOCOL_V1",
-    "VALIDATOR_DECISION_PROTOCOL_V2",
-    "SUPPORTED_VALIDATOR_DECISION_PROTOCOLS",
     "canonical_evidence_fields",
-    "decision_signature_message",
     "evidence_digest_hex",
     "make_ed25519_signer",
     "SignFn",
     "OrmasValidatorClient",
     "ValidatorConfig",
     "ValidatorDaemon",
+    "SLOT_PROOF_SCHEMA",
+    "build_slot_proof",
+    "measure_concurrent_slots",
 ]
 
 VALIDATOR_PROTOCOL_V1 = "ormas-validator-v1"
-VALIDATOR_DECISION_PROTOCOL_V1 = "ormas-validator-decision-v1"
-VALIDATOR_DECISION_PROTOCOL_V2 = "ormas-validator-decision-v2"
-SUPPORTED_VALIDATOR_DECISION_PROTOCOLS = (
-    VALIDATOR_DECISION_PROTOCOL_V1,
-    VALIDATOR_DECISION_PROTOCOL_V2,
-)
-_VALIDATOR_DECISION_V2_DOMAIN = "ormas-validator-decision-v2\x00"
-_VALIDATOR_DECISIONS = frozenset({"accept", "reject", "error"})
+VERIFY_TIMEOUT_MARGIN_S = 35
 
-# Decision message (UTF-8) or domain-separated re-key bytes -> signature_hex.
+# Decision digest_hex (UTF-8) or domain-separated re-key bytes -> signature_hex.
 SignFn = Callable[[str | bytes], str]
 REKEY_SIGNATURE_DOMAIN = b"ormas-validator-rekey-v1"
-_SINGLE_SLOT_ERROR = "checker review requires exactly one slot"
-
-
-def _require_single_checker_slot(slots: object) -> None:
-    """Disable same-UID parallel review around credentials and signing authority.
-
-    ``bool`` and numeric aliases are refused so direct callers cannot bypass the
-    same exact-one invariant the CLI enforces.
-    """
-    if type(slots) is not int or slots != 1:
-        raise ValueError(_SINGLE_SLOT_ERROR)
 
 
 def require_assignment_id(assignment_id: Any) -> str:
@@ -108,6 +88,116 @@ def _assignment_id_or_none(assignment_id: Any) -> str | None:
         return require_assignment_id(assignment_id)
     except ValueError:
         return None
+
+# ── slot proof (U3a) ─────────────────────────────────────────────────────────
+# A checker with more than one review slot proves, at boot, that this process can
+# hold that many reviews resident at once, and signs the measurement with its
+# decision key. The gateway verifies the signature against the registered key
+# (``outcomes_validators.verify_checker_slot_proof``, a byte-identical COPY of the
+# message rule below) before an operator may approve more than one slot.
+SLOT_PROOF_SCHEMA = "ormas.checker-slot-proof.v2"
+SLOT_PROOF_DOMAIN = b"ormas-checker-slot-proof:v2\x00"
+# One verifier container is capped at 1 GiB plus tmpfs/shm; the clone and git sit
+# beside it. The gateway refuses a proof under 1024 MiB per slot.
+DEFAULT_SLOT_MEMORY_MIB = 1536
+_PAGE = 4096
+
+
+def slot_proof_message(proof: Mapping[str, Any]) -> bytes:
+    body = {k: v for k, v in proof.items() if k != "signature"}
+    return SLOT_PROOF_DOMAIN + json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+
+def build_slot_proof(
+    *, subject_id: str, pubkey_hex: str, measured: int, per_slot_memory_mib: int,
+    cpu_count: int, measured_at: str, sign_fn: SignFn,
+) -> dict[str, Any]:
+    proof: dict[str, Any] = {
+        "schema_version": SLOT_PROOF_SCHEMA,
+        "subject_id": subject_id,
+        "pubkey_hex": pubkey_hex,
+        "measured_concurrent_assignments": measured,
+        "per_slot_memory_mib": per_slot_memory_mib,
+        "cpu_count": cpu_count,
+        "measured_at": measured_at,
+    }
+    proof["signature"] = sign_fn(slot_proof_message(proof))
+    return proof
+
+
+def _usable_cpus() -> int:
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # macOS has no affinity call
+        return max(1, os.cpu_count() or 1)
+
+
+def _slot_probe_child(index: int, memory_bytes: int, ready: Any, release: Any, timeout_s: float) -> None:
+    """Spawn target: touch one slot's memory, report resident, hold until released."""
+    buffer = bytearray(memory_bytes)
+    pages = (memory_bytes + _PAGE - 1) // _PAGE
+    buffer[::_PAGE] = b"\x01" * pages  # calloc'd zero pages are not resident until written
+    ready.put(index)
+    release.wait(timeout_s)
+    del buffer
+
+
+def measure_concurrent_slots(
+    slots: int, *, per_slot_memory_mib: int = DEFAULT_SLOT_MEMORY_MIB, timeout_s: float = 120.0,
+    target: Callable[..., None] | None = None,
+) -> tuple[int, int]:
+    """``(measured, cpu_count)``: how many of ``slots`` review processes were resident at once.
+
+    Each probe is a separate spawned process, as a review child is, holding one
+    slot's memory until released. Only probes that reported resident AND are still
+    alive when the parent stops waiting count: they held their memory at the same
+    moment. A probe that reported and then died (for example under the CVM's memory
+    limit) is not counted. The result is capped by usable CPUs, since each verifier
+    container runs on one.
+    """
+    import multiprocessing
+    import queue as queue_module
+
+    if type(slots) is not int or slots < 1:
+        raise ValueError("slots must be a positive integer")
+    cpu_count = _usable_cpus()
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Queue()
+    release = ctx.Event()
+    memory_bytes = per_slot_memory_mib * 1024 * 1024
+    procs = [ctx.Process(target=target or _slot_probe_child,
+                         args=(i, memory_bytes, ready, release, timeout_s),
+                         name=f"ormas-validator-slot-probe-{i}", daemon=True)
+             for i in range(slots)]
+    reported: set[int] = set()
+    resident = 0
+    try:
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + timeout_s
+        while len(reported) < slots:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                index = ready.get(timeout=min(remaining, 0.25))
+            except queue_module.Empty:
+                if not any(proc.is_alive() for proc in procs):
+                    break
+                continue
+            if type(index) is int and 0 <= index < slots:
+                reported.add(index)
+        # One snapshot while nobody is released: these probes hold memory together.
+        resident = sum(1 for index in reported if procs[index].is_alive())
+    finally:
+        release.set()
+        for proc in procs:
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(5)
+        ready.close()
+    return min(resident, cpu_count), cpu_count
 
 
 # ── execution contract ────────────────────────────────────────────────────────
@@ -347,101 +437,13 @@ def evidence_digest_hex(fields: Mapping[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def decision_signature_message(
-    *, protocol_version: str, validator_id: str, assignment_id: str,
-    decision: str, evidence_digest_sha256: str, decision_nonce: str = "",
-    validator_key_generation: int | None = None,
-    validator_pubkey_hex: str | None = None,
-    decision_expires_at: str | None = None,
-) -> str:
-    """Return the exact message signed for one validator decision.
-
-    V1 is retained only to drain assignments created by a pre-v2 gateway. V2
-    domain-separates a closed canonical envelope and binds the authenticated
-    validator identity, the assignment attempt, the exact verdict and the
-    gateway-frozen evidence digest.
-    """
-    if not isinstance(evidence_digest_sha256, str) or _SHA256_HEX_RE.fullmatch(
-        evidence_digest_sha256
-    ) is None:
-        raise ValueError("invalid evidence digest")
-    if protocol_version == VALIDATOR_DECISION_PROTOCOL_V1:
-        return evidence_digest_sha256
-    if protocol_version != VALIDATOR_DECISION_PROTOCOL_V2:
-        raise ValueError("unsupported validator decision protocol")
-    if not isinstance(validator_id, str) or not validator_id:
-        raise ValueError("invalid validator identity")
-    if not isinstance(assignment_id, str) or not assignment_id:
-        raise ValueError("invalid assignment identity")
-    if not isinstance(decision_nonce, str) or _SHA256_HEX_RE.fullmatch(decision_nonce) is None:
-        raise ValueError("invalid decision nonce")
-    if type(validator_key_generation) is not int or validator_key_generation <= 0:
-        raise ValueError("invalid validator key generation")
-    try:
-        normalized_pubkey = bytes.fromhex(validator_pubkey_hex or "").hex()
-    except (TypeError, ValueError):
-        raise ValueError("invalid validator public key") from None
-    if len(normalized_pubkey) != 64 or normalized_pubkey != validator_pubkey_hex:
-        raise ValueError("invalid validator public key")
-    if not isinstance(decision_expires_at, str) or not re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", decision_expires_at,
-    ):
-        raise ValueError("invalid decision expiry")
-    if decision not in _VALIDATOR_DECISIONS:
-        raise ValueError("invalid validator decision")
-    envelope = {
-        "assignment_id": assignment_id,
-        "decision": decision,
-        "decision_expires_at": decision_expires_at,
-        "decision_nonce": decision_nonce,
-        "evidence_digest_sha256": evidence_digest_sha256,
-        "protocol_version": VALIDATOR_DECISION_PROTOCOL_V2,
-        "validator_id": validator_id,
-        "validator_key_generation": validator_key_generation,
-        "validator_pubkey_hex": normalized_pubkey,
-    }
-    return _VALIDATOR_DECISION_V2_DOMAIN + json.dumps(
-        envelope, sort_keys=True, separators=(",", ":"),
-    )
-
-
-def _assignment_decision_protocol(assignment: Mapping[str, Any]) -> str:
-    """Resolve an explicit wire protocol without downgrade inference."""
-    version = assignment.get("decision_protocol_version")
-    if version == VALIDATOR_DECISION_PROTOCOL_V1:
-        if assignment.get("decision_nonce") is not None:
-            raise ValueError("invalid legacy decision nonce")
-        return VALIDATOR_DECISION_PROTOCOL_V1
-    if version == VALIDATOR_DECISION_PROTOCOL_V2:
-        nonce = assignment.get("decision_nonce")
-        if not isinstance(nonce, str) or _SHA256_HEX_RE.fullmatch(nonce) is None:
-            raise ValueError("invalid decision nonce")
-        generation = assignment.get("validator_key_generation")
-        if type(generation) is not int or generation <= 0:
-            raise ValueError("invalid validator key generation")
-        pubkey = assignment.get("validator_pubkey_hex")
-        try:
-            normalized_pubkey = bytes.fromhex(pubkey).hex() if isinstance(pubkey, str) else ""
-        except ValueError:
-            normalized_pubkey = ""
-        if len(normalized_pubkey) != 64 or normalized_pubkey != pubkey:
-            raise ValueError("invalid validator public key")
-        expires_at = assignment.get("decision_expires_at")
-        if not isinstance(expires_at, str) or not re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", expires_at,
-        ):
-            raise ValueError("invalid decision expiry")
-        return VALIDATOR_DECISION_PROTOCOL_V2
-    raise ValueError("unsupported validator decision protocol")
-
-
 def make_ed25519_signer(private_key_hex: str) -> tuple[SignFn, str]:
     """Build a ``(sign_fn, pubkey_hex)`` pair from a raw 32-byte Ed25519 private
 
-    key, hex-encoded. String messages are signed as UTF-8 bytes, matching the
-    gateway verifier. Bytes are signed directly for the domain-separated re-key
-    proof. New decisions sign :func:`decision_signature_message`; legacy drain
-    assignments retain their digest-only message.
+    key, hex-encoded. ``sign_fn(digest_hex)`` signs the digest's UTF-8 bytes —
+    the exact convention the gateway verifies against
+    (``outcomes_validators.verify_ed25519_signature``). Bytes are signed directly
+    for the domain-separated re-key proof; decision encoding stays unchanged.
     """
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -480,12 +482,17 @@ class OrmasValidatorClient:
                 timeout=60.0,
                 follow_redirects=False,
                 trust_env=False,
+                # Retain idle channels through the 15s poll without changing pool caps.
+                limits=httpx.Limits(
+                    max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0,
+                ),
             )
             self._owns_client = True
 
     def register(
         self, *, pubkey_hex: str, task_cells: list[str] | None = None,
-        current_sign_fn: SignFn | None = None,
+        current_sign_fn: SignFn | None = None, slots: int | None = None,
+        slot_proof: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Register; on a re-key refusal, prove the retained CURRENT key once.
 
@@ -496,11 +503,15 @@ class OrmasValidatorClient:
             "schema_version": VALIDATOR_PROTOCOL_V1,
             "pubkey_hex": pubkey_hex,
             "acceptance_contracts": list(SUPPORTED_ACCEPTANCE_CONTRACTS),
-            "decision_protocol_versions": list(SUPPORTED_VALIDATOR_DECISION_PROTOCOLS),
         }
         if task_cells is not None:
             # Only a checker that can attest advertises the Protected cell.
             body["task_cells"] = list(task_cells)
+        if slots is not None:
+            # The review count this process runs; the gateway reserves no more (U3a).
+            body["slots"] = slots
+        if slot_proof is not None:
+            body["slot_proof"] = dict(slot_proof)
         resp = self._client.post("/api/validator/v1/registrations", json=body)
         if resp.status_code == 409 and current_sign_fn is not None:
             error = resp.json().get("error")
@@ -600,18 +611,462 @@ class ValidatorConfig:
     workdir_root: Path
 
 
+@dataclass
+class _ReviewFlight:
+    """One in-flight child review. The signer stays on the parent daemon."""
+
+    proc: Any
+    recv: Any
+    assignment: Mapping[str, Any]
+    digest: str
+
+
 def _with_usable_read_credential(client: Any, assignment: Mapping[str, Any]) -> Mapping[str, Any]:
     """The assignment with its expired App read token replaced for this checker.
 
     Only an expired App token is refreshed, through the checker's own assignment.
-    Without a client the expired token is kept and the read refuses it. A refused
-    refresh raises ``GitError``.
+    Without a client (a review child) the expired token is kept and the read
+    refuses it. A refused refresh raises ``GitError``.
     """
     if not _app_read_expired(assignment.get("repo_credential")) or client is None:
         return assignment
     fresh = _refreshed_app_read(
         lambda: client.read_repository_credential(assignment["assignment_id"]))
     return {**assignment, "repo_credential": fresh}
+
+
+def _child_sign_refused(digest_hex: str) -> str:
+    raise RuntimeError("validator signing key must not enter a review child")
+
+
+# Key under which the parent hands a Protected review child its assignment's
+# sealed-then-opened read token. Never part of the signed evidence fields.
+_PROTECTED_TOKEN_KEY = "_ormas_protected_read_token"
+
+
+def _take_protected_read_token(assignment: dict[str, Any]) -> Any:
+    """Pop the parent's token handoff from a child payload; None when absent or malformed."""
+    from .protected_attestation import ProtectedReadToken
+
+    raw = assignment.pop(_PROTECTED_TOKEN_KEY, None)
+    if (not isinstance(raw, dict) or not isinstance(raw.get("token"), str)
+            or not isinstance(raw.get("expires_at"), str)):
+        return None
+    return ProtectedReadToken(token=raw["token"], expires_at=raw["expires_at"])
+
+
+def _is_graded_assignment(assignment: Mapping[str, Any]) -> bool:
+    # The gateway projects Graded evidence at top level, not in a work packet.
+    return (any(key.startswith('graded_') and value is not None for key, value in assignment.items())
+            or assignment.get('acceptance_level') == 'graded')
+
+
+def review_assignment(workdir_root: str, assignment: Mapping[str, Any]) -> str | None:
+    """Picklable child entry: clone and decide. No client and no signing key.
+
+    ``_clone`` reads ``config.workdir_root`` only. ``_decide`` uses the assignment
+    and the workdir, not the client or the signer. A Protected child gets the read
+    token its parent opened by attestation; it cannot attest itself.
+    """
+    if _is_graded_assignment(assignment):
+        return None  # Gateway-operated Graded acceptance, never a public decision.
+    payload = dict(assignment)
+    token = _take_protected_read_token(payload)
+    assignment = payload
+    reviewer = ValidatorDaemon(
+        client=None,  # type: ignore[arg-type]
+        config=ValidatorConfig(workdir_root=Path(workdir_root)),
+        sign_fn=_child_sign_refused,
+    )
+    if token is not None:
+        reviewer._protected_tokens[str(assignment.get("assignment_id"))] = token
+    workdir = reviewer._clone_with_retry(assignment)
+    if workdir is None:
+        return "error"
+    try:
+        return reviewer._decide(assignment, workdir)
+    finally:
+        reviewer._release_workdir(assignment)
+
+
+def _child_process_main(
+    send_conn: Any,
+    workdir_root: str,
+    assignment: dict[str, Any],
+    review_fn: Callable[[str, Mapping[str, Any]], str],
+) -> None:
+    """Spawn target. A missing result means the parent posts nothing."""
+    try:
+        try:
+            decision = review_fn(workdir_root, assignment)
+        except GitError:
+            decision = "error"
+        if isinstance(decision, str):
+            send_conn.send(decision)
+    finally:
+        send_conn.close()
+
+
+def _release_process(proc: Any) -> None:
+    if proc.is_alive():
+        return
+    close = getattr(proc, "close", None)
+    if close is not None:
+        close()
+
+
+def _finish_flight(flight: _ReviewFlight, poll_interval_s: float) -> None:
+    flight.proc.join(poll_interval_s)
+    try:
+        flight.recv.close()
+    except OSError:
+        pass
+    _release_process(flight.proc)
+
+
+_STILL_RUNNING = object()
+
+
+@dataclass
+class _PendingPost:
+    """A finished review whose post has not succeeded. Signed once, in the parent."""
+
+    assignment: Mapping[str, Any]
+    digest: str
+    decision: str
+    signature_hex: str
+
+
+def _http_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _is_gateway_call_error(exc: BaseException) -> bool:
+    """HTTP status or transport failure from the validator client. Not ``OSError``."""
+    try:
+        import httpx
+    except ImportError:
+        return False
+    return isinstance(exc, (httpx.HTTPStatusError, httpx.TransportError))
+
+
+def _log_gateway_failure(action: str, exc: BaseException) -> None:
+    """Class and one line, plus the HTTP status when the response has one.
+
+    No assignment body and no credential.
+    """
+    text = str(exc)
+    detail = text.splitlines()[0] if text else ""
+    status = _http_status(exc)
+    if status is not None and str(status) not in detail:
+        detail = f"{detail} HTTP {status}".strip()
+    logging.getLogger(__name__).warning("%s failed: %s: %s", action, type(exc).__name__, detail)
+
+
+def _child_result(flight: _ReviewFlight, poll_interval_s: float) -> Any:
+    """Decision string, None if the child died without one, or still running."""
+    if flight.recv.poll():
+        try:
+            message = flight.recv.recv()
+        except (EOFError, OSError):
+            return None
+        return message if isinstance(message, str) else None
+    if not flight.proc.is_alive():
+        flight.proc.join(poll_interval_s)
+        if flight.recv.poll():
+            try:
+                message = flight.recv.recv()
+            except (EOFError, OSError):
+                return None
+            return message if isinstance(message, str) else None
+        return None
+    return _STILL_RUNNING
+
+
+def _remember_post(
+    daemon: ValidatorDaemon,
+    pending: dict[Any, _PendingPost],
+    assignment: Mapping[str, Any],
+    digest: str,
+    decision: str,
+) -> None:
+    aid = assignment["assignment_id"]
+    if aid in pending:
+        return
+    pending[aid] = _PendingPost(
+        assignment=assignment,
+        digest=digest,
+        decision=decision,
+        signature_hex=daemon.sign_fn(digest),
+    )
+
+
+def _is_late_decision_conflict(exc: BaseException) -> bool:
+    """True for an HTTP 409 from ``post_decision`` after the assignment settled."""
+    try:
+        import httpx
+    except ImportError:
+        return False
+    return isinstance(exc, httpx.HTTPStatusError) and _http_status(exc) == 409
+
+
+def _retry_pending_posts(
+    daemon: ValidatorDaemon,
+    pending: dict[Any, _PendingPost],
+    posted: set[Any],
+) -> bool:
+    """Retry stored signatures. A failure stays pending and does not raise.
+
+    A 409 ``HTTPStatusError`` is a benign late decision: log it (action, exception
+    class, HTTP status; no assignment body or credential), drop that assignment
+    from ``pending``, record it in ``posted``, release its read token, and do
+    not post it again. Any other exception stays pending.
+    """
+    progressed = False
+    for aid, item in list(pending.items()):
+        try:
+            daemon.client.post_decision(
+                aid, decision=item.decision, signature_hex=item.signature_hex,
+            )
+        except Exception as exc:
+            _log_gateway_failure("post_decision", exc)
+            if not _is_late_decision_conflict(exc):
+                continue
+            # Settled upstream. One post for this assignment; never retry it.
+        posted.add(aid)
+        del pending[aid]
+        daemon._protected_tokens.pop(str(aid), None)
+        progressed = True
+    return progressed
+
+
+def _reap_reviews(
+    daemon: ValidatorDaemon,
+    in_flight: dict[Any, _ReviewFlight],
+    pending: dict[Any, _PendingPost],
+    crashed: set[Any],
+    deferred: set[Any],
+    poll_interval_s: float,
+) -> bool:
+    """Collect finished children. A dead child is not posted and not restarted here."""
+    done: list[Any] = []
+    for aid, flight in in_flight.items():
+        decision = _child_result(flight, poll_interval_s)
+        if decision is _STILL_RUNNING:
+            continue
+        if isinstance(decision, str):
+            _remember_post(daemon, pending, flight.assignment, flight.digest, decision)
+        else:
+            crashed.add(aid)
+            deferred.add(aid)
+        _finish_flight(flight, poll_interval_s)
+        done.append(aid)
+    for aid in done:
+        del in_flight[aid]
+    return bool(done)
+
+
+def _dispatch_reviews(
+    daemon: ValidatorDaemon,
+    ctx: Any,
+    in_flight: dict[Any, _ReviewFlight],
+    pending: dict[Any, _PendingPost],
+    posted: set[Any],
+    crashed: set[Any],
+    deferred: set[Any],
+    assignments: list[Any],
+    slots: int,
+) -> int:
+    """Start reviews while a slot is free. Never-attempted rows go first."""
+    fresh: list[Any] = []
+    again: list[Any] = []
+    seen: set[str] = set()
+    for assignment in assignments:
+        if not isinstance(assignment, Mapping):
+            continue
+        aid = _assignment_id_or_none(assignment.get("assignment_id"))
+        if aid is None or aid in seen:
+            continue
+        seen.add(aid)
+        if assignment.get("attestation_required"):
+            continue  # a stub: attested by _attest_stubs, reviewed once its evidence is listed
+        if aid in in_flight or aid in posted or aid in pending or aid in deferred:
+            continue
+        if aid in crashed:
+            again.append(assignment)
+        else:
+            fresh.append(assignment)
+    started = 0
+    for assignment in [*fresh, *again]:
+        if len(in_flight) >= slots:
+            break
+        aid = assignment["assignment_id"]
+        # Earlier rows in this same response may have become pending or started.
+        # Never overwrite a live handle or create two children for one identity.
+        if aid in in_flight or aid in posted or aid in pending or aid in deferred:
+            continue
+        kind, digest = daemon._preface(assignment)
+        if kind == "skip" or digest is None:
+            continue
+        if kind == "error":
+            _remember_post(daemon, pending, assignment, digest, "error")
+            started += 1
+            continue
+        # The child has no client or bearer; hand it a usable read credential.
+        try:
+            readable = _with_usable_read_credential(daemon.client, assignment)
+        except GitError:
+            continue  # nothing posted; a later poll may try this assignment again
+        payload = copy.deepcopy(dict(readable))
+        if readable.get("service_level") == "protected":
+            # Review children hold no client and cannot attest: the parent opens
+            # this assignment's sealed token and hands over only that token.
+            token = _parent_protected_token(daemon, str(aid))
+            if token is None:
+                continue  # nothing posted; the next poll attests again
+            payload[_PROTECTED_TOKEN_KEY] = {"token": token.token, "expires_at": token.expires_at}
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        # Look up the entry here so a test can substitute a picklable fake.
+        # The signing key is not an argument.
+        proc = ctx.Process(
+            target=_child_process_main,
+            args=(send_conn, str(daemon.config.workdir_root), payload, review_assignment),
+            name=f"ormas-validator-{aid}",
+            daemon=True,
+        )
+        try:
+            proc.start()
+        except Exception:
+            send_conn.close()
+            recv_conn.close()
+            raise
+        send_conn.close()
+        in_flight[aid] = _ReviewFlight(
+            proc=proc, recv=recv_conn, assignment=assignment, digest=digest,
+        )
+        started += 1
+    return started
+
+
+def _parent_protected_token(daemon: ValidatorDaemon, assignment_id: str) -> Any:
+    if daemon.protected is None:
+        return None
+    if daemon._token_valid(assignment_id):
+        return daemon._protected_tokens[assignment_id]
+    try:
+        return daemon._attest(assignment_id)
+    except GitError:
+        return None
+
+
+def _release_stale_tokens(daemon: ValidatorDaemon, assignments: list[Any],
+                          in_flight: dict[Any, _ReviewFlight], pending: dict[Any, _PendingPost]) -> None:
+    """Free the slot a held token reserves once it expires or its assignment is terminal.
+
+    Call only with a successful listing: a listed assignment (stub or evidence) is
+    still ours; one that left the listing was decided, timed out or reassigned. An
+    in-flight review or an unposted decision keeps its token.
+    """
+    listed = {str(row.get("assignment_id")) for row in assignments}
+    keep = listed | {str(k) for k in in_flight} | {str(k) for k in pending}
+    for aid in list(daemon._protected_tokens):
+        if aid not in keep or (aid not in in_flight and not daemon._token_valid(aid)):
+            daemon._protected_tokens.pop(aid, None)
+
+
+def _attest_stubs(daemon: ValidatorDaemon, assignments: list[Any], in_flight: dict[Any, _ReviewFlight],
+                  slots: int) -> bool:
+    """Phase one for Protected stubs, as in ``run_once``, while review slots are free.
+
+    A stub with a live token waits for its evidence listing; a refused stub never
+    blocks the rows after it. Both retry on the next poll.
+    """
+    if daemon.protected is None:
+        return False
+    attested = False
+    busy = {str(k) for k in in_flight}
+    held = sum(1 for aid in daemon._protected_tokens if aid not in busy)
+    for row in assignments:
+        if _is_graded_assignment(row):
+            continue
+        if not row.get("attestation_required"):
+            continue
+        assignment_id = _assignment_id_or_none(row.get("assignment_id"))
+        if assignment_id is None:
+            continue
+        if daemon._token_valid(assignment_id):
+            continue
+        if len(in_flight) + held >= slots:
+            break
+        try:
+            daemon._attest(assignment_id)
+        except GitError:
+            continue
+        held += 1
+        attested = True
+    return attested
+
+
+def _admitted_assignments(daemon: ValidatorDaemon, assignments: list[Any]) -> list[Any]:
+    """Rows this checker may act on, for both the single-slot and parallel paths."""
+    if daemon.protected is None:
+        # Only an attesting checker can act on a Protected stub.
+        return [a for a in assignments
+                if isinstance(a, Mapping) and not a.get("attestation_required")]
+    # A checker holding Protected release authority must never process
+    # work from a less isolated service cell. Keep that key and bearer
+    # confined to assignments the gateway explicitly labels Protected.
+    return [a for a in assignments
+            if isinstance(a, Mapping) and a.get("service_level") == "protected"]
+
+
+def _fill_slots(
+    daemon: ValidatorDaemon,
+    ctx: Any,
+    in_flight: dict[Any, _ReviewFlight],
+    pending: dict[Any, _PendingPost],
+    posted: set[Any],
+    crashed: set[Any],
+    deferred: set[Any],
+    slots: int,
+) -> int:
+    """List, then start work. A list failure leaves current children alone."""
+    if len(in_flight) >= slots:
+        return 0
+    try:
+        assignments = daemon.client.list_assignments()
+    except Exception as exc:
+        _log_gateway_failure("list_assignments", exc)
+        assignments = []
+    else:
+        _release_stale_tokens(daemon, assignments, in_flight, pending)
+    # The same admission gate as run_once, before any attestation or dispatch.
+    assignments = _admitted_assignments(daemon, assignments)
+    attested = _attest_stubs(daemon, assignments, in_flight, slots)
+    started = _dispatch_reviews(
+        daemon, ctx, in_flight, pending, posted, crashed, deferred, assignments, slots,
+    )
+    # Crashes from this poll wait until this list call has returned.
+    deferred.clear()
+    return started + int(attested)
+
+
+def _stop_reviews(in_flight: dict[Any, _ReviewFlight], poll_interval_s: float) -> None:
+    for flight in in_flight.values():
+        if flight.proc.is_alive():
+            flight.proc.terminate()
+        flight.proc.join(poll_interval_s)
+        if flight.proc.is_alive():
+            flight.proc.kill()
+            flight.proc.join(poll_interval_s)
+        try:
+            flight.recv.close()
+        except OSError:
+            pass
+        _release_process(flight.proc)
+    in_flight.clear()
 
 
 class ValidatorDaemon:
@@ -633,10 +1088,15 @@ class ValidatorDaemon:
         self.protected = protected
         self._protected_tokens: dict[str, Any] = {}
 
-    def register(self, *, pubkey_hex: str, current_sign_fn: SignFn | None = None) -> dict[str, Any]:
+    def register(self, *, pubkey_hex: str, current_sign_fn: SignFn | None = None,
+                 slots: int | None = None, slot_proof: Mapping[str, Any] | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"pubkey_hex": pubkey_hex}
         if current_sign_fn is not None:
             kwargs["current_sign_fn"] = current_sign_fn
+        if slots is not None:
+            kwargs["slots"] = slots
+        if slot_proof is not None:
+            kwargs["slot_proof"] = slot_proof
         if self.protected is not None:
             from .protected_attestation import PROTECTED_SERVICE_CELL
             kwargs["task_cells"] = [PROTECTED_SERVICE_CELL]
@@ -669,6 +1129,17 @@ class ValidatorDaemon:
                 token.expires_at.replace("Z", "+00:00")) > datetime.now(timezone.utc)
         except (TypeError, ValueError, AttributeError):
             return False
+
+    def _release_workdir(self, assignment: Mapping[str, Any]) -> None:
+        """The post retries only a signed decision; every re-review clones anew."""
+        aid = assignment.get("assignment_id")
+        if not isinstance(aid, str) or not re.fullmatch(r"asgn_[A-Za-z0-9_-]+", aid):
+            return
+        root = self.config.workdir_root
+        workdir = root / aid
+        if root.is_symlink() or workdir.is_symlink():
+            return
+        shutil.rmtree(workdir, ignore_errors=True)
 
     def _protected_clone(self, assignment: Mapping[str, Any], workdir: Path) -> None:
         from .outcomes_support import protected_repository_git
@@ -725,7 +1196,8 @@ class ValidatorDaemon:
         cause = error
         while isinstance(cause, BaseException) and cause.__cause__ is not None:
             cause = cause.__cause__
-        stderr = getattr(cause, "stderr", None)
+        # A verifier timeout can carry partial output from the client's code.
+        stderr = None if isinstance(cause, subprocess.TimeoutExpired) else getattr(cause, "stderr", None)
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", errors="replace")
         detail = str(cause) + (f": {stderr}" if stderr else "")
@@ -795,23 +1267,20 @@ class ValidatorDaemon:
             diff_out = _run_git(
                 ["diff", "--no-ext-diff", "--no-textconv",
                  "--name-only", "--no-renames", "-z",
-                 base_commit, result_commit, "--"],
-                cwd=workdir,
+                 base_commit, result_commit, "--"], cwd=workdir,
             )
-        except GitError as exc:
-            return self._review_error(assignment, exc)
-        # Decide scope before toolchain provisioning or either verifier can run
-        # repository-controlled code.  Keep this result rather than consulting
-        # mutable Git metadata after an untrusted process has started.
-        try:
             changed = list(_nul_git_paths(diff_out))
         except GitError as exc:
             return self._review_error(assignment, exc)
-        touches_immutable = bool(immutable) and any(
-            _path_covered_by_allowed(p, immutable) for p in changed
-        )
-        scope_ok = (not allowed) or all(_path_covered_by_allowed(p, allowed) for p in changed)
 
+        # Scope is authoritative before toolchain provisioning or either
+        # verifier can execute repository-controlled code.
+        touches_immutable = bool(immutable) and any(
+            _path_covered_by_allowed(path, immutable) for path in changed
+        )
+        scope_ok = (not allowed) or all(
+            _path_covered_by_allowed(path, allowed) for path in changed
+        )
         if touches_immutable or not scope_ok:
             return "reject"
 
@@ -822,6 +1291,16 @@ class ValidatorDaemon:
         except (ToolchainUnavailable, ValueError, TypeError, KeyError, AttributeError) as exc:
             return self._review_error(assignment, exc)
 
+        # Same bound on both phases. Public packets use the profile timeout
+        # plus the 35s margin prepare_task_packet already applies. Legacy has
+        # no owner-chosen magnitude, so None keeps the unbounded verify call.
+        verify_timeout_s = None
+        if public_execution:
+            verify_timeout_s = (
+                assignment["execution_contract"]["verifier_profile"]["timeout_s"]
+                + VERIFY_TIMEOUT_MARGIN_S
+            )
+
         try:
             _run_git(["checkout", base_commit], cwd=workdir)
         except GitError as exc:
@@ -830,10 +1309,12 @@ class ValidatorDaemon:
             if evidence_root(verify_command) is None:
                 return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
                                            raise_setup_errors=True,
-                                           trusted_public_python=public_execution)
+                                           trusted_public_python=public_execution,
+                                           timeout_s=verify_timeout_s)
             return _run_verify_command(verify_command, cwd=workdir, path_prefix=prefix,
                                        raise_setup_errors=True,
                                        trusted_public_python=public_execution,
+                                       timeout_s=verify_timeout_s,
                                        evidence_identity={
                 "job_id": assignment.get("job_id"), "role": "validator",
                 "assignment_id": assignment.get("assignment_id"), "phase": phase,
@@ -843,6 +1324,10 @@ class ValidatorDaemon:
 
         try:
             base_exit = verify("base")
+        except subprocess.TimeoutExpired as exc:
+            # The base commit is the client's code. A hang is a failed
+            # preflight reproduction, same as a public base exit other than 86.
+            return self._review_error(assignment, exc)
         except (ValueError, OSError) as exc:
             return self._review_error(assignment, exc)
         if public_execution and base_exit != 86:
@@ -858,12 +1343,15 @@ class ValidatorDaemon:
             return self._review_error(assignment, exc)
         try:
             result_exit = verify("result")
+        except subprocess.TimeoutExpired:
+            # A launched result verifier that hangs is the miner's outcome.
+            return "reject"
         except (ValueError, OSError) as exc:
             return self._review_error(assignment, exc)
         if public_execution:
-            if result_exit not in (0, 86):
-                return self._review_error(assignment, f"result verifier failed: exit {result_exit}")
-            return {0: "accept", 86: "reject"}[result_exit]
+            # Only exit 0 accepts. Every other int, including runtime-error
+            # exits, is a counted miss rather than a neutral checker error.
+            return "accept" if result_exit == 0 else "reject"
         if evidence_root(verify_command) is not None and result_exit in (74, 127):
             return self._review_error(assignment, f"result verifier setup failed: exit {result_exit}")
 
@@ -883,22 +1371,14 @@ class ValidatorDaemon:
         ``skip`` — no digest to sign (same as today's early return). ``error`` —
         sign and post ``error`` without a repository. ``review`` — clone and decide.
         """
+        if _is_graded_assignment(assignment):
+            return ('skip', None)
         if _assignment_id_or_none(assignment.get("assignment_id")) is None:
             return ("skip", None)
         expected_digest = assignment.get("evidence_digest_sha256")
         if not isinstance(expected_digest, str) or _SHA256_HEX_RE.fullmatch(expected_digest) is None:
             # There is no valid assignment identity to acknowledge. Never sign
             # an invented empty digest or access a repository for this row.
-            return ("skip", None)
-        try:
-            protocol = _assignment_decision_protocol(assignment)
-            if protocol == VALIDATOR_DECISION_PROTOCOL_V2:
-                validator_id = assignment.get("validator_id")
-                if not isinstance(validator_id, str) or not validator_id:
-                    raise ValueError("missing validator identity")
-        except ValueError:
-            # There is no agreed message to sign. Do not access the repository
-            # and do not reinterpret an unknown version as the legacy format.
             return ("skip", None)
         try:
             fields = canonical_evidence_fields(
@@ -924,79 +1404,85 @@ class ValidatorDaemon:
             return ("error", expected_digest)
         return ("review", expected_digest)
 
-    @staticmethod
-    def _signature_message(
-        assignment: Mapping[str, Any], digest: str, decision: str,
-    ) -> str:
-        return decision_signature_message(
-            protocol_version=_assignment_decision_protocol(assignment),
-            validator_id=str(assignment.get("validator_id") or ""),
-            assignment_id=str(assignment["assignment_id"]),
-            decision_nonce=str(assignment.get("decision_nonce") or ""),
-            validator_key_generation=assignment.get("validator_key_generation"),
-            validator_pubkey_hex=assignment.get("validator_pubkey_hex"),
-            decision_expires_at=assignment.get("decision_expires_at"),
-            decision=decision,
-            evidence_digest_sha256=digest,
-        )
-
     def _sign_and_post(self, assignment: Mapping[str, Any], digest: str, decision: str) -> None:
         # An error acknowledges the original assignment identity, including a
         # malformed contract. It cannot enter the acceptance quorum, and avoids
         # retrying a deterministic invalid assignment through an empty signature.
         assignment_id = require_assignment_id(assignment.get("assignment_id"))
-        signature_hex = self.sign_fn(self._signature_message(assignment, digest, decision))
+        signature_hex = self.sign_fn(digest)
         self.client.post_decision(
             assignment_id, decision=decision, signature_hex=signature_hex,
         )
 
     def run_once(self) -> bool:
-        """Review one pending assignment if any. False when idle."""
-        assignments = self.client.list_assignments()
-        if self.protected is None:
-            # Only an attesting checker can act on a Protected stub.
-            assignments = [a for a in assignments if not a.get("attestation_required")]
-        else:
-            # A checker holding Protected release authority must never process
-            # work from a less isolated service cell. Keep that key and bearer
-            # confined to assignments the gateway explicitly labels Protected.
-            assignments = [a for a in assignments if a.get("service_level") == "protected"]
+        """Review one pending assignment if any. False when idle.
+
+        An HTTP status or transport error from ``list_assignments`` or from one
+        ``post_decision`` is logged and does not escape, so the single-slot serve
+        loop keeps polling. A 409 is a benign late decision after settlement
+        (for example ``validator_timeout``): drop that assignment's local read
+        token and do not post it again in this pass.
+        """
+        try:
+            assignments = self.client.list_assignments()
+        except Exception as exc:
+            if not _is_gateway_call_error(exc):
+                raise
+            _log_gateway_failure("list_assignments", exc)
+            return False
+        assignments = _admitted_assignments(self, assignments)
         if not assignments:
             return False
-        assignment = None
         attested = False
+        saw_late = False
         for row in assignments:
             if not isinstance(row, Mapping):
                 continue
             assignment_id = _assignment_id_or_none(row.get("assignment_id"))
             if assignment_id is None:
                 continue
-            if not row.get("attestation_required"):
-                assignment = row
-                break
-            # Phase one: attest for this stub; a later poll lists its evidence. A stub
-            # already attested with a live token waits for that listing, and a refused
-            # stub never blocks the rows after it; both retry on the next poll.
-            if self._token_valid(assignment_id):
+            if _is_graded_assignment(row):
+                continue  # Decline without signing, cloning or starving Verified rows.
+            if row.get("attestation_required"):
+                # Phase one: attest for this stub; a later poll lists its evidence. A stub
+                # already attested with a live token waits for that listing, and a refused
+                # stub never blocks the rows after it; both retry on the next poll.
+                if self._token_valid(assignment_id):
+                    continue
+                try:
+                    self._attest(assignment_id)
+                except GitError:
+                    continue
+                attested = True
                 continue
+            kind, digest = self._preface(row)
+            if kind == "skip" or digest is None:
+                # Same as before for a bad row at the head. After a late 409, sleep
+                # instead of spinning on a settled row that is still listed above it.
+                return not saw_late
+            decision = "error"
+            if kind == "review":
+                try:
+                    workdir = self._clone_with_retry(row)
+                    if workdir is not None:
+                        decision = self._decide(row, workdir)
+                finally:
+                    self._release_workdir(row)
             try:
-                self._attest(assignment_id)
-            except GitError:
-                continue
-            attested = True
-        if assignment is None:
-            return attested
-        kind, digest = self._preface(assignment)
-        if kind == "skip" or digest is None:
+                self._sign_and_post(row, digest, decision)
+            except Exception as exc:
+                if not _is_gateway_call_error(exc):
+                    raise
+                _log_gateway_failure("post_decision", exc)
+                self._protected_tokens.pop(assignment_id, None)
+                if _http_status(exc) == 409:
+                    # Benign late decision. One post for this assignment in this pass.
+                    saw_late = True
+                    continue
+                return False
+            self._protected_tokens.pop(assignment_id, None)
             return True
-        decision = "error"
-        if kind == "review":
-            workdir = self._clone_with_retry(assignment)
-            if workdir is not None:
-                decision = self._decide(assignment, workdir)
-        self._sign_and_post(assignment, digest, decision)
-        self._protected_tokens.pop(assignment_id, None)
-        return True
+        return False if saw_late else attested
 
     def serve(
         self,
@@ -1005,18 +1491,67 @@ class ValidatorDaemon:
         *,
         until: Callable[[], bool] | None = None,
     ) -> None:
-        """Review sequentially until stopped; parallel review is fail-closed."""
+        """Review until stopped. One slot stays inline; more slots use child processes.
+
+        With Protected attestation the parent attests and hands each child only its
+        own assignment's read token (U3a); the signer never leaves the parent.
+        A failed list or decision post in the single-slot loop does not end it.
+        """
         import time
 
-        _require_single_checker_slot(slots)
-        while True:
-            if until is not None and until():
-                return
-            worked = self.run_once()
-            if until is not None and until():
-                return
-            if not worked:
-                time.sleep(poll_interval_s)
+        if slots == 1:
+            while True:
+                if until is not None and until():
+                    return
+                worked = self.run_once()
+                if until is not None and until():
+                    return
+                if not worked:
+                    time.sleep(poll_interval_s)
+            return
+        self._serve_parallel(slots, poll_interval_s, until=until)
+
+    def _serve_parallel(
+        self,
+        slots: int,
+        poll_interval_s: float,
+        *,
+        until: Callable[[], bool] | None,
+    ) -> None:
+        """Up to ``slots`` reviews at once. Each review is its own process."""
+        import multiprocessing
+        import time
+
+        ctx = multiprocessing.get_context("spawn")
+        in_flight: dict[Any, _ReviewFlight] = {}
+        pending: dict[Any, _PendingPost] = {}
+        posted: set[Any] = set()
+        crashed: set[Any] = set()
+        deferred: set[Any] = set()
+        try:
+            while True:
+                finished = _reap_reviews(
+                    self, in_flight, pending, crashed, deferred, poll_interval_s,
+                )
+                posted_now = _retry_pending_posts(self, pending, posted)
+                dispatched = _fill_slots(
+                    self, ctx, in_flight, pending, posted, crashed, deferred, slots,
+                )
+                posted_now = posted_now or _retry_pending_posts(self, pending, posted)
+                if until is not None and until():
+                    return
+                if finished or posted_now or dispatched:
+                    continue
+                if in_flight:
+                    multiprocessing.connection.wait(
+                        [flight.recv for flight in in_flight.values()],
+                        timeout=poll_interval_s,
+                    )
+                else:
+                    time.sleep(poll_interval_s)
+        finally:
+            _stop_reviews(in_flight, poll_interval_s)
+
 
 def _load_cli_secret(*, token_env: str | None, token_path: str | None) -> str:
     """Read a service credential without following links or exposing its bytes."""
@@ -1031,12 +1566,15 @@ def _load_cli_secret(*, token_env: str | None, token_path: str | None) -> str:
     return value
 
 
-def _single_slot_count(value: str) -> int:
+def _positive_slot_count(value: str) -> int:
     import argparse
 
-    if value != "1":
-        raise argparse.ArgumentTypeError("--slots must be exactly 1")
-    return 1
+    if not re.fullmatch(r"[0-9]+", value):
+        raise argparse.ArgumentTypeError("--slots must be a positive integer")
+    slots = int(value, 10)
+    if slots < 1:
+        raise argparse.ArgumentTypeError("--slots must be a positive integer")
+    return slots
 
 
 def _assignment_timeout_s(assignment: Mapping[str, Any]) -> Any:
@@ -1091,8 +1629,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Print current assignments (id, job, review timeout) and exit without reviewing",
     )
     parser.add_argument(
-        "--slots", type=_single_slot_count, default=1,
-        help="exactly 1 assignment review (default: 1)",
+        "--slots", type=_positive_slot_count, default=1,
+        help="assignment reviews at once (default: 1)",
+    )
+    parser.add_argument(
+        "--slot-memory-mib", type=_positive_slot_count, default=DEFAULT_SLOT_MEMORY_MIB,
+        help="memory each review slot must hold resident in the boot slot probe (default: 1536)",
     )
     parser.add_argument("--poll-interval-s", type=float, default=15.0)
     args = parser.parse_args(argv)
@@ -1133,11 +1675,28 @@ def main(argv: list[str] | None = None) -> int:
                      if not args.list_only else None)
 
         def _register() -> None:
+            nonlocal slots
             if registrar is not None:
+                extra: dict[str, Any] = {} if args.once else {"slots": 1}
                 if current_sign_fn is None:
-                    registrar.register(pubkey_hex=pubkey)
+                    ack = registrar.register(pubkey_hex=pubkey, **extra)
                 else:
-                    registrar.register(pubkey_hex=pubkey, current_sign_fn=current_sign_fn)
+                    ack = registrar.register(pubkey_hex=pubkey, current_sign_fn=current_sign_fn, **extra)
+                if slots > 1:
+                    # Advertise one slot until the probe proves more, then the measured count.
+                    from datetime import datetime, timezone
+                    measured, cpu_count = measure_concurrent_slots(
+                        slots, per_slot_memory_mib=args.slot_memory_mib)
+                    slots = max(1, measured)
+                    if measured < args.slots:
+                        logging.getLogger(__name__).warning(
+                            "slot probe measured %d of %d slots", measured, args.slots)
+                    proof = build_slot_proof(
+                        subject_id=str(ack["validator_id"]), pubkey_hex=pubkey, measured=slots,
+                        per_slot_memory_mib=args.slot_memory_mib, cpu_count=cpu_count,
+                        measured_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        sign_fn=sign_fn)
+                    registrar.register(pubkey_hex=pubkey, slots=slots, slot_proof=proof)
             else:
                 if protected is None:
                     client.register(pubkey_hex=pubkey)
@@ -1145,6 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
                     from .protected_attestation import PROTECTED_SERVICE_CELL
                     client.register(pubkey_hex=pubkey, task_cells=[PROTECTED_SERVICE_CELL])
 
+        slots = 1 if args.once or args.list_only else args.slots
         _register()
         if args.list_only:
             for line in _list_only_lines(client.list_assignments()):
@@ -1154,7 +1714,7 @@ def main(argv: list[str] | None = None) -> int:
         assert daemon is not None
         if args.once:
             return 0 if daemon.run_once() else 3
-        daemon.serve(args.slots, args.poll_interval_s)
+        daemon.serve(slots, args.poll_interval_s)
         return 0
     finally:
         client.close()
