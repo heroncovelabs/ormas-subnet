@@ -213,10 +213,16 @@ class PublicRecovery:
         fd = os.open(self.artifact, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as source:
             metadata = os.fstat(source.fileno())
+            max_length = 65 * 1024 * 1024 + 8  # existing public-execution body + header
+            packet = body.get('work_packet')
+            if isinstance(packet, dict) and packet.get('acceptance_level') == 'graded':
+                from .outcomes_support import graded_delivery_limits
+                limits = graded_delivery_limits(packet.get('delivery_limits'))
+                max_length = limits['max_bytes'] + 1_048_576 + 8  # raw-file header bound
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
                     or metadata.st_uid != os.getuid()
                     or metadata.st_size != body["artifact_length"]
-                    or not 0 < metadata.st_size <= 65 * 1024 * 1024 + 8):
+                    or not 0 < metadata.st_size <= max_length):
                 raise RecoveryRequired("public recovery artifact is unsafe")
             digest = hashlib.sha256()
             for chunk in iter(lambda: source.read(65536), b""):

@@ -127,7 +127,8 @@ def test_artifact_builder_rejects_frozen_scope_before_reading_blobs(
     monkeypatch.setattr(support, "public_git", observed)
     target = io.BytesIO()
 
-    with pytest.raises(ValueError, match="scope"):
+    # main's serializer names the rule: public_artifact_out_of_scope / public_artifact_immutable.
+    with pytest.raises(ValueError, match="scope|immutable"):
         support.build_public_artifact(packet, repo, result, target)
 
     assert target.getvalue() == b""

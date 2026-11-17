@@ -14,10 +14,12 @@ import select
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from importlib import resources
 from collections.abc import Mapping
@@ -27,7 +29,6 @@ from urllib.parse import urlsplit
 
 from ._trusted_tools import TrustedExecutableUnavailable, trusted_executable
 from .verifier_runtime import (
-    REVOKED_ACCEPTANCE_DRIVER_SHA256,
     RuntimeRefusal,
     dependency_spec,
     structured_test_argv,
@@ -36,32 +37,54 @@ from .verifier_runtime import (
 )
 
 PUBLIC_FIELDS = frozenset({'execution_environment', 'execution_requirements'})
+GRADED_PUBLIC_PRIVATE_FIELDS = frozenset({
+    'repo_credential', 'repository_credential', 'private_repository_access',
+    'repository_access', 'sharing',
+})
 
 # Historical catalogs remain available for interpreting frozen evidence, but a
 # compiler that lost execution approval must never become executable merely by
 # selecting its old catalog digest.  Updating this allowlist requires review of
 # the exact embedded verifier source and coordinated gateway/SDK rollout.
 _ACTIVE_VERIFIER_COMPILERS = frozenset({
-    '2ba990540ac8653f130efe5ed132a0dfdca6048db18386352719d3a317ae2c00',
+    # card 31: explicit umask 022 in candidate and verify commands
+    '4ae28f0ab47f662b52db84a131fb6f69ca12e4efabea9cbcdb3cf19df3a0eb92',
+    '5bc3da22728e0e7cd0c7b447194b36f77e273310f1c2ce822e4d1ce07348b4ac',
+    # M5: opt-in verifier package cache; pre-cache qualified compilers stay active.
+    '3b5db9e86f9fec5b94639648a812f29c5f05d04a79be33027d84710b67c87010',
+    'be421a7acea27181fd8ba8e55419c22cce0d73c0999502fa7ea2ef958af95bee',
+    # 7cdead20: Verified Git support and identity-only Graded baseline sync.
+    '437943d01eab6012e560aeba1c00b003dc7a61d0367ece699917f709be472133',
+    '622c7f9820213a010a66ff9974e91f362e2b60ca69a184beb3235c72e6de6349',
+    # DRAFT 7cdead20: opt-in git pytest image; frozen e28c11a6 packets stay active.
+    '00affaf06968d2f27c7ba7802da6ee4641913a9bb009b58d2d51bd4a08bbd1f1',
+    # DRAFT e28c11a6: local Graded-only compiler; not served, issuance off.
+    'd8d5af502989ee906978511b4d4435228de786fa56189aecc74c32f6160f495b',
+    # 2026-10-14.2 security release. Still executable: 2026-10-14.3 is a reliability
+    # change, not a revocation, so packets frozen on .2 keep running during rollout.
+    'd609ed993b3bda292cc93e5e995699da1175ca995d4226d17cb8794a8ab89151',
+    # 2026-10-14.3: dependency downloads reuse one connection per host and retry, on the
+    # ea3806ce7 trusted-tool hardening. Archived by the 2026-10-18 combined release (dev and
+    # Tuxedo packets frozen on it keep running); it returns as the served catalog with the
+    # checker-image cut, whose checkers and workers can resolve it locally.
+    'eacf5e445082d2d4738c5b4e117a04a043452dc334cf5ded1cdc4de81aece313',
+    # 2026-10-14.4 (ff7c1e51…): surgical Protected release cut from gateway 88363d4ef =
+    # the 2026-10-04.1 verifier plus the download-resilience fix. SERVED by the 2026-10-18
+    # combined release because production qualifications bind this digest and the installed
+    # checker image and un-rolled workers resolve only it; the ea3806ce7/86cbeb9ad verifier
+    # hardening is deferred to the checker-image cut (release notes).
+    '214eadfb183270c187f0dba07ad16123ea402a90dcd2e13d883b906d2060db1c',
 })
-
-# 2026-10-14.4 (ff7c1e51…): the deployed verifier plus download resilience.
-# Like the gateway's draining allowance, keep it only while frozen packets drain:
-# it predates trusted-tool hardening. Bind the exception to this catalog/compiler
-# pair, not the revision label (the public .4 has a different digest/compiler).
-_DRAINING_VERIFIER_COMPILERS = {
-    'sha256:ff7c1e51b36c54f8aa8b63d2b9b6ea91c4d1587ee39bc31575b7763ffbf40367':
-        '214eadfb183270c187f0dba07ad16123ea402a90dcd2e13d883b906d2060db1c',
-}
 
 
 def digest(value):
     return 'sha256:' + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
-def load_support_catalog(catalog_digest=None):
+def load_support_catalog(catalog_digest=None, *, graded=False):
     assets = resources.files(__package__).joinpath('client_assets')
-    current = json.loads(assets.joinpath('outcomes_support.v1.json').read_text())
+    name = 'outcomes_support_graded_draft.v1.json' if graded else 'outcomes_support.v1.json'
+    current = json.loads(assets.joinpath(name).read_text())
     if catalog_digest is None or digest(current) == catalog_digest:
         return current
     history = assets.joinpath('outcomes_support_history')
@@ -71,6 +94,9 @@ def load_support_catalog(catalog_digest=None):
                 old = json.loads(path.read_text())
                 if digest(old) == catalog_digest:
                     return old
+    draft = json.loads(assets.joinpath('outcomes_support_graded_draft.v1.json').read_text())
+    if digest(draft) == catalog_digest:
+        return draft
     raise ValueError('unsupported_catalog_version')
 
 
@@ -80,14 +106,21 @@ def _runtime_source():
 
 def _active_compiler(catalog):
     compiler = catalog.get('verifier_compiler_sha256') if isinstance(catalog, dict) else None
-    if compiler not in _ACTIVE_VERIFIER_COMPILERS and (
-            compiler is None or _DRAINING_VERIFIER_COMPILERS.get(digest(catalog)) != compiler):
+    if compiler not in _ACTIVE_VERIFIER_COMPILERS:
         raise ValueError('verifier_compiler_revoked')
     return compiler
 
 
-def _profile(profile_id, catalog_digest=None):
-    catalog = load_support_catalog(catalog_digest)
+def _frozen_compiler(catalog):
+    """The compiler a frozen catalog names, whether or not it still holds approval."""
+    compiler = catalog.get('verifier_compiler_sha256') if isinstance(catalog, dict) else None
+    if not isinstance(compiler, str) or re.fullmatch('[0-9a-f]{64}', compiler) is None:
+        raise ValueError('verifier_compiler_mismatch')
+    return compiler
+
+
+def _profile(profile_id, catalog_digest=None, *, graded=False):
+    catalog = load_support_catalog(catalog_digest, graded=True) if graded else load_support_catalog(catalog_digest)
     profile = next((p for p in catalog['profiles'] if p['profile_id'] == profile_id), None)
     if profile is None or profile['status'] == 'planned':
         raise ValueError('unsupported_execution_profile')
@@ -113,6 +146,24 @@ def _locked_file(root, name):
     if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
         raise ValueError('dependency_lock_unavailable')
     return path.read_bytes()
+
+
+# These two historical acceptance cards delegated the verdict to pytest in the
+# candidate container.  A candidate import could call os._exit(0) before the
+# required assertions ran, and each card treated that status as acceptance.
+# PR #37 changed their docstrings only, so both byte identities for each card
+# remain revoked as immutable audit evidence.  The public SDK keeps this list in
+# verifier_runtime.py; here it guards preparation and packet validation only,
+# because the served embedded verifier is frozen by its catalog compiler hash
+# (its copy arrives with the checker-image cut).
+REVOKED_ACCEPTANCE_DRIVER_SHA256 = frozenset({
+    # claim_refusal_backoff_external.py: original, then PR #37 docstring variant
+    '545411aeba3d5ac8db574a733ed7d2cf21bec012b19a73a8de5c6a6cbbe6f442',
+    'e032021de2cda990e4a8656376932efd2c9e48c565aab8a008688a9acb2f2b88',
+    # validator_list_only_external.py: original, then PR #37 docstring variant
+    'af06a6db0a155f703848d916f2fef53c22fec1ac2b3147fd5f1bf438744d404a',
+    '36e853b3f76fbc41550404d731564091a7659d1a98f2d6871a30fc46a043b361',
+})
 
 
 def _validate_acceptance_files(files):
@@ -185,6 +236,26 @@ def runtime_config(environment, *, command, timeout_s, toolchain=None):
                if profile['profile_id'] == 'linux-node-browser-http-v1' else {})}
 
 
+def graded_runtime_config(environment, *, command, timeout_s, toolchain=None):
+    """Use the catalog-bound Graded mode; preserve legacy/Verified config bytes."""
+    config = runtime_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
+    catalog = load_support_catalog(environment['catalog_digest'])
+    graded = catalog.get('acceptance_level') == 'graded'
+    if not graded:
+        return config
+    if config['profile_id'] not in {'linux-python-pytest-v1', 'linux-python-pytest-git-v1'}:
+        raise ValueError('graded_plain_command_requires_pytest')
+    from .graded_verifier_runtime import RuntimeRefusal, structured_test_argv
+    try:
+        argv, _ = structured_test_argv(config, None, '/tmp/ormas-pytest-report.xml')
+    except RuntimeRefusal as exc:
+        raise ValueError(str(exc)) from None
+    if len(argv) > 128:
+        raise ValueError('invalid_candidate_argv')
+    config['candidate_argv'] = list(config['argv'])
+    return config
+
+
 def _service(value):
     try:
         return validate_service(value)
@@ -192,9 +263,10 @@ def _service(value):
         raise ValueError(str(exc)) from None
 
 
-def effective_command(config):
-    source = _runtime_source()
-    compiler = _active_compiler(load_support_catalog())
+def effective_command(config, *, catalog_digest=None):
+    graded = 'candidate_argv' in config
+    source = Path(__file__).with_name('graded_verifier_runtime.py').read_text() if graded else _runtime_source()
+    compiler = _active_compiler(load_support_catalog(catalog_digest, graded=True) if graded else load_support_catalog(catalog_digest))
     if hashlib.sha256(source.encode()).hexdigest() != compiler:
         raise ValueError('compiler_catalog_stale')
     encoded = base64.b64encode(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).decode()
@@ -217,15 +289,22 @@ def execution_requirements(environment, config, *, languages, command_digest):
             'languages': _languages(languages, profile), **{key: profile[key] for key in
             ('os', 'arch', 'runtime', 'package_manager', 'browser', 'system_packages', 'services', 'network', 'workspace_mode')},
             'limits': config['limits'],
-            **({'publication': dict(profile['publication'])} if 'publication' in profile else {})}
+            **({'publication': dict(profile['publication'])} if 'publication' in profile else {}),
+            **({'graded_custody': environment['graded_custody']} if 'graded_custody' in environment else {})}
 
 
-def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None):
+def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None, graded=False):
     """Freeze a catalog profile and exact lock bytes; no installation or inference."""
     required = {'profile_id', 'lock_paths', 'languages'}
-    if not isinstance(selection, dict) or not required <= selection.keys() or selection.keys() - required - {'acceptance_paths', 'service', 'repository_access'}:
+    if not isinstance(selection, dict) or not required <= selection.keys() or selection.keys() - required - {'acceptance_paths', 'service', 'repository_access', 'graded_custody'}:
         raise ValueError('invalid_execution_environment')
-    catalog, profile = _profile(selection['profile_id'])
+    if 'graded_custody' in selection:
+        custody = selection['graded_custody']
+        if not isinstance(custody, str) or custody != 'operator_services':
+            raise ValueError('invalid_execution_environment')
+        if not graded or 'repository_access' not in selection:
+            raise ValueError('graded_custody_scope_invalid')
+    catalog, profile = _profile(selection['profile_id'], graded=True) if graded else _profile(selection['profile_id'])
     if 'repository_access' in selection:
         _private_repository_access(selection['repository_access'], catalog)
     if ('service' in selection) != (profile['profile_id'] == 'linux-node-browser-http-v1'):
@@ -242,11 +321,23 @@ def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None):
                    'acceptance_files': {}}
     if 'repository_access' in selection:
         environment['repository_access'] = dict(selection['repository_access'])
+    if 'graded_custody' in selection:
+        environment['graded_custody'] = selection['graded_custody']
     if 'service' in selection:
         environment['service'] = _service(selection['service'])
-    config = runtime_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
+    build_config = graded_runtime_config if graded else runtime_config
+    config = build_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
+    # The draft's sibling profiles use only the Graded runtime's closed handlers.
+    # Never expand the served runtime or alter Verified preparation.
+    if graded:
+        from .graded_verifier_runtime import (
+            dependency_spec as parse_dependencies, structured_test_argv as test_arguments,
+            RuntimeRefusal as runtime_refusal,
+        )
+    else:
+        parse_dependencies, test_arguments, runtime_refusal = dependency_spec, structured_test_argv, RuntimeRefusal
     try:
-        spec, _ = dependency_spec(profile['profile_id'], locks)
+        spec, _ = parse_dependencies(profile['profile_id'], locks)
         if toolchain is not None:
             pins = {p['name'].lower().replace('_', '-') + '==' + p['version'] for p in spec}
             if any(pin.lower().replace('_', '-') not in pins for pin in toolchain['pip_install']):
@@ -255,7 +346,7 @@ def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None):
             lock = json.loads(locks['package-lock.json'])
             if lock['packages'].get('node_modules/@playwright/test', {}).get('version') != profile['browser']['driver_version']:
                 raise ValueError('browser_driver_lock_mismatch')
-        test_argv, kind = structured_test_argv(config, root, '/tmp/ormas-preflight.xml')
+        test_argv, kind = test_arguments(config, root, '/tmp/ormas-preflight.xml')
         # The ordinary case needs no new client ceremony: the named test paths
         # become the frozen driver. Support/config files can be named explicitly.
         offset = {'junit-file': 9, 'node-junit': 3, 'playwright-json': 5}[kind]
@@ -286,27 +377,236 @@ def prepare_environment(selection, *, cwd, command, timeout_s, toolchain=None):
             name: hashlib.sha256(_locked_file(root, name)).hexdigest()
             for name in sorted(names)
         })
-    except RuntimeRefusal as exc:
+        config['acceptance_files'] = environment['acceptance_files']
+    except runtime_refusal as exc:
         raise ValueError(str(exc)) from None
     # Reject unsafe frozen driver bytes before resolving or invoking a host Git
     # executable. Only accepted material proceeds to repository inspection.
     # Freeze only pointers in this repository's committed tree. No submodule
     # URL is consulted, and no recursively owned repository is fetched.
-    if profile.get('repository_features', {}).get('submodules') == 'uninitialized-pointers-v1':
+    # A symlinks-False profile refuses any tracked symlink before anything is frozen.
+    features = profile.get('repository_features', {})
+    pointers = features.get('submodules') == 'uninitialized-pointers-v1'
+    if pointers or features.get('symlinks') is False:
         links = {}
         for entry in public_git(['ls-tree', '-rz', '--full-tree', 'HEAD'], cwd=root).split(b'\0'):
             if entry:
                 metadata, path = entry.split(b'\t', 1)
                 mode, kind, oid = metadata.decode('ascii').split()
-                if mode == '160000':
+                if mode == '120000' and features.get('symlinks') is False:
+                    raise ValueError('tracked_symlink_unsupported')
+                if pointers and mode == '160000':
                     if kind != 'commit':
                         raise ValueError('invalid_repository_gitlinks')
                     links[path.decode('utf-8')] = oid
         if links:
             environment['repository_gitlinks'] = validate_repository_gitlinks(links)
-    config = runtime_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
+            # The frozen pointers are part of the runtime config.
+            config = build_config(environment, command=command, timeout_s=timeout_s, toolchain=toolchain)
+    # Local AND deferred preparation refuse a base the runtime's
+    # snapshot would refuse, by its own cause, without Docker or the base test.
+    refusal = source_fit_refusal(config, cwd=str(root))
+    if refusal is not None:
+        raise ValueError(refusal)
     requirements = execution_requirements(environment, config, languages=languages, command_digest='sha256:' + '0' * 64)
     return environment, config, requirements
+
+
+# The runtime's installed-artifact roots (``_snapshot``); parity is pinned by
+# tests/mcp_server/test_prepare_source_fit.py against both runtime copies.
+_RUNTIME_INSTALLED_ROOTS = frozenset({'.venv', 'venv', 'node_modules', '.ormas-install', '.ormas-cache'})
+
+
+def source_fit_refusal(config, *, cwd):
+    """The runtime ``_snapshot`` refusal this clean base would hit, else None.
+
+    Inspects the checkout's Git top-level (the tree the verifier copies), not a
+    subdirectory the client named. Mirrors ``_snapshot`` membership and limits
+    in its order (exclusion overrides, ``ls-files --cached --others
+    --exclude-standard``, frozen gitlinks, file limit, installed artifacts,
+    regular files, the profile's ``source_max_bytes``/``max_bytes``, frozen
+    locks present and unchanged) with the runtime's cause names. Portable:
+    plain ``subprocess.run`` and ``os.lstat``, no pipe selectors, process
+    groups or descriptor-relative opens, so native Windows deferred
+    preparation works. Copies nothing and starts no container.
+    """
+    if 'candidate_argv' in config:
+        from . import graded_verifier_runtime as runtime
+    else:
+        from . import verifier_runtime as runtime
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home()),
+           "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    if os.name == 'nt':
+        env.update({k: os.environ[k] for k in ('SYSTEMROOT', 'PATHEXT', 'USERPROFILE') if k in os.environ})
+    deadline = time.monotonic() + config['limits']['timeout_s']
+    try:
+        code, top = _inventory_git(runtime, ['rev-parse', '--show-toplevel'],
+                                   cwd=Path(cwd).resolve(), deadline=deadline, cap=4096, env=env)
+        if code or not top.strip():
+            return 'source_inventory_unavailable'
+        _inspect_snapshot(runtime, Path(os.fsdecode(top.strip())).resolve(), config, deadline, env)
+    except runtime.RuntimeRefusal as exc:
+        return str(exc)
+    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+        return 'source_inventory_unavailable'
+    return None
+
+
+def _inventory_git(runtime, args, *, cwd, deadline, cap, env, warnings=None):
+    """Portable stand-in for the runtime's ``_bounded`` git reads (stderr merged).
+
+    With ``warnings`` (a list), stderr is kept apart and appended there instead.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise runtime.RuntimeRefusal('verification_timeout')
+    try:
+        completed = subprocess.run(runtime.safe_git_argv(*args), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT if warnings is None else subprocess.PIPE,
+                                   timeout=remaining, check=False)
+    except subprocess.TimeoutExpired:
+        raise runtime.RuntimeRefusal('verification_timeout') from None
+    if len(completed.stdout) + len(completed.stderr or b'') > cap:
+        raise runtime.RuntimeRefusal('verification_output_limit')
+    if warnings is not None and completed.stderr:
+        warnings.append(completed.stderr)
+    return completed.returncode, completed.stdout
+
+
+def _source_entry(source, name, refuse, readable_dirs):
+    """``lstat`` of a listed path, refusing what the runtime's ``_source_file`` refuses.
+
+    FileNotFoundError (absent) propagates; a non-directory parent raises
+    NotADirectoryError, and an unreadable parent raises PermissionError, as the
+    runtime's readable no-follow directory open would fail. Each directory is
+    probed once with ``os.scandir``, which also works on Windows.
+    """
+    parts = name.split('/')
+    if not name or any(p in ('', '.', '..', '.git') for p in parts) or '\\' in name:
+        raise refuse('unsupported_source_path')
+    path = source
+    for part in parts[:-1]:
+        path = path / part
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise NotADirectoryError(name)
+        if path not in readable_dirs:
+            with os.scandir(path):
+                pass
+            readable_dirs.add(path)
+    return path / parts[-1], os.lstat(path / parts[-1])
+
+
+def _inspect_snapshot(runtime, source, cfg, deadline, env):
+    refuse = runtime.RuntimeRefusal
+    code, local_excludes = _inventory_git(
+        runtime, ['config', '--local', '--includes', '--get', 'core.excludesFile'],
+        cwd=source, deadline=deadline, cap=4096, env=env)
+    if code == 0 and local_excludes.strip():
+        raise refuse('repository_exclusion_override_unsupported')
+    code, exclude_path = _inventory_git(runtime, ['rev-parse', '--git-path', 'info/exclude'],
+                                        cwd=source, deadline=deadline, cap=4096, env=env)
+    if code:
+        raise refuse('source_inventory_unavailable')
+    path = Path(os.fsdecode(exclude_path.strip()))
+    if not path.is_absolute():
+        path = source / path
+    if path.exists():
+        if path.is_symlink() or path.stat().st_size > 65536:
+            raise refuse('repository_exclusion_override_unsupported')
+        if any(line.strip() and not line.lstrip().startswith('#') for line in path.read_text().splitlines()):
+            raise refuse('repository_exclusion_override_unsupported')
+    listing_warnings = []
+    code, raw = _inventory_git(runtime, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+                               cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env,
+                               warnings=listing_warnings)
+    if code:
+        raise refuse('source_inventory_unavailable')
+    if listing_warnings:
+        # Git could not read part of the tree (for example an unreadable
+        # directory). The runtime merges this text into its file list and then
+        # fails or silently drops a file; neither is a faithful copy.
+        raise refuse('unsupported_source_file')
+    names = sorted(set(os.fsdecode(n) for n in raw.split(b'\0') if n))
+    gitlinks = runtime.validate_repository_gitlinks(cfg.get('repository_gitlinks', {}))
+    if _indexed_gitlinks(runtime, source, deadline, env) != gitlinks:
+        raise refuse('repository_gitlink_changed')
+    if len(names) > cfg['limits']['max_files']:
+        raise refuse('source_file_limit')
+    byte_limit = cfg['limits'].get('source_max_bytes', cfg['limits']['max_bytes'])
+    locks = cfg.get('lock_files', {})
+    fingerprints = {}
+    readable_dirs = {source}
+    total = 0
+    for name in names:
+        if name.split('/')[0] in _RUNTIME_INSTALLED_ROOTS:
+            raise refuse('source_installed_artifacts_refused')
+        if time.monotonic() >= deadline:
+            raise refuse('verification_timeout')
+        if name in gitlinks:
+            _empty_gitlink(source, name, refuse, readable_dirs)
+            fingerprints[name] = 'gitlink:' + gitlinks[name]
+            continue
+        try:
+            path, info = _source_entry(source, name, refuse, readable_dirs)
+        except FileNotFoundError:
+            continue  # A deleted file is absent in the runtime's copy too.
+        except OSError:
+            raise refuse('unsupported_source_file') from None
+        if not stat.S_ISREG(info.st_mode):
+            raise refuse('unsupported_source_file')
+        try:
+            with open(path, 'rb'):
+                pass  # The runtime opens every file for reading before copying.
+        except OSError:
+            raise refuse('unsupported_source_file') from None
+        total += info.st_size
+        if total > byte_limit:
+            raise refuse('source_byte_limit')
+        if name in locks:
+            fingerprints[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for name in gitlinks:
+        _empty_gitlink(source, name, refuse, readable_dirs)
+    # The runtime fingerprints every copied file; a frozen lock that is
+    # ignored, untracked, absent or changed is not in its copy.
+    for name, expected in locks.items():
+        if fingerprints.get(name) != expected:
+            raise refuse('dependency_lock_changed')
+
+
+def _indexed_gitlinks(runtime, source, deadline, env):
+    code, raw = _inventory_git(runtime, ['ls-files', '--stage', '-z'],
+                               cwd=source, deadline=deadline, cap=4 * 1024 * 1024, env=env)
+    if code:
+        raise runtime.RuntimeRefusal('source_inventory_unavailable')
+    links = {}
+    for entry in raw.split(b'\0'):
+        if not entry:
+            continue
+        metadata, path = entry.split(b'\t', 1)
+        mode, oid, stage = metadata.split()
+        if mode == b'160000':
+            if stage != b'0':
+                raise runtime.RuntimeRefusal('repository_gitlink_changed')
+            links[os.fsdecode(path)] = oid.decode('ascii')
+    return runtime.validate_repository_gitlinks(links)
+
+
+def _empty_gitlink(source, name, refuse, readable_dirs):
+    try:
+        path, info = _source_entry(source, name, refuse, readable_dirs)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise refuse('repository_gitlink_materialized') from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise refuse('repository_gitlink_materialized')
+    try:
+        with os.scandir(path) as entries:
+            if next(entries, None) is not None:
+                raise refuse('repository_gitlink_materialized')
+    except OSError:
+        raise refuse('repository_gitlink_materialized') from None
 
 
 def has_public_execution(packet):
@@ -340,8 +640,15 @@ def validate_gitlink_scope(environment, allowed_paths):
             raise ValueError('repository_gitlink_scope_unsupported')
 
 
-def validate_public_execution_packet(packet):
-    """Recompile, don't trust client-supplied executable or preflight identities."""
+def validate_public_execution_packet(packet, *, allow_revoked_compiler=False):
+    """Recompile, don't trust client-supplied executable or preflight identities.
+
+    ``allow_revoked_compiler`` binds the packet to the compiler its frozen catalog
+    names whether or not that compiler still holds execution approval; every other
+    check runs unchanged. Only settled-job accounting reads use it (the reward
+    scorer judging a paid receipt against its frozen acceptance); anything that
+    claims, leases, executes or repairs keeps the default and stays refused.
+    """
     if not isinstance(packet, dict) or not PUBLIC_FIELDS <= packet.keys():
         raise ValueError('public_execution_contract_required')
     environment = packet['execution_environment']
@@ -352,14 +659,23 @@ def validate_public_execution_packet(packet):
         fields.add('repository_access')
     if isinstance(environment, dict) and 'repository_gitlinks' in environment:
         fields.add('repository_gitlinks')
+    if isinstance(environment, dict) and 'graded_custody' in environment:
+        fields.add('graded_custody')
     if not isinstance(environment, dict) or set(environment) != fields:
         raise ValueError('invalid_execution_environment')
     if environment['schema_version'] != 'outcomes.execution-environment.v1' or not isinstance(environment['profile'], dict):
         raise ValueError('invalid_execution_environment')
+    if 'graded_custody' in environment:
+        custody = environment['graded_custody']
+        if not isinstance(custody, str) or custody != 'operator_services':
+            raise ValueError('invalid_execution_environment')
+        if 'repository_access' not in environment or not (
+                packet.get('acceptance_level') == 'graded' or 'graded_contract' in packet):
+            raise ValueError('graded_custody_scope_invalid')
     catalog, profile = _profile(environment['profile'].get('profile_id'), environment['catalog_digest'])
     if environment['catalog_digest'] != digest(catalog) or environment['profile'] != profile:
         raise ValueError('execution_catalog_changed')
-    compiler = _active_compiler(catalog)
+    compiler = _frozen_compiler(catalog) if allow_revoked_compiler else _active_compiler(catalog)
     if 'repository_access' in environment:
         _private_repository_access(environment['repository_access'], catalog)
     if 'repository_gitlinks' in environment:
@@ -380,16 +696,28 @@ def validate_public_execution_packet(packet):
     limits = req.get('limits')
     if not isinstance(limits, dict) or type(limits.get('timeout_s')) is not int:
         raise ValueError('invalid_runtime_limits')
-    config = runtime_config(environment, command=vp.get('original_command'), timeout_s=limits['timeout_s'], toolchain=packet.get('toolchain'))
+    graded = packet.get('acceptance_level') == 'graded' or 'graded_contract' in packet
+    if catalog.get('acceptance_level') == 'graded' and not graded:
+        raise ValueError('graded_compiler_requires_graded_packet')
+    build_config = graded_runtime_config if catalog.get('acceptance_level') == 'graded' else runtime_config
+    config = build_config(environment, command=vp.get('original_command'), timeout_s=limits['timeout_s'], toolchain=packet.get('toolchain'))
     expected_command = packet.get('verification_command')
     if not isinstance(expected_command, str):
         raise ValueError('verifier_compiler_mismatch')
-    arguments = shlex.split(expected_command)
     encoded = base64.b64encode(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).decode()
-    if (len(arguments) != 6 or arguments[:4] != ['python3', '-I', '-S', '-c']
-            or hashlib.sha256(arguments[4].encode()).hexdigest() != compiler
-            or arguments[5] != encoded or shlex.join(arguments) != expected_command):
-        raise ValueError('verifier_compiler_mismatch')
+    try:
+        source = (Path(__file__).with_name('graded_verifier_runtime.py').read_text()
+                  if 'candidate_argv' in config else _runtime_source())
+    except (OSError, UnicodeDecodeError):
+        source = None
+    candidate = (shlex.join(['python3', '-I', '-S', '-c', source, encoded])
+                 if source is not None and hashlib.sha256(source.encode()).hexdigest() == compiler else None)
+    if candidate != expected_command:
+        arguments = shlex.split(expected_command)
+        if (len(arguments) != 6 or arguments[:4] != ['python3', '-I', '-S', '-c']
+                or hashlib.sha256(arguments[4].encode()).hexdigest() != compiler
+                or arguments[5] != encoded or shlex.join(arguments) != expected_command):
+            raise ValueError('verifier_compiler_mismatch')
     sha = hashlib.sha256(expected_command.encode()).hexdigest()
     # int == float in Python, so packets written as 600.0 (pre-2026-10-09 clients) and 600 both pass.
     if vp != {'schema_version': 'outcomes.verifier-profile.v1', 'profile_id': 'external-driver-v1',
@@ -400,6 +728,9 @@ def validate_public_execution_packet(packet):
     expected = execution_requirements(environment, config, languages=req.get('languages'), command_digest='sha256:' + sha)
     if req != expected or not isinstance(packet.get('task_features'), dict) or packet['task_features'].get('languages') != req['languages']:
         raise ValueError('execution_requirements_mismatch')
+    if (graded and expected['repository_visibility'] == 'public'
+            and GRADED_PUBLIC_PRIVATE_FIELDS & packet.keys()):
+        raise ValueError('graded_public_form_private_binding')
     immutable = policy.get('immutable_paths')
     if not isinstance(immutable, list) or any(not isinstance(p, str) for p in immutable):
         raise ValueError('invalid_immutable_paths')
@@ -420,7 +751,40 @@ def validate_public_execution_packet(packet):
           'outcome': 'not_run', 'reason': 'client_preflight_deferred',
           'verifier_digest': expected['verifier_digest'],
           'environment_digest': expected['environment_digest'], 'base_sha': policy.get('repo_base_sha')}
-    if verify_base != v2 and verify_base != v3:
+    if graded:
+        # Graded freezes regression observations, not proof of an acceptance
+        # assertion. Keep the Verified v2/v3 preimages and compiler unchanged.
+        contract = packet.get('graded_contract')
+        if (packet.get('acceptance_level') != 'graded' or not isinstance(contract, dict)
+                or not isinstance(contract.get('digest'), str)
+                or re.fullmatch('[0-9a-f]{64}', contract['digest']) is None
+                or contract.get('base_sha') != policy.get('repo_base_sha')
+                or contract.get('immutable_paths') != immutable
+                or contract.get('regression_commands') != [vp['original_command']]):
+            raise ValueError('graded_base_preflight_required')
+        statuses = contract.get('regression_base_status')
+        if (not isinstance(statuses, dict) or set(statuses) != {vp['original_command']}
+                or any(status not in ('green', 'red', 'unknown') for status in statuses.values())):
+            raise ValueError('graded_base_preflight_required')
+        deferred = isinstance(verify_base, dict) and verify_base.get('source') == 'deferred'
+        if any(status not in (('unknown',) if deferred else ('green', 'red')) for status in statuses.values()):
+            raise ValueError('graded_base_preflight_required')
+        # Commit the whole contract mapping, including its canonical contract
+        # digest. The gateway independently validates GradedContract semantics;
+        # this stdlib wire validator must also detect body/digest substitution.
+        evidence = {
+            'schema_version': 'outcomes.graded-base-preflight.v1',
+            'source': 'deferred' if deferred else 'packet',
+            'outcome': 'not_run' if deferred else 'observed',
+            **({'reason': 'client_preflight_deferred'} if deferred else {}),
+            'verifier_digest': expected['verifier_digest'],
+            'environment_digest': expected['environment_digest'],
+            'base_sha': policy.get('repo_base_sha'), 'contract_digest': digest(contract),
+            'regression_base_status': statuses,
+        }
+        if verify_base != evidence:
+            raise ValueError('graded_base_preflight_required')
+    elif verify_base != v2 and verify_base != v3:
         raise ValueError('public_base_preflight_required')
     return expected
 
@@ -434,10 +798,14 @@ def _trusted_tool(name):
 
 def _git_environment():
     git = _trusted_tool('git')
-    return {'PATH': str(git.parent), 'HOME': '/nonexistent',
-            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': os.devnull,
-            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
-            'GIT_NO_REPLACE_OBJECTS': '1'}
+    environment = {'PATH': str(git.parent), 'HOME': '/nonexistent',
+                   'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': os.devnull,
+                   'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
+                   'GIT_NO_REPLACE_OBJECTS': '1'}
+    gate = os.environ.get('ORMAS_NITRO_GATE_URL')
+    if gate is not None:
+        environment['https_proxy'] = gate
+    return environment
 
 
 def _isolated_git(args, *, cwd, env):
@@ -577,7 +945,9 @@ def _release_app_read(listener, wake, binding, token, expiry, exact):
 def _app_read_git(args, *, cwd, repo_url, token, expiry):
     """Run Git with a per-call credential helper backed by an in-process channel."""
     parts = urlsplit(repo_url)
-    binding = (parts.scheme, parts.netloc, parts.path.lstrip('/'))
+    nitro = 'ORMAS_NITRO_GATE_URL' in os.environ
+    repository_path = parts.path.lstrip('/')
+    binding = (parts.scheme, parts.netloc, repository_path.rstrip('/') if nitro else repository_path)
     env = _git_environment()
     with tempfile.TemporaryDirectory(prefix='ormas-read-') as directory:
         helper, endpoint = Path(directory) / 'helper.py', str(Path(directory) / 'channel')
@@ -585,16 +955,53 @@ def _app_read_git(args, *, cwd, repo_url, token, expiry):
         with os.fdopen(fd, 'w') as stream:
             stream.write(_APP_READ_HELPER)
         flags = _app_read_flags(repo_url, '!' + shlex.join([sys.executable, '-I', str(helper), endpoint]))
-        if not _app_read_url_is_exact(flags, cwd=cwd, env=env, repo_url=repo_url):
+        if nitro:
+            try:
+                url_exact = _app_read_url_is_exact(flags, cwd=cwd, env=env, repo_url=repo_url)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                url_exact = None
+            if url_exact is None:
+                raise ValueError('private_repository_http_config')
+        else:
+            url_exact = _app_read_url_is_exact(flags, cwd=cwd, env=env, repo_url=repo_url)
+        if not url_exact:
             raise ValueError('private_repository_url_rewritten')
+        def http_exact():
+            if not _app_read_http_is_exact(flags, cwd=cwd, env=env, repo_url=repo_url):
+                return False
+            transport_root = repo_url.rstrip('/') + '/'
+            return not nitro or _app_read_http_is_exact(
+                flags, cwd=cwd, env=env, repo_url=transport_root)
+
+        if nitro:
+            try:
+                output = _isolated_git([*flags, 'config', '--null', '--list'], cwd=cwd, env=env)
+                entries = output.split(b'\0')
+            except (OSError, ValueError, subprocess.SubprocessError):
+                entries = None
+            if entries is None:
+                raise ValueError('private_repository_http_config')
+            for entry in entries:
+                key, _, _ = entry.partition(b'\n')
+                if key.startswith(b'remote.'):
+                    subsection, separator, _ = key.removeprefix(b'remote.').rpartition(b'.')
+                    if separator and subsection == repo_url.encode():
+                        raise ValueError('private_repository_url_rewritten')
+            try:
+                exact = http_exact()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                exact = False
+            if not exact:
+                raise ValueError('private_repository_http_config')
+        if nitro and args[0] == 'fetch':
+            args = ['fetch', '--no-recurse-submodules', *args[1:]]
         wake, woken = os.pipe()
         try:
             with socket.socket(socket.AF_UNIX) as listener:
                 listener.bind(endpoint)
                 listener.listen()
                 release = threading.Thread(target=_release_app_read, daemon=True, args=(
-                    listener, wake, binding, token, expiry,
-                    lambda: _app_read_http_is_exact(flags, cwd=cwd, env=env, repo_url=repo_url)))
+                    listener, wake, binding, token, expiry, http_exact))
                 release.start()
                 try:
                     return _isolated_git([*flags, *args], cwd=cwd, env=env)
@@ -656,16 +1063,12 @@ def repository_git(args, *, cwd, repo_url, credential):
 
 
 
-def _publication_path_covered(path, policy_paths):
-    """Apply the frozen file/directory policy without path reinterpretation."""
-    return any(
-        path.startswith(entry) if entry.endswith('/') else path == entry
-        for entry in policy_paths if entry
-    )
-
-
 def public_result_scope(packet, workdir, result_commit):
-    """Return the authoritative public result scope decision and changed paths."""
+    """Return the authoritative public result scope decision and changed paths.
+
+    The decision uses the same frozen allowed/immutable rules the artifact
+    serializer and the gateway apply (``_validate_raw_file_paths``).
+    """
     validate_public_execution_packet(packet)
     if 'publication' not in packet['execution_requirements'] or not re.fullmatch('[0-9a-f]{40}', result_commit):
         raise ValueError('public artifact contract required')
@@ -683,27 +1086,121 @@ def public_result_scope(packet, workdir, result_commit):
         changed = tuple(sorted(raw[:-1].decode('utf-8').split('\0'))) if raw else ()
     except UnicodeDecodeError:
         raise ValueError('public artifact path is not valid UTF-8') from None
-    scope_ok = ((not allowed) or all(_publication_path_covered(path, allowed) for path in changed))
-    scope_ok = scope_ok and not any(
-        _publication_path_covered(path, immutable) for path in changed
-    )
-    return scope_ok, changed
+    try:
+        _validate_raw_file_paths(changed, policy)
+    except ValueError:
+        return False, changed
+    return True, changed
 
 
 def build_public_artifact(packet, workdir, result_commit, target):
-    """Serialize authorized committed regular files as bounded raw bytes."""
-    scope_ok, changed = public_result_scope(packet, workdir, result_commit)
-    if not scope_ok:
-        raise ValueError('public artifact scope violation')
-    limits = packet['execution_requirements']['limits']
-    if not 0 < len(changed) <= packet['execution_requirements']['publication']['max_changed_files']:
+    """Serialize committed regular files as bounded raw bytes, never a Git pack.
+
+    Scope refusals (``public_artifact_out_of_scope``, ``public_artifact_immutable``,
+    secret paths) are raised by ``_validate_raw_file_paths`` before any blob is read.
+    """
+    validate_public_execution_packet(packet)
+    if 'publication' not in packet['execution_requirements'] or not re.fullmatch('[0-9a-f]{40}', result_commit):
+        raise ValueError('public artifact contract required')
+    return build_raw_file_artifact(packet['execution_policy'], workdir, result_commit, target,
+        max_bytes=packet['execution_requirements']['limits']['max_bytes'],
+        max_files=packet['execution_requirements']['publication']['max_changed_files'])
+
+
+def graded_delivery_limits(value):
+    """Explicit packet bounds; never borrow scratch or public-execution defaults."""
+    if (not isinstance(value, Mapping) or set(value) != {'max_bytes', 'max_files'}
+            or any(type(value[key]) is not int or value[key] <= 0 for key in value)):
+        raise ValueError('graded_delivery_limits_required')
+    return dict(value)
+
+
+def build_graded_artifact(packet, workdir, result_commit, target):
+    """Graded custody uses the raw-file wire, not public-execution authority."""
+    if packet.get('acceptance_level') != 'graded' or not isinstance(packet.get('graded_contract'), Mapping):
+        raise ValueError('graded_contract_required')
+    limits = graded_delivery_limits(packet.get('delivery_limits'))
+    return build_raw_file_artifact(packet['execution_policy'], workdir, result_commit, target,
+                                  **limits, enforce_allowed_paths=False)
+
+
+def _validate_raw_file_paths(paths, policy, *, enforce_allowed_paths=True):
+    import unicodedata
+    from ._raw_file_paths import _root_covering
+
+    root_scope = any(_root_covering(rule) for rule in policy.get('allowed_paths') or ())
+    if root_scope:
+        import fnmatch
+        from ._raw_file_paths import (
+            PatchIntakeError, SECRET_PATH_PATTERNS, _filesystem_key, _path, _path_is_allowed,
+            _patterns,
+        )
+
+        immutable = list(policy.get('immutable_paths', []))
+        # Preserve publication's literal-subtree bounds as well as S8's glob
+        # and filesystem-alias refusals, just as the root material selector does.
+        immutable += [rule.rstrip('/') + '/**' for rule in immutable
+                      if not any(character in rule for character in '*?[')]
+        immutable_keys = _patterns([_filesystem_key(rule) for rule in immutable], 'immutable_path')
+
+    def covers(path, permission):
+        return path == permission.rstrip('/') or path.startswith(permission.rstrip('/') + '/')
+
+    seen = set()
+    for path in paths:
+        if (len(path.encode('utf-8')) > 4096 or path != unicodedata.normalize('NFC', path)
+                or '\\' in path or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)
+                or any(part in ('', '.', '..') or part.casefold() == '.git'
+                       for part in path.split('/'))):
+            raise ValueError('public_artifact_path_invalid')
+        if path.casefold() in seen:
+            raise ValueError('public_artifact_path_collision')
+        seen.add(path.casefold())
+        if root_scope:
+            _path(path)  # S8's repository-control and unsafe-path refusals.
+            key = _filesystem_key(path)
+            if _path_is_allowed(key, immutable_keys):
+                raise ValueError('public_artifact_immutable')
+            if any(fnmatch.fnmatchcase(component, pattern) for component in key.split('/')
+                   for pattern in SECRET_PATH_PATTERNS):
+                raise PatchIntakeError('secret_path')
+        if enforce_allowed_paths and not root_scope and not any(covers(path, rule) for rule in policy['allowed_paths']):
+            raise ValueError('public_artifact_out_of_scope')
+        if any(covers(path, rule) or covers(rule, path) for rule in policy.get('immutable_paths', [])):
+            raise ValueError('public_artifact_immutable')
+
+
+def build_raw_file_artifact(policy, workdir, result_commit, target, *, max_bytes, max_files,
+                            enforce_allowed_paths=True):
+    """Serialize the same raw-file bundle without requiring v2 execution authority."""
+    if any(type(value) is not int or value <= 0 for value in (max_bytes, max_files)):
+        raise ValueError('graded_delivery_limits_required')
+    if not isinstance(result_commit, str) or not re.fullmatch('[0-9a-f]{40}', result_commit):
+        raise ValueError('public artifact contract required')
+    changed = public_git(['diff', '--name-only', '--no-renames', '-z', policy['repo_base_sha'],
+        result_commit, '--'], cwd=workdir).decode('utf-8').split('\0')
+    changed = sorted(p for p in changed if p)
+    if not 0 < len(changed) <= max_files:
         raise ValueError('public artifact file limit')
+    _validate_raw_file_paths(changed, policy, enforce_allowed_paths=enforce_allowed_paths)
     tree = {}
-    for record in public_git(['ls-tree', '-rz', '--full-tree', result_commit], cwd=workdir).split(b'\0'):
+    # The immutable tree supplies blob sizes too; avoid a Git process per size.
+    # Limit size lookups to changed paths, using public_git's literal pathspecs.
+    listing = ['ls-tree', '-rlz', '--full-tree', result_commit]
+    try:
+        records = public_git([*listing, '--', *changed], cwd=workdir)
+    except OSError as exc:
+        import errno
+
+        if exc.errno != errno.E2BIG:
+            raise
+        # Preserve large, explicitly bounded deliveries beyond the OS argv limit.
+        records = public_git(listing, cwd=workdir)
+    for record in records.split(b'\0'):
         if record:
             metadata, path = record.split(b'\t', 1)
-            mode, kind, sha = metadata.decode('ascii').split(' ')
-            tree[path.decode('utf-8')] = (mode, kind, sha)
+            mode, kind, sha, length = metadata.decode('ascii').split()
+            tree[path.decode('utf-8')] = (mode, kind, sha, length)
     tree_sha = public_git(['rev-parse', result_commit + '^{tree}'], cwd=workdir).decode().strip()
     entries = []
     size = 0
@@ -713,12 +1210,14 @@ def build_public_artifact(packet, workdir, result_commit, target):
             if item is None:
                 entries.append({'path': path, 'op': 'delete', 'mode': None, 'byte_len': 0, 'sha256': None})
                 continue
-            mode, kind, sha = item
+            mode, kind, sha, raw_length = item
             if mode not in ('100644', '100755') or kind != 'blob':
                 raise ValueError('public artifact file mode unsupported')
-            length = int(public_git(['cat-file', '-s', sha], cwd=workdir).decode())
+            if re.fullmatch('[0-9]+', raw_length) is None:
+                raise ValueError('public artifact blob mismatch')
+            length = int(raw_length)
             size += length
-            if size > limits['max_bytes']:
+            if size > max_bytes:
                 raise ValueError('public artifact byte limit')
             raw = public_git(['cat-file', 'blob', sha], cwd=workdir)
             if len(raw) != length:
@@ -727,7 +1226,7 @@ def build_public_artifact(packet, workdir, result_commit, target):
             entries.append({'path': path, 'op': 'upsert', 'mode': mode,
                 'byte_len': length, 'sha256': hashlib.sha256(raw).hexdigest()})
         header = json.dumps({'schema_version': 'ormas.public-artifact.v1',
-            'base_commit': packet['execution_policy']['repo_base_sha'], 'tree_sha': tree_sha, 'files': entries},
+            'base_commit': policy['repo_base_sha'], 'tree_sha': tree_sha, 'files': entries},
             sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()
         if len(header) > 1_048_576:
             raise ValueError('public artifact header limit')

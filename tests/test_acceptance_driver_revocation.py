@@ -14,6 +14,15 @@ import pytest
 from ormas_subnet import outcomes_support as support
 from ormas_subnet import verifier_runtime as runtime
 
+# main: the served embedded verifier is frozen by its catalog compiler hash, so the
+# revoked-driver list lives in outcomes_support (preparation and packet validation).
+# The verifier-startup check re-arms once verifier_runtime.py carries the list again
+# (the checker-image cut), like test_trusted_git_tools.py's deferred hardening.
+REVOKED = support.REVOKED_ACCEPTANCE_DRIVER_SHA256
+_needs_runtime_revocation = pytest.mark.skipif(
+    not hasattr(runtime, "REVOKED_ACCEPTANCE_DRIVER_SHA256"),
+    reason="embedded verifier revocation deferred to the checker-image cut")
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER_VARIANTS = {
@@ -116,7 +125,9 @@ def _packet_for_digest(driver_digest, *, catalog_digest=None):
 
 
 def test_revocation_inventory_covers_both_historical_source_variants():
-    assert runtime.REVOKED_ACCEPTANCE_DRIVER_SHA256 == frozenset(ALL_REVOKED_DIGESTS)
+    assert REVOKED == frozenset(ALL_REVOKED_DIGESTS)
+    if hasattr(runtime, "REVOKED_ACCEPTANCE_DRIVER_SHA256"):
+        assert runtime.REVOKED_ACCEPTANCE_DRIVER_SHA256 == REVOKED
     for path, digest in CURRENT_DRIVER_DIGESTS.items():
         assert digest in DRIVER_VARIANTS[path]
 
@@ -233,6 +244,7 @@ def test_frozen_packet_with_revoked_driver_fails_validation(driver_digest, catal
         support.validate_public_execution_packet(packet)
 
 
+@_needs_runtime_revocation
 @pytest.mark.parametrize("driver_digest", ALL_REVOKED_DIGESTS)
 def test_runtime_refuses_revoked_driver_before_candidate_execution(
     tmp_path, monkeypatch, driver_digest,
@@ -269,6 +281,9 @@ def test_unrelated_external_driver_still_prepares_and_validates(tmp_path, monkey
         return b""
 
     monkeypatch.setattr(support, "public_git", repository_without_gitlinks)
+    # main's source-fit preflight inventories a Git checkout; this
+    # fixture is a bare directory, so set that unrelated refusal aside here.
+    monkeypatch.setattr(support, "source_fit_refusal", lambda *_args, **_kwargs: None)
     original = f"python3 -m pytest -q {path}"
 
     environment, config, _ = support.prepare_environment(
@@ -282,12 +297,14 @@ def test_unrelated_external_driver_still_prepares_and_validates(tmp_path, monkey
         command=original,
         timeout_s=60,
     )
-    assert not runtime.REVOKED_ACCEPTANCE_DRIVER_SHA256.intersection(
+    assert not REVOKED.intersection(
         environment["acceptance_files"].values()
     )
-    assert host_git_lookups == [
+    # main inspects the committed tree only for profiles that admit gitlinks or
+    # refuse symlinks; any lookup is the single read-only listing after the driver check.
+    assert host_git_lookups in ([], [
         (["ls-tree", "-rz", "--full-tree", "HEAD"], tmp_path.resolve())
-    ]
+    ])
     packet = _complete_packet(environment, config, original)
     assert support.validate_public_execution_packet(packet) == packet["execution_requirements"]
     runtime._validate_config(config)

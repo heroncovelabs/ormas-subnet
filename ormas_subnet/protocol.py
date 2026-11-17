@@ -16,7 +16,9 @@ logic itself.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 
@@ -214,9 +216,20 @@ class TaskDraft(_RunnerWireDTO):
     # Frozen server-owned public acceptance policy and claim plan. Legacy jobs
     # omit this field entirely; public jobs require the qualified extension.
     acceptance_contract: Mapping[str, Any] | None = None
+    # Original Graded job whose accepted offer this revision reuses; for the
+    # first revision, that original job is its parent.
+    graded_parent_job_id: str | None = None
+    graded_round_kind: str | None = None
 
     def __post_init__(self) -> None:
         require_task_id(self.task_id)
+        parent = self.graded_parent_job_id
+        kind = self.graded_round_kind
+        valid_lineage = (parent is None and kind is None) or (
+            kind == "revision" and isinstance(parent, str) and bool(parent.strip())
+        )
+        if not valid_lineage:
+            raise ValueError("invalid graded revision lineage")
         object.__setattr__(self, "allowed_paths", tuple(self.allowed_paths))
         object.__setattr__(self, "work_packet", MappingProxyType(dict(self.work_packet)))
         object.__setattr__(self, "repair_findings", tuple(self.repair_findings))
@@ -255,6 +268,10 @@ class TaskDraft(_RunnerWireDTO):
             payload["acceptance_contract"] = validate_acceptance_contract(
                 dict(self.acceptance_contract)
             )
+        if self.graded_parent_job_id is None:
+            payload.pop("graded_parent_job_id", None)
+        if self.graded_round_kind is None:
+            payload.pop("graded_round_kind", None)
         return payload
 
     @classmethod
@@ -266,6 +283,8 @@ class TaskDraft(_RunnerWireDTO):
         data.setdefault("repo_url", "")
         data.setdefault("repo_credential", None)
         data.setdefault("acceptance_contract", None)
+        data.setdefault("graded_parent_job_id", None)
+        data.setdefault("graded_round_kind", None)
         return super().from_wire(data)
 
 
@@ -288,14 +307,27 @@ class TaskLease(_RunnerWireDTO):
     # Limit offers: the miner's expected charge, at or below ``limit_usd``.
     estimate_usd: float | None = None
     limit_usd: float | None = None
+    # Offered duration accepted for this lease and the gateway's absolute solve
+    # cutoff (ISO-8601 UTC), fixed when the lease was granted. Present only on
+    # ``offers`` claims whose accepted offer carried ``wall_s``; omitted otherwise,
+    # so older decoders keep working. Renewal and re-serving never extend it.
+    wall_s: float | None = None
+    solve_deadline_at: str | None = None
 
     def __post_init__(self) -> None:
         require_task_id(self.task_id)
+        if self.wall_s is None and self.solve_deadline_at is None:
+            return
+        if _positive_wall_s(self.wall_s) is None or not _utc_deadline(self.solve_deadline_at):
+            raise ValueError("invalid lease wall_s/solve_deadline_at")
 
     def to_wire(self) -> dict[str, Any]:
         payload = super().to_wire()
         if self.claim_request_id is None:
             payload.pop("claim_request_id", None)
+        if self.wall_s is None:
+            payload.pop("wall_s", None)
+            payload.pop("solve_deadline_at", None)
         return payload
 
     @classmethod
@@ -308,7 +340,35 @@ class TaskLease(_RunnerWireDTO):
         data.setdefault("offer_kind", "firm")
         data.setdefault("estimate_usd", None)
         data.setdefault("limit_usd", None)
+        if "wall_s" in data or "solve_deadline_at" in data:
+            # Present timing is a complete pair; an explicit null is not absence.
+            if data.get("wall_s") is None or data.get("solve_deadline_at") is None:
+                raise ValueError("invalid lease wall_s/solve_deadline_at")
+        data.setdefault("wall_s", None)
+        data.setdefault("solve_deadline_at", None)
         return super().from_wire(data)
+
+
+def _positive_wall_s(value: Any) -> float | None:
+    """Finite positive seconds, integer or fractional; bool refused."""
+    if type(value) not in (int, float):
+        return None
+    try:
+        wall = float(value)
+    except OverflowError:
+        return None
+    return wall if math.isfinite(wall) and wall > 0 else None
+
+
+def _utc_deadline(value: Any) -> bool:
+    """A timezone-aware ISO-8601 instant at UTC offset zero."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.utcoffset() == timedelta(0)
 
 
 @dataclass(frozen=True)

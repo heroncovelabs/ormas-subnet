@@ -12,7 +12,6 @@ from ormas_subnet.client import OrmasMinerClient
 from ormas_subnet.protocol import RUNNER_PROTOCOL_V1, TaskDraft, TaskLease
 from ormas_subnet.skeleton import MinerConfig, MinerSkeleton
 from ormas_subnet.validator import (
-    VALIDATOR_DECISION_PROTOCOL_V1,
     OrmasValidatorClient,
     ValidatorConfig,
     ValidatorDaemon,
@@ -226,7 +225,6 @@ def _assignment(assignment_id: str = "asgn_valid") -> dict[str, Any]:
     )
     return {
         "assignment_id": assignment_id,
-        "decision_protocol_version": VALIDATOR_DECISION_PROTOCOL_V1,
         **fields,
         "evidence_digest_sha256": evidence_digest_hex(fields),
     }

@@ -9,12 +9,9 @@ from ormas_subnet import protocol as public_protocol
 from ormas_subnet import public_acceptance as public_acceptance
 from ormas_subnet.skeleton import MinerConfig, MinerSkeleton
 from ormas_subnet.validator import (
-    VALIDATOR_DECISION_PROTOCOL_V1,
-    VALIDATOR_DECISION_PROTOCOL_V2,
     ValidatorConfig,
     ValidatorDaemon,
     canonical_evidence_fields,
-    decision_signature_message,
     evidence_digest_hex,
 )
 
@@ -103,12 +100,24 @@ def _evidence(contract: dict) -> dict:
     )
 
 
-def test_private_and_public_acceptance_helpers_are_exact_mirrors() -> None:
+def test_acceptance_helpers_mirror_except_for_operator_only_graded_constant() -> None:
     private_path = ROOT / "tensorbox_spec/client_assets/public_acceptance.py"
     public_path = ROOT / "public_subnet/ormas_subnet/public_acceptance.py"
     if not private_path.exists():
         pytest.skip("private monorepo mirror is not installed")
-    assert private_path.read_bytes() == public_path.read_bytes()
+    private = _private_acceptance()
+    assert private.GRADED_ACCEPTANCE_CONTRACT_SCHEMA == "ormas.graded-acceptance.v1"
+    assert private.GRADED_ACCEPTANCE_CONTRACT_SCHEMA not in private.SUPPORTED_ACCEPTANCE_CONTRACTS
+    assert private.SUPPORTED_ACCEPTANCE_CONTRACTS == public_acceptance.SUPPORTED_ACCEPTANCE_CONTRACTS
+    assert not hasattr(public_acceptance, "GRADED_ACCEPTANCE_CONTRACT_SCHEMA")
+    # G7 deliberately keeps the operator capability out of the public twin
+    # until G17. Everything other than this declaration/export still mirrors.
+    private_source = private_path.read_text().replace(
+        '# Operator-only grading capability, not a public acceptance contract.\n'
+        'GRADED_ACCEPTANCE_CONTRACT_SCHEMA = "ormas.graded-acceptance.v1"\n',
+        "",
+    ).replace('    "GRADED_ACCEPTANCE_CONTRACT_SCHEMA",\n', "")
+    assert private_source == public_path.read_text()
 
 
 def test_policy_and_contract_validation_return_independent_snapshots() -> None:
@@ -285,62 +294,6 @@ def test_gateway_and_public_validator_canonical_evidence_match() -> None:
     )
     assert public_fields == gateway_fields
     assert evidence_digest_hex(public_fields) == gateway.evidence_digest_hex(gateway_fields)
-    kwargs = {
-        "protocol_version": VALIDATOR_DECISION_PROTOCOL_V2,
-        "validator_id": "val_1",
-        "assignment_id": "asgn_1",
-        "decision_nonce": "1" * 64,
-        "validator_key_generation": 3,
-        "validator_pubkey_hex": "2" * 64,
-        "decision_expires_at": "2026-10-14T15:00:00Z",
-        "decision": "accept",
-        "evidence_digest_sha256": evidence_digest_hex(public_fields),
-    }
-    assert decision_signature_message(**kwargs) == gateway.decision_signature_message(**kwargs)
-
-
-def test_decision_v2_message_binds_protocol_identity_attempt_verdict_and_evidence() -> None:
-    values = {
-        "protocol_version": VALIDATOR_DECISION_PROTOCOL_V2,
-        "validator_id": "val_one",
-        "assignment_id": "asgn_one",
-        "decision_nonce": "1" * 64,
-        "validator_key_generation": 3,
-        "validator_pubkey_hex": "2" * 64,
-        "decision_expires_at": "2026-10-14T15:00:00Z",
-        "decision": "accept",
-        "evidence_digest_sha256": "a" * 64,
-    }
-    message = decision_signature_message(**values)
-    assert message == (
-        'ormas-validator-decision-v2\x00{"assignment_id":"asgn_one",'
-        '"decision":"accept","decision_expires_at":"2026-10-14T15:00:00Z",'
-        '"decision_nonce":"' + "1" * 64
-        + '","evidence_digest_sha256":"' + "a" * 64
-        + '","protocol_version":"ormas-validator-decision-v2",'
-        '"validator_id":"val_one","validator_key_generation":3,'
-        '"validator_pubkey_hex":"' + "2" * 64 + '"}'
-    )
-    assert decision_signature_message(
-        **{**values, "protocol_version": VALIDATOR_DECISION_PROTOCOL_V1},
-    ) == "a" * 64
-    for field, replacement in (
-        ("protocol_version", "unknown"),
-        ("validator_id", "val_two"),
-        ("assignment_id", "asgn_two"),
-        ("decision_nonce", "2" * 64),
-        ("validator_key_generation", 4),
-        ("validator_pubkey_hex", "3" * 64),
-        ("decision_expires_at", "2026-10-14T15:00:01Z"),
-        ("decision", "reject"),
-        ("evidence_digest_sha256", "b" * 64),
-    ):
-        changed = {**values, field: replacement}
-        if field == "protocol_version":
-            with pytest.raises(ValueError, match="unsupported"):
-                decision_signature_message(**changed)
-        else:
-            assert decision_signature_message(**changed) != message
 
 
 class _FakeValidatorClient:
@@ -361,7 +314,6 @@ def test_validator_run_binds_assignment_acceptance_contract(tmp_path, monkeypatc
     evidence = _evidence(contract)
     assignment = {
         "assignment_id": "asgn_public",
-        "decision_protocol_version": VALIDATOR_DECISION_PROTOCOL_V1,
         **evidence,
         "evidence_digest_sha256": evidence_digest_hex(evidence),
     }
@@ -372,69 +324,6 @@ def test_validator_run_binds_assignment_acceptance_contract(tmp_path, monkeypatc
 
     assert daemon.run_once() is True
     assert client.posted == [("asgn_public", "accept", assignment["evidence_digest_sha256"])]
-
-
-@pytest.mark.parametrize("decision", ["accept", "reject", "error"])
-def test_validator_signs_the_exact_v2_decision_envelope(tmp_path, decision) -> None:
-    evidence = _evidence(_contract())
-    assignment = {
-        "assignment_id": "asgn_v2",
-        "validator_id": "val_v2",
-        "decision_protocol_version": VALIDATOR_DECISION_PROTOCOL_V2,
-        "decision_nonce": "1" * 64,
-        "validator_key_generation": 3,
-        "validator_pubkey_hex": "2" * 64,
-        "decision_expires_at": "2026-10-14T15:00:00Z",
-        **evidence,
-        "evidence_digest_sha256": evidence_digest_hex(evidence),
-    }
-    client = _FakeValidatorClient(assignment)
-    signed: list[str] = []
-
-    def sign(message: str) -> str:
-        signed.append(message)
-        return "ab" * 64
-
-    daemon = ValidatorDaemon(client, ValidatorConfig(tmp_path), sign)
-    daemon._sign_and_post(assignment, assignment["evidence_digest_sha256"], decision)
-
-    assert signed == [decision_signature_message(
-        protocol_version=VALIDATOR_DECISION_PROTOCOL_V2,
-        validator_id="val_v2",
-        assignment_id="asgn_v2",
-        decision_nonce="1" * 64,
-        validator_key_generation=3,
-        validator_pubkey_hex="2" * 64,
-        decision_expires_at="2026-10-14T15:00:00Z",
-        decision=decision,
-        evidence_digest_sha256=assignment["evidence_digest_sha256"],
-    )]
-    assert client.posted == [("asgn_v2", decision, "ab" * 64)]
-
-
-@pytest.mark.parametrize(("version", "nonce"), [
-    (None, "1" * 64),
-    ("ormas-validator-decision-v999", "1" * 64),
-    (VALIDATOR_DECISION_PROTOCOL_V1, "1" * 64),
-    (VALIDATOR_DECISION_PROTOCOL_V2, None),
-    (VALIDATOR_DECISION_PROTOCOL_V2, "short"),
-])
-def test_validator_refuses_missing_or_unknown_decision_binding_before_repository_access(
-    tmp_path, version, nonce,
-) -> None:
-    evidence = _evidence(_contract())
-    assignment = {
-        "assignment_id": "asgn_unknown",
-        "validator_id": "val_v2",
-        **evidence,
-        "evidence_digest_sha256": evidence_digest_hex(evidence),
-    }
-    if version is not None:
-        assignment["decision_protocol_version"] = version
-    if nonce is not None:
-        assignment["decision_nonce"] = nonce
-    daemon = ValidatorDaemon(_FakeValidatorClient(assignment), ValidatorConfig(tmp_path), lambda _: "")
-    assert daemon._preface(assignment) == ("skip", None)
 
 
 def test_validator_canonical_evidence_refuses_malformed_contract() -> None:

@@ -77,6 +77,10 @@ DEFAULT_POLL_INTERVAL_S = 15
 DEFAULT_LEASE_TTL_S = 300
 DEFAULT_HEARTBEAT_S = 90
 
+# Bound on the exception text written to the local failure log line. The gateway
+# capture allow-list does not carry free text, so this never leaves the process.
+_FAILURE_MESSAGE_MAX = 500
+
 # `TaskReceipt.model` is optional. Omit it when the solver did not name one.
 # Do not send a synthetic stand-in such as "unknown": a third-party receipt
 # is valid without a model. ``actual_provider`` is still a plain string, so an
@@ -92,9 +96,48 @@ _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 _LOGGER = logging.getLogger(__name__)
 
+# Statuses the offer read may return. Terminal rows are not open work.
+_OFFER_BID_STATUSES = frozenset({
+    "open", "awarded", "not_awarded", "withdrawn", "replaced", "no_capacity",
+    "acceptance_capacity", "award_lapsed",
+})
+_TERMINAL_OFFER_STATUSES = frozenset({
+    "not_awarded", "withdrawn", "replaced", "no_capacity",
+    "acceptance_capacity", "award_lapsed",
+})
+_PENDING_OFFER_FENCE = (
+    "offer POST outcome unknown; recover own bid identity before claiming"
+)
+
 
 class GitError(RuntimeError):
     """A git subprocess used by the skeleton failed."""
+
+
+_ROUND_JOURNAL_FIELDS = frozenset({"gateway", "runner_id", "revisions"})
+_REVISION_ROUND_FIELDS = frozenset(
+    {"job_id", "request_id", "kind", "origin", "bid_id", "deadline", "child_job_id", "claimed"})
+
+
+def _valid_revision_round(record: Any) -> None:
+    """Raise ``ValueError`` unless ``record`` is one agreed revision journal entry."""
+    def text(value):
+        return isinstance(value, str) and bool(value)
+
+    if (not isinstance(record, dict) or set(record) != _REVISION_ROUND_FIELDS
+            or record["kind"] != "revision"
+            or not all(text(record[k]) for k in ("job_id", "request_id", "origin", "deadline", "child_job_id"))
+            or record["child_job_id"] == record["job_id"] or type(record["claimed"]) is not bool
+            or not (record["bid_id"] is None or text(record["bid_id"]))):
+        raise ValueError("invalid revision round")
+
+
+def _deadline_passed(value: str, now: datetime) -> bool:
+    try:
+        deadline = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return deadline.tzinfo is None or now >= deadline
+    except (TypeError, ValueError, AttributeError):
+        return True
 
 
 def _app_read_expired(credential: Any) -> bool:
@@ -170,6 +213,16 @@ class SolveResult:
 SolveFn = Callable[[TaskDraft, Path], SolveResult]
 
 
+def _terminal_refusal(exc: OrmasGatewayError) -> bool:
+    """True for a gateway 4xx refusal other than 409 (a decided, non-transient refusal)."""
+    return exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 409
+
+
+def _without_legacy_error(capture: Mapping[str, Any]) -> dict[str, Any]:
+    """A copy of a retained capture without the legacy free-text ``error`` key."""
+    return {key: value for key, value in capture.items() if key != "error"}
+
+
 def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None) -> str:
     try:
         git = trusted_executable("git")
@@ -179,7 +232,7 @@ def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
     if set(overrides) - {"GIT_SSH_COMMAND"}:
         raise GitError("unsupported git environment override")
     # Git receives no ambient service secrets, user configuration, proxy or
-    # executable search path.  The single call-site override is a generated,
+    # executable search path. The single call-site override is a generated,
     # job-scoped SSH command whose executable is independently vetted below.
     git_env = {
         "PATH": str(git.parent),
@@ -190,10 +243,9 @@ def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
         "GIT_TERMINAL_PROMPT": "0",
         **overrides,
     }
-    # Repository code runs between trusted Git operations.  Never let a verifier
-    # install replacement refs or hooks that change the object view or execute
-    # again when the validator checks out the result.  GIT_SSH_COMMAND and other
-    # explicit call-site settings are preserved above.
+    # Repository code runs between trusted Git operations. Never let it install
+    # replacement refs, hooks, fsmonitor commands or credential helpers that
+    # alter the object view, execute code or acquire ambient authority.
     git_env["GIT_NO_REPLACE_OBJECTS"] = "1"
     command_config = (
         ("core.hooksPath", os.devnull),
@@ -214,19 +266,12 @@ def _run_git(args: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
     )
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    # Preserve path bytes represented as text.  In particular, ``git ... -z``
-    # may begin with whitespace that is part of the first filename; ``strip``
-    # would silently turn that into a different path during scope checks.
+    # Preserve the identity of leading-whitespace filenames returned by Git.
     return proc.stdout.rstrip("\r\n")
 
 
 def _nul_git_paths(output: str) -> tuple[str, ...]:
-    """Parse a ``git ... -z`` path list without changing path identity.
-
-    Git paths are byte strings.  The protocol and completion JSON require UTF-8,
-    so reject undecodable names as a review error instead of crashing or signing
-    evidence for a differently decoded path.
-    """
+    """Parse a ``git ... -z`` path list without changing path identity."""
     if output and not output.endswith("\0"):
         raise GitError("git path output was not NUL terminated")
     paths = tuple(output[:-1].split("\0")) if output else ()
@@ -238,6 +283,22 @@ def _nul_git_paths(output: str) -> tuple[str, ...]:
 def _public_git(args, *, cwd):
     from .outcomes_support import public_git
     return public_git(args, cwd=cwd)
+
+
+def _graded_packet(draft):
+    """Recognize custody without granting public-execution/publication authority."""
+    raw = getattr(draft, 'work_packet', None)
+    if not isinstance(raw, Mapping) or raw.get('acceptance_level') != 'graded':
+        return None
+    contract, policy = raw.get('graded_contract'), raw.get('execution_policy')
+    if (not isinstance(contract, Mapping) or not isinstance(policy, Mapping)
+            or draft.base_commit != policy.get('repo_base_sha')
+            or contract.get('base_sha') != draft.base_commit
+            or contract.get('immutable_paths') != policy.get('immutable_paths')):
+        raise GitError('graded draft contract mismatch')
+    from .outcomes_support import graded_delivery_limits
+    graded_delivery_limits(raw.get('delivery_limits'))
+    return dict(raw)
 
 
 def _public_packet(draft):
@@ -403,7 +464,7 @@ def _split_verify_command(verify_command: str) -> tuple[list[str], dict[str, str
 def _run_verify_command(
     verify_command: str, *, cwd: Path, path_prefix: str | None = None,
     evidence_identity=None, raise_setup_errors: bool = False,
-    trusted_public_python: bool = False,
+    trusted_public_python: bool = False, timeout_s=None,
 ) -> int:
     """Run ``verify_command`` in ``cwd`` under a bounded, credential-free env.
 
@@ -411,6 +472,7 @@ def _run_verify_command(
     reads or writes the real one), and ``LANG`` cross into the child — no
     provider keys or tokens. The nonsecret ORMAS_VERIFIER_SCRATCH_DIR also crosses
     so the external driver's Docker bind mounts resolve on a sibling-container host.
+    ORMAS_VERIFIER_PACKAGE_CACHE crosses only when explicitly set for the host wheel cache.
     Returns the exit code; a command that can't even be parsed or launched
     fails closed (1 / 127) rather than raising past the caller.
     When ``path_prefix`` is set, it is prepended to the child's ``PATH`` and
@@ -420,6 +482,10 @@ def _run_verify_command(
     interpreter and the inherited ``PATH`` cannot choose the verifier process.
     Validators set ``raise_setup_errors`` to distinguish a command that never
     launched from a real verifier that returned the same numeric exit code.
+    ``timeout_s`` is an optional wall-clock bound. ``None`` leaves the
+    ``subprocess.run`` call without a ``timeout`` keyword (the legacy path).
+    Any other value is passed through as ``timeout``; ``TimeoutExpired``
+    propagates to the caller instead of becoming an exit code.
     """
     try:
         argv, env_overrides = _split_verify_command(verify_command)
@@ -464,13 +530,23 @@ def _run_verify_command(
             # The verifier runtime's scratch root is tempfile.gettempdir(), steered by TMPDIR.
             env["ORMAS_VERIFIER_SCRATCH_DIR"] = scratch_root
             env["TMPDIR"] = scratch_root
+        if "ORMAS_VERIFIER_PACKAGE_CACHE" in os.environ:
+            env["ORMAS_VERIFIER_PACKAGE_CACHE"] = os.environ["ORMAS_VERIFIER_PACKAGE_CACHE"]
         env.update(env_overrides)
         try:
             with verification_call(verify_command, env, cwd=cwd,
                                    identity=evidence_identity) as bound_env:
-                proc = subprocess.run(
-                    argv, cwd=str(cwd), env=bound_env, capture_output=True, text=True,
-                )
+                # None keeps today's unbounded run: the keyword is omitted, not
+                # passed as timeout=None. A hit propagates TimeoutExpired.
+                if timeout_s is None:
+                    proc = subprocess.run(
+                        argv, cwd=str(cwd), env=bound_env, capture_output=True, text=True,
+                    )
+                else:
+                    proc = subprocess.run(
+                        argv, cwd=str(cwd), env=bound_env, capture_output=True, text=True,
+                        timeout=timeout_s,
+                    )
         except ValueError:
             if raise_setup_errors:
                 raise
@@ -486,7 +562,9 @@ def _run_verify_command(
 class MinerConfig:
     """Static identity + defaults for one miner process.
 
-    ``repo_url`` is what the skeleton clones from at bind time; ``push_remote``
+    ``repo_id`` is used for binding; ``repo_url`` is the legacy clone fallback.
+    Packet jobs use their own repository; set both fields to ``""`` if unbound.
+    ``push_remote``
     controls whether the result branch is actually pushed (``None`` records a
     ``local:`` ref instead — useful for a dry run or a test double).
     ``ask_usd`` is the miner's firm ask sent with every claim; the default
@@ -520,6 +598,19 @@ class MinerConfig:
     positive ``ask_usd`` supplies static firm pricing. Own bid identities and
     immutable terms persist in the existing gateway/runner recovery namespace;
     an unknown award or ambiguous POST refuses execution.
+
+    ``change_order_terms`` opts in to Graded change-order quoting with static
+    firm ``{kind, price_usd}`` or limit ``{kind, estimate_usd, limit_usd}``
+    terms. The default ``None`` declines change orders. A pass reads the
+    Graded inbox after its ordinary claim: an idle pass straight away; a pass
+    that leased work once that work is finished, and only after this process
+    has read the inbox or run a Graded lease. An eligible revision agrees.
+    The child named in the agree reply is recorded in a round journal and
+    claimed by job id before ordinary work, on the agreeing pass or a later
+    one, until its agreed delivery deadline. Inbox failures are retried on a
+    later pass; only an idle pass lets an authentication refusal propagate.
+    A reply is sent once. A lost reply is not recovered; see
+    ``MinerSkeleton._rounds_state`` for what that leaves unclaimed.
 
     ``settle_fn(lease, result)`` sets the price for a verified limit delivery,
     capped at the lease's limit. Without it, the price is the limit. It must be
@@ -562,6 +653,7 @@ class MinerConfig:
     offer_window: bool = False
     claim_refusal_backoff_s: float | None = None
     claim_refusal_backoff_max_s: float | None = None
+    change_order_terms: dict[str, Any] | None = None
 
 
 class MinerSkeleton:
@@ -603,6 +695,8 @@ class MinerSkeleton:
         self._queue_unsupported = False
         # Only the exact claim-step exception is retryable by the daemon.
         self._claim_error: BaseException | None = None
+        # Process-local backstop while a refused lease identity is not yet durable.
+        self._refused_offer_leases = set()
         # Consecutive gateway claim refusals (a non-401/403 OrmasGatewayError)
         # and the last one seen, for :meth:`claim_health`. The counter drives
         # the exponential backoff in :meth:`run_forever` and is reset by any
@@ -610,6 +704,15 @@ class MinerSkeleton:
         # reset: an operator still wants to see the most recent refusal.
         self._consecutive_claim_refusals = 0
         self._last_claim_refusal: dict[str, Any] | None = None
+        # Set once this process has read a Graded inbox or run a Graded lease.
+        # Until then a pass that leased work reads no inbox, so its requests
+        # stay exactly the ordinary ones. Known limit: a miner busy from its
+        # first pass, with no Graded lease since it started, answers pending
+        # requests only at its first idle pass.
+        self._graded_rounds_in_use = False
+        # Set when rounds.json cannot be read or validated: round claiming and
+        # round journalling stop for this process and the file is left as is.
+        self._rounds_disabled = False
 
     # ------------------------------------------------------------------
     # Setup
@@ -717,6 +820,13 @@ class MinerSkeleton:
 
     def _clone_and_checkout(self, draft: TaskDraft) -> Path:
         workdir = self._fresh_workdir(draft.task_id)
+        if _graded_packet(draft) is not None:
+            # Custody never acquires a repository key or enters legacy write-key
+            # handling. The frozen base must be readable without a credential.
+            source = draft.repo_url or self.config.repo_url
+            _public_git(['clone', '--no-checkout', source, str(workdir)], cwd=workdir.parent)
+            _public_git(['checkout', '--detach', draft.base_commit], cwd=workdir)
+            return workdir
         packet = _public_packet(draft)
         if packet is not None:
             from .outcomes_support import validate_repository_credential, repository_git
@@ -739,6 +849,9 @@ class MinerSkeleton:
             _public_git(['checkout', '--detach', draft.base_commit], cwd=workdir)
             return workdir
         source = draft.repo_url if (getattr(draft, "repo_credential", None) and draft.repo_url) else self.config.repo_url
+        if not source:
+            raise GitError("legacy job has no clone repository; supply --repo-url "
+                           "or a job repository with its credential")
         with _credential_git_env(getattr(draft, "repo_credential", None)) as env:
             _run_git(["clone", source, str(workdir)], cwd=workdir.parent, env=env)
         if draft.base_commit:
@@ -793,8 +906,22 @@ class MinerSkeleton:
             else:
                 source = stack.enter_context(tempfile.TemporaryFile())
                 length, digest, tree_sha = _build_public_artifact(draft, workdir, result, source)
-            published = self.client.publish_result(draft.task_id, self.config.runner_id,
-                lease.lease_id, source=source, length=length)
+            self.client.heartbeat_task(
+                draft.task_id, self.config.runner_id, lease.lease_id, renew=True,
+            )
+            try:
+                published = self.client.publish_result(draft.task_id, self.config.runner_id,
+                    lease.lease_id, source=source, length=length)
+            except OrmasGatewayError as exc:
+                if (exc.status_code != 409
+                        or exc.error_type != 'public_publication_attempt_unavailable'):
+                    raise
+                source.seek(0)
+                self.client.heartbeat_task(
+                    draft.task_id, self.config.runner_id, lease.lease_id, renew=True,
+                )
+                published = self.client.publish_result(draft.task_id, self.config.runner_id,
+                    lease.lease_id, source=source, length=length)
         commit = published.get('result_commit')
         ref = f'refs/heads/ormas/job/{draft.task_id}'
         if (published.get('result_ref') != ref or published.get('artifact_sha256') != digest
@@ -818,6 +945,83 @@ class MinerSkeleton:
         if parents != [commit, draft.base_commit]:
             raise GitError('public publication parent mismatch')
         return ref, replace(result, result_commit=commit)
+
+    def _publish_graded(self, lease, draft, workdir, result, *, capture=None):
+        """Hold one frozen bundle; retry transport/5xx with those identical bytes."""
+        from .outcomes_support import build_graded_artifact
+
+        store = self._public_recovery
+        if store is None:
+            raise RecoveryRequired('graded custody requires a recovery journal')
+        pending = store.pending()
+        if pending is not None and pending['stage'] == 'claimed':
+            if capture is None:
+                raise RecoveryRequired('graded artifact requires frozen capture')
+            pending = store.checkpoint_artifact(
+                lambda target: build_graded_artifact(
+                    _graded_packet(draft), workdir, result.result_commit, target),
+                result=asdict(result), capture=capture,
+            )
+        if pending is None or pending['stage'] != 'artifact':
+            raise RecoveryRequired('graded artifact checkpoint is missing')
+        deadline = time.monotonic() + self.lease_ttl_s
+        backoff = max(1.0, self.config.heartbeat_interval_s)
+        with store.artifact_source(pending) as source:
+            while True:
+                if self.cancelled.is_set():
+                    raise RecoveryRequired('graded artifact cancelled')
+                try:
+                    self.client.heartbeat_task(
+                        draft.task_id, self.config.runner_id, lease.lease_id, renew=True,
+                    )
+                    source.seek(0)
+                    held = self.client.upload_graded_artifact(
+                        draft.task_id, self.config.runner_id, lease.lease_id,
+                        source=source, length=pending['artifact_length'],
+                    )
+                except OrmasGatewayError as exc:
+                    if exc.status_code == 409 and exc.error_type == 'lease_lost':
+                        self.cancelled.set()
+                    if exc.status_code is not None and exc.status_code < 500:
+                        raise
+                    if time.monotonic() + backoff >= deadline:
+                        raise
+                except (HTTPError, OSError):
+                    if time.monotonic() + backoff >= deadline:
+                        raise
+                else:
+                    break
+                # Same gateway-authoritative cadence and lease bound as completion.
+                time.sleep(backoff)
+                backoff *= 2
+        if (not isinstance(held, Mapping) or held.get('status') != 'held'
+                or held.get('artifact_digest') != pending['artifact_sha256']
+                or self.cancelled.is_set()):
+            raise GitError('graded artifact hold mismatch')
+        return None, result
+
+    def _resolve_graded_artifact_refusal(self, lease, draft, exc, start):
+        """Close a refused hold, never replace an ambiguous upload with a delivery."""
+        store = self._public_recovery
+        pending = store.pending() if store is not None else None
+        if (pending is None or pending['stage'] != 'artifact'
+                or _graded_packet(draft) is None):
+            return False
+        if self.cancelled.is_set() or (isinstance(exc, OrmasGatewayError)
+                and exc.status_code == 409 and exc.error_type == 'lease_lost'):
+            self.cancelled.set()
+            self.last_run['lease_lost'] = True
+            self._acknowledge_public(None)
+            return True
+        if (not isinstance(exc, OrmasGatewayError) or exc.status_code is None
+                or not 400 <= exc.status_code < 500):
+            return False
+        # Custody was explicitly refused, so there is no delivery to replay.
+        # Tell the gateway too; a silent local tombstone would leave its lease
+        # running and it could re-serve the same acknowledged claim.
+        self._report_lease_failure(lease, draft, exc, start,
+                                  verification_state='publish_failed', failure_class='publish_failed')
+        return True
 
     def _material_diff_sha256(self, workdir: Path, base_commit: str, result_commit: str) -> str | None:
         if not base_commit or not result_commit:
@@ -1003,7 +1207,13 @@ class MinerSkeleton:
                 return self.client.claim_task(self.config.runner_id, offers=offers)
         return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
 
-    def _offer_state(self) -> dict[str, Any]:
+    def _offer_state(self, *, allow_pending: bool = False) -> dict[str, Any]:
+        """Load the offer journal.
+
+        Unsafe, corrupt, and identity-mismatched records always refuse.
+        A non-None ``pending`` intent refuses unless the caller is the
+        recovery path (``allow_pending=True``), which reads it before offering.
+        """
         store = self._public_recovery
         if store is None:
             raise RecoveryRequired("offer recovery requires gateway and runner identity")
@@ -1030,22 +1240,113 @@ class MinerSkeleton:
             for job_id, bid_id in state["current"].items():
                 if state["bids"][bid_id]["terms"]["job_id"] != job_id:
                     raise ValueError("invalid bid job identity")
+            refused = state.get("refused_leases", [])
+            if (not isinstance(refused, list) or any(
+                    not isinstance(record, dict) or set(record) != {"job_id", "lease_id", "bid_id"}
+                    or not all(isinstance(record[key], str) and record[key]
+                               for key in ("job_id", "lease_id"))
+                    or (record["bid_id"] is not None and (
+                        not isinstance(record["bid_id"], str) or not record["bid_id"]))
+                    for record in refused)):
+                raise ValueError("invalid refused lease identity")
             if state["pending"] is not None:
-                raise RecoveryRequired("offer POST outcome unknown; recover own bid identity before claiming")
+                if not allow_pending:
+                    raise RecoveryRequired(_PENDING_OFFER_FENCE)
+                _validate_window_offer(state["pending"])
             return state
         except (ValueError, KeyError, TypeError):
             raise RecoveryRequired("offer recovery record is corrupt") from None
 
+    def _refuse_pending_offer(self, cause: BaseException | None = None) -> None:
+        """Keep the pending intent and stop this poll. The POST is not replayed."""
+        raise RecoveryRequired(_PENDING_OFFER_FENCE) from cause
+
+    def _recover_pending_offer(self, state: dict[str, Any]) -> set[str]:
+        """One own-offer read for a lost POST. Returns jobs that must not be re-offered."""
+        intent = state.get("pending")
+        if intent is None:
+            return set()
+        job_id = intent["job_id"]
+        try:
+            response = self.client.get_offer_for_job(self.config.runner_id, job_id)
+        except OrmasGatewayError as exc:
+            if ((exc.status_code is not None and exc.status_code >= 500)
+                    or (exc.status_code == 404 and exc.error_type is None)):
+                self._refuse_pending_offer(exc)
+            raise
+        except (HTTPError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+            self._refuse_pending_offer(exc)
+        if (not isinstance(response, Mapping) or response.get("job_id") != job_id
+                or type(response.get("window_closed")) is not bool or "bid" not in response):
+            self._refuse_pending_offer()
+        bid = response["bid"]
+        if bid is not None and (
+                not isinstance(bid, Mapping)
+                or not isinstance(bid.get("bid_id"), str) or not bid["bid_id"]
+                or not isinstance(bid.get("status"), str)
+                or bid["status"] not in _OFFER_BID_STATUSES):
+            self._refuse_pending_offer()
+        terminal = (
+            isinstance(bid, Mapping)
+            and bid.get("status") in _TERMINAL_OFFER_STATUSES
+            and (bid.get("terms") != intent or bid.get("bid_id") in state["bids"])
+        )
+        if bid is None or terminal:
+            if response["window_closed"] is not True:
+                self._refuse_pending_offer()
+            _LOGGER.warning(
+                "pending offer for job %s closed without an adoptable bid", job_id)
+            state["pending"] = None
+            self._save_offers(state)
+            return {job_id}
+        bid_id, status = bid["bid_id"], bid["status"]
+        award_id = bid.get("award_id")
+        if (bid_id in state["bids"] or bid.get("terms") != intent
+                or (status == "awarded" and (
+                    not isinstance(award_id, str) or not award_id))):
+            self._refuse_pending_offer()
+        record = {
+            "terms": dict(intent),
+            "status": status,
+            "window_closes_at": bid.get("window_closes_at"),
+        }
+        if status == "awarded":
+            record["award_id"] = award_id
+        state["bids"][bid_id] = record
+        state["current"][job_id] = bid_id
+        state["pending"] = None
+        self._save_offers(state)
+        return {job_id}
+
     def _save_offers(self, state: dict[str, Any]) -> None:
+        self._save_journal("offers", state)
+
+    def _sync_offer_refusals(self, state: dict[str, Any]) -> None:
+        refused = state.setdefault("refused_leases", [])
+        dirty = False
+        for job_id, lease_id, bid_id in self._refused_offer_leases:
+            if not all(isinstance(value, str) and value for value in (job_id, lease_id, bid_id)):
+                continue
+            record = {"job_id": job_id, "lease_id": lease_id, "bid_id": bid_id}
+            if record not in refused:
+                refused.append(record)
+                dirty = True
+        if dirty:
+            self._save_offers(state)
+
+    def _save_rounds(self, state: dict[str, Any]) -> None:
+        self._save_journal("rounds", state)
+
+    def _save_journal(self, kind: str, state: dict[str, Any]) -> None:
         root = self._public_recovery.root
         raw = json.dumps(state, allow_nan=False, separators=(",", ":")).encode()
-        fd, name = tempfile.mkstemp(prefix="offers-", dir=root)
+        fd, name = tempfile.mkstemp(prefix=kind + "-", dir=root)
         try:
             with os.fdopen(fd, "wb") as target:
                 target.write(raw)
                 target.flush()
                 os.fsync(target.fileno())
-            os.replace(name, root / "offers.json")
+            os.replace(name, root / (kind + ".json"))
             fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.fsync(fd)
@@ -1071,7 +1372,7 @@ class MinerSkeleton:
         status, award = response.get("status"), response.get("award_id")
         if (response.get("bid_id") != bid_id or status not in
                 {"open", "awarded", "not_awarded", "withdrawn", "replaced", "no_capacity",
-                 "award_lapsed"}
+                 "acceptance_capacity", "award_lapsed"}
                 or (status == "awarded" and (not isinstance(award, str) or not award))
                 or (bid["status"] == "awarded" and status != "award_lapsed" and (
                     status != "awarded" or bid.get("award_id") != award))):
@@ -1081,10 +1382,25 @@ class MinerSkeleton:
         self._save_offers(state)
         return bid
 
-    def _check_offer_lease(self, state, claimed, legacy_offers=()):
+    def _check_offer_lease(self, state, claimed, legacy_offers=(), skipped_jobs=()):
         if claimed is None:
             return None
         lease, draft = claimed
+        identity = (lease.task_id, lease.lease_id, lease.bid_id)
+        if lease.task_id in skipped_jobs:
+            self._refused_offer_leases.add(identity)
+        self._sync_offer_refusals(state)
+        refusal = {"job_id": lease.task_id, "lease_id": lease.lease_id, "bid_id": lease.bid_id}
+        if identity in self._refused_offer_leases or refusal in state["refused_leases"]:
+            exc = RecoveryRequired("queue award bid identity mismatch")
+            self._claim_error = exc
+            raise exc
+        if getattr(draft, "graded_round_kind", None) == "revision":
+            # Only a child named by this miner's own agree reply. Any other
+            # revision lease meets the checks below, as on origin/main.
+            record = self._revision_record(lease)
+            if record is not None:
+                return self._check_revision_lease(state, claimed, record)
         bid = state["bids"].get(lease.bid_id)
         legacy = False
         if bid is None:
@@ -1098,10 +1414,7 @@ class MinerSkeleton:
         terms = bid["terms"]
         if (bid["status"] != "awarded" or lease.task_id != terms["job_id"]
                 or draft.task_id != terms["job_id"] or draft.runner_id != self.config.runner_id
-                or lease.offer_kind != terms["kind"]
-                or lease.outcome_price_usd != float(terms.get("price_usd", terms.get("limit_usd")))
-                or lease.estimate_usd != (float(terms["estimate_usd"]) if terms["kind"] == "limit" else None)
-                or lease.limit_usd != (float(terms["limit_usd"]) if terms["kind"] == "limit" else None)):
+                or self._frozen_terms_differ(lease, terms)):
             raise RecoveryRequired("lease award bid identity or frozen terms mismatch")
         if legacy:
             if not isinstance(lease.bid_id, str) or not lease.bid_id:
@@ -1111,8 +1424,52 @@ class MinerSkeleton:
             self._save_offers(state)
         return claimed
 
+    @staticmethod
+    def _frozen_terms_differ(lease, terms) -> bool:
+        return (lease.offer_kind != terms["kind"]
+                or lease.outcome_price_usd != float(terms.get("price_usd", terms.get("limit_usd")))
+                or lease.estimate_usd != (float(terms["estimate_usd"]) if terms["kind"] == "limit" else None)
+                or lease.limit_usd != (float(terms["limit_usd"]) if terms["kind"] == "limit" else None))
+
+    def _check_revision_lease(self, state, claimed, record):
+        """A recorded revision child: the parent's bid, terms and original job."""
+        lease, draft = claimed
+        if (draft.task_id != lease.task_id or draft.runner_id != self.config.runner_id
+                or draft.graded_parent_job_id != record["origin"]):
+            raise RecoveryRequired("lease award bid identity or frozen terms mismatch")
+        if record["bid_id"] is not None:
+            bid = self._read_bid(state, record["bid_id"])
+            if (lease.bid_id != record["bid_id"] or bid["status"] != "awarded"
+                    or bid["terms"]["job_id"] != record["origin"]
+                    or self._frozen_terms_differ(lease, bid["terms"])):
+                raise RecoveryRequired("lease award bid identity or frozen terms mismatch")
+        elif lease.bid_id is not None:
+            # The parent was leased outside this journal. Only a legacy claim's
+            # bid has no frozen window terms to keep; a lost award is recovery.
+            if self.client.get_offer(lease.bid_id).get("status") != "legacy":
+                raise RecoveryRequired("unknown own award bid")
+            terms = {"job_id": record["origin"], "kind": lease.offer_kind}
+            if lease.offer_kind == "limit":
+                terms.update(estimate_usd=lease.estimate_usd, limit_usd=lease.limit_usd)
+            else:
+                terms["price_usd"] = lease.outcome_price_usd
+            try:
+                _validate_window_offer(terms)
+            except ValueError:
+                raise RecoveryRequired("lease award bid identity or frozen terms mismatch") from None
+            state["bids"].setdefault(lease.bid_id, {"terms": terms, "status": "awarded", "legacy": True})
+            state["current"].setdefault(record["origin"], lease.bid_id)
+            self._save_offers(state)
+            self._update_revision(record["child_job_id"], bid_id=lease.bid_id)
+        # Without a bid the lease carries no award and no offer terms
+        # (runner_api.py:_draft_and_lease): a legacy parent's child.
+        return claimed
+
     def _claim_offer_window(self) -> tuple[TaskLease, TaskDraft] | None:
-        state = self._offer_state()
+        state = self._offer_state(allow_pending=True)
+        # Reconcile a lost POST before any queue read, and never resubmit it here.
+        recovered_jobs = self._recover_pending_offer(state)
+        self._sync_offer_refusals(state)
         if self._queue_unsupported:
             if state["bids"]:
                 raise RecoveryRequired("own offer bids require gateway queue support")
@@ -1128,15 +1485,31 @@ class MinerSkeleton:
             return self.client.claim_task(self.config.runner_id, ask_usd=self.config.ask_usd)
         missing_pricing = self.config.offer_fn is None and not _positive_usd(self.config.ask_usd)
         legacy_offers = []
+        skipped_jobs = set()
+        rounds = self._rounds_state()
+        children = {r["child_job_id"] for r in rounds["revisions"]} if rounds is not None else set()
         for entry in queue.get("jobs", []):
             job_id = entry["job_id"]
+            if job_id in children:
+                # An agreed revision child is never priced. It is claimed by
+                # job id, and its lease is checked against its record.
+                continue
+            # The intent resolved above is not priced or posted again this poll.
+            # An award already on the queue still has to match the saved bid.
+            if job_id in recovered_jobs and not entry.get("awarded_to_you"):
+                continue
             bid_id = state["current"].get(job_id)
             bid = state["bids"].get(bid_id)
             if entry.get("awarded_to_you"):
                 awarded = self._read_bid(state, entry.get("bid_id"))
-                if (awarded["terms"]["job_id"] != job_id or awarded["status"] != "awarded"
-                        or awarded.get("award_id") != entry.get("award_id")):
+                if (awarded["status"] != "awarded" or awarded.get("award_id") != entry.get("award_id")):
                     raise RecoveryRequired("queue award bid identity mismatch")
+                if awarded["terms"]["job_id"] != job_id:
+                    # Only a revision child carries another job's award
+                    # (outcomes_jobs.py: it inherits the parent's). One this
+                    # journal does not name is left unclaimed and unpriced.
+                    skipped_jobs.add(job_id)
+                    _LOGGER.debug("queue job %s carries an unrecorded inherited award", job_id)
                 continue
             if bid is not None and not bid.get("legacy"):
                 bid = self._read_bid(state, bid_id)
@@ -1169,8 +1542,9 @@ class MinerSkeleton:
             if (bid is not None and not bid.get("legacy") and bid["terms"] == offer
                     and bid["status"] == "open"):
                 continue
-            # Save intent first: a lost POST response cannot be recovered by the
-            # own-status API, which requires the returned bid id.
+            # Save the intent before the single POST. A lost response is read
+            # back with get_offer_for_job on the next poll; recovery does not
+            # resubmit it. The bid-id route cannot do this — it needs the id.
             state["pending"] = offer
             self._save_offers(state)
             try:
@@ -1202,25 +1576,344 @@ class MinerSkeleton:
         # terms through an empty-offer claim before requiring fresh pricing.
         claimed = self.client.claim_task(self.config.runner_id, offers=[])
         if claimed is not None:
-            return self._check_offer_lease(state, claimed)
+            return self._check_offer_lease(state, claimed, skipped_jobs=skipped_jobs)
         if missing_pricing:
             raise ValueError("offer-window pricing requires a positive ask_usd or offer_fn")
         if legacy_offers:
             claimed = self.client.claim_task(self.config.runner_id, offers=legacy_offers)
-            return self._check_offer_lease(state, claimed, legacy_offers)
+            return self._check_offer_lease(state, claimed, legacy_offers, skipped_jobs)
         return None
+
+    def _poll_graded_rounds(self) -> bool:
+        """Answer pending requests; return whether a revision was agreed.
+
+        Reading this optional exchange is best effort so older gateways and
+        miners outside Graded admission can still claim ordinary work. A failed
+        read grants no consent. Replies use the gateway's persisted status for
+        replay safety; every non-pending row is left alone. Each reply is sent
+        once; what its reply names is journalled after it arrives.
+        """
+        try:
+            requests = self.client.list_graded_rounds(self.config.runner_id)
+        except OrmasGatewayError as exc:
+            if exc.status_code in {401, 403}:
+                raise
+            _LOGGER.debug("Graded inbox read failed: %s", exc.error_type)
+            return False
+        except Exception as exc:  # optional read; includes transport/schema failures
+            _LOGGER.debug("Graded inbox read failed: %s", type(exc).__name__)
+            return False
+        self._graded_rounds_in_use = True
+        journalled = self._public_recovery is not None
+        rounds = offers = None
+        if journalled and any(r.get("status") == "pending" for r in requests):
+            rounds = self._rounds_state()
+            if self.config.offer_window:
+                try:
+                    offers = self._offer_state(allow_pending=True)
+                except RecoveryRequired as exc:
+                    _LOGGER.warning("Graded requests left pending: %s", exc)
+                    return False
+        agreed = False
+        for request in requests:
+            if request.get("status") != "pending":
+                continue
+            kind = request.get("kind")
+            if kind == "revision":
+                # The gateway refuses every reply, agree or decline, once the
+                # acceptance window has closed; posting then only earns a 409.
+                try:
+                    closes = datetime.fromisoformat(request["window_closes_at"].replace("Z", "+00:00"))
+                    if closes.tzinfo is None or datetime.now(timezone.utc) >= closes:
+                        continue
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                eligible = False
+                try:
+                    index, allowance = request["revision_index"], request["revision_allowance"]
+                    deadline = datetime.fromisoformat(
+                        request["revision_delivery_deadline"].replace("Z", "+00:00"))
+                    # The gateway numbers revisions from 1 (count + 1).
+                    eligible = (
+                        type(index) is int and type(allowance) is int
+                        and 1 <= index <= allowance and deadline.tzinfo is not None
+                        and datetime.now(timezone.utc) < deadline
+                    )
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    pass  # Incomplete timing/allowance never grants consent.
+                # With the round journal disabled an agreed child could be
+                # claimed by nothing, so the request is declined.
+                eligible = eligible and (not journalled or rounds is not None)
+                decision = "revision_agree" if eligible else "revision_decline"
+            elif kind == "change_order":
+                if self.config.change_order_terms is not None:
+                    response = self._graded_round_reply(
+                        self.client.submit_change_order_quote,
+                        self.config.runner_id, request["job_id"],
+                        client_request_id=request["request_id"],
+                        contract_digest=request["amended_contract_digest"],
+                        terms=self.config.change_order_terms,
+                    )
+                    if response is not None and offers is not None:
+                        self._journal_quote(offers, request, response)
+                    continue
+                decision = "change_order_decline"
+            else:
+                continue
+            response = self._graded_round_reply(
+                self.client.answer_graded_round,
+                self.config.runner_id, request["request_id"], job_id=request["job_id"],
+                decision=decision, contract_digest=request["contract_digest"],
+            )
+            if response is not None and decision == "revision_agree":
+                agreed = True
+                if rounds is not None:
+                    self._journal_revision(rounds, offers, request, response)
+        return agreed
+
+    def _graded_round_reply(self, send, *args, **kwargs) -> dict[str, Any] | None:
+        """Send one reply; return its body, or ``None`` when no reply arrived.
+
+        A refused or failed reply never stops ordinary claiming and is not
+        sent again by this pass.
+        """
+        try:
+            response = send(*args, **kwargs)
+            return dict(response) if isinstance(response, Mapping) else {}
+        except OrmasGatewayError as exc:
+            if exc.status_code in {401, 403}:
+                raise
+            _LOGGER.debug("Graded round reply refused: %s", exc.error_type)
+        except Exception as exc:  # transport/schema failure; the next pass reads status again
+            _LOGGER.debug("Graded round reply failed: %s", type(exc).__name__)
+        return None
+
+    def _journal_quote(self, offers, request, response) -> None:
+        """Window mode: the quote reply's own bid, so its award's lease is known."""
+        bid_id, child = response.get("bid_id"), response.get("job_id")
+        closes = response.get("window_closes_at")
+        if (not isinstance(bid_id, str) or not bid_id or bid_id in offers["bids"]
+                or not isinstance(child, str) or not child or child == request.get("job_id")
+                or child in offers["current"] or not isinstance(closes, str) or not closes):
+            _LOGGER.warning("quote %s reply has no new bid identity", request.get("request_id"))
+            return
+        offers["bids"][bid_id] = {"terms": {"job_id": child, **self.config.change_order_terms},
+                                  "status": "open", "window_closes_at": closes}
+        offers["current"][child] = bid_id
+        try:
+            self._save_offers(offers)
+        except OSError as exc:
+            offers["bids"].pop(bid_id)
+            offers["current"].pop(child)
+            _LOGGER.warning("quote %s bid not journalled: %s", request.get("request_id"), exc)
+
+    # ------------------------------------------------------------------
+    # Graded round journal: revision children this miner agreed to
+    # ------------------------------------------------------------------
+
+    def _rounds_state(self) -> dict[str, Any] | None:
+        """Read ``rounds.json``; ``None`` when it is disabled for this process.
+
+        The round journal holds one record per agreed revision, keyed by the
+        parent's ``(job_id, request_id)``: the child job id from the agree
+        reply, the original job and its bid, the agreed delivery deadline and
+        whether the child was claimed. A later revision in the same chain finds
+        its original job and bid through the record that names its parent as a
+        child. Records are never deleted; one whose deadline has passed is no
+        longer a claim target.
+
+        A journal that cannot be read or validated is never read as consent:
+        this process stops round claiming and round journalling, logs once,
+        leaves the file untouched as evidence and declines new revisions.
+        Ordinary claiming continues under its own checks.
+
+        Stated limits. A reply is sent once. If an agree or a window-mode
+        quote reply is lost, or the journal write after it fails, nothing is
+        re-sent and nothing is reconstructed. A revision child in default mode
+        is still picked up by an ordinary claim whenever the offer hook offers
+        it; otherwise it goes unclaimed and ordinary claiming continues. In
+        window mode an unrecorded child listed under its inherited parent award
+        is left unpriced and unclaimed. The award of a quote whose reply was
+        lost is a lease this miner cannot identify: it is refused as on
+        origin/main ("lease has unknown own award bid"), on every pass that is
+        served it. Recovery waits for the gateway to name the child in the
+        inbox entry.
+        """
+        store = self._public_recovery
+        if store is None or self._rounds_disabled:
+            return None
+        empty = {"gateway": store.namespace, "runner_id": store.runner_id, "revisions": []}
+        try:
+            fd = os.open(store.root / "rounds.json", os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return empty
+        except OSError as exc:
+            return self._disable_rounds("unreadable (%s)" % type(exc).__name__)
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as source:
+                metadata = os.fstat(source.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
+                        or metadata.st_uid != os.getuid()):
+                    return self._disable_rounds("unsafe")
+                state = json.load(source)
+            if (not isinstance(state, dict) or set(state) != _ROUND_JOURNAL_FIELDS
+                    or state["gateway"] != store.namespace or state["runner_id"] != store.runner_id
+                    or not isinstance(state["revisions"], list)):
+                return self._disable_rounds("identity or shape mismatch")
+            keys, children = set(), set()
+            for record in state["revisions"]:
+                _valid_revision_round(record)
+                keys.add((record["job_id"], record["request_id"]))
+                children.add(record["child_job_id"])
+            if not len(keys) == len(children) == len(state["revisions"]):
+                return self._disable_rounds("duplicate record")
+            return state
+        except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+            return self._disable_rounds("corrupt (%s)" % type(exc).__name__)
+
+    def _disable_rounds(self, reason: str) -> None:
+        self._rounds_disabled = True
+        _LOGGER.warning("Graded round journal %s: round claiming disabled for this process;"
+                        " the file is left unchanged", reason)
+        return None
+
+    def _save_revisions(self, rounds) -> bool:
+        try:
+            self._save_rounds(rounds)
+            return True
+        except OSError as exc:
+            _LOGGER.warning("Graded round journal not written: %s", exc)
+            return False
+
+    def _journal_revision(self, rounds, offers, request, response) -> None:
+        """Record the child named in an agree reply, under ``(job_id, request_id)``."""
+        job_id, request_id = request.get("job_id"), request.get("request_id")
+        # A later revision is requested on the previous child; the gateway
+        # still leases it under the original job's bid and names that job.
+        previous = next((r for r in rounds["revisions"] if r["child_job_id"] == job_id), None)
+        origin = previous["origin"] if previous is not None else job_id
+        bid_id = None
+        if offers is not None:
+            bid_id = previous["bid_id"] if previous is not None else offers["current"].get(origin)
+        record = {"job_id": job_id, "request_id": request_id, "kind": "revision", "origin": origin,
+                  "bid_id": bid_id, "deadline": request.get("revision_delivery_deadline"),
+                  "child_job_id": response.get("child_job_id"), "claimed": False}
+        try:
+            _valid_revision_round(record)
+        except ValueError:
+            _LOGGER.warning("agreed revision %s has no child job identity", request_id)
+            return
+        if any((r["job_id"], r["request_id"]) == (job_id, request_id)
+               or r["child_job_id"] == record["child_job_id"] for r in rounds["revisions"]):
+            _LOGGER.warning("agreed revision %s is already journalled", request_id)
+            return
+        rounds["revisions"].append(record)
+        if not self._save_revisions(rounds):
+            rounds["revisions"].remove(record)
+
+    def _revision_record(self, lease):
+        """The journalled agreement that names this lease's job as its child."""
+        rounds = self._rounds_state()
+        if rounds is None:
+            return None
+        return next((r for r in rounds["revisions"] if r["child_job_id"] == lease.task_id), None)
+
+    def _update_revision(self, child_job_id, **fields) -> None:
+        rounds = self._rounds_state()
+        if rounds is None:
+            return
+        for record in rounds["revisions"]:
+            if record["child_job_id"] == child_job_id:
+                record.update(fields)
+                self._save_revisions(rounds)
+                return
+
+    def _claim_agreed_revision(self) -> tuple[TaskLease, TaskDraft] | None:
+        """Claim an agreed child by job id, whatever ordinary pricing decides.
+
+        A refused or failed targeted claim (anything but 401/403) is logged
+        and left for a later pass; it never stops the ordinary claim.
+        """
+        rounds = self._rounds_state()
+        if rounds is None:
+            return None
+        now = datetime.now(timezone.utc)
+        for record in rounds["revisions"]:
+            # The gateway closes a revision child at its agreed delivery deadline.
+            if record["claimed"] or _deadline_passed(record["deadline"], now):
+                continue
+            child, state, offers = record["child_job_id"], None, None
+            if self.config.offer_window:
+                state = self._offer_state(allow_pending=True)
+                bid = state["bids"].get(record["bid_id"]) if record["bid_id"] is not None else None
+                if bid is not None:
+                    # The offer only puts the parent's frozen terms on the
+                    # lease; the gateway leases a revision at the parent's price.
+                    offers = [{**bid["terms"], "job_id": child}]
+            try:
+                if offers is not None:
+                    claimed = self.client.claim_task(self.config.runner_id, offers=offers, job_id=child)
+                else:
+                    claimed = self.client.claim_task(
+                        self.config.runner_id, ask_usd=self.config.ask_usd, job_id=child)
+            except OrmasGatewayError as exc:
+                if exc.status_code in {401, 403}:
+                    raise
+                _LOGGER.warning("agreed revision %s claim refused: %s", child, exc.error_type)
+                continue
+            except Exception as exc:  # noqa: BLE001 - transport/schema; a later pass retries
+                _LOGGER.warning("agreed revision %s claim failed: %s", child, type(exc).__name__)
+                continue
+            if claimed is None:
+                continue
+            return self._check_offer_lease(state, claimed) if state is not None else claimed
+        return None
+
+    def _note_round_lease(self, claimed) -> None:
+        lease, draft = claimed
+        if self._public_recovery is None or getattr(draft, "graded_round_kind", None) != "revision":
+            return
+        record = self._revision_record(lease)
+        if record is not None and not record["claimed"]:
+            self._update_revision(lease.task_id, claimed=True)
 
     def _run_once_locked(self) -> bool:
         store = self._public_recovery
         if store is not None and (pending := store.pending()) is not None:
             return self._recover_public(pending)
         try:
-            claimed = self._claim_task()
+            claimed = self._claim_agreed_revision()
+            if claimed is None:
+                claimed = self._claim_task()
         except (OrmasGatewayError, HTTPError, OSError) as exc:
             self._claim_error = exc
             raise
+        if claimed is None and self._poll_graded_rounds():
+            # The agreed child is queued for this runner alone at the parent's
+            # terms; an empty-offer claim never leases a queued job.
+            try:
+                claimed = (self._claim_agreed_revision() if store is not None
+                           else self._claim_task())
+            except (OrmasGatewayError, HTTPError, OSError) as exc:
+                self._claim_error = exc
+                raise
         if claimed is None:
             return False
+        self._note_round_lease(claimed)
+        if claimed[1].work_packet.get("acceptance_level") == "graded":
+            self._graded_rounds_in_use = True
+        done = self._run_claimed(store, claimed)
+        if self._graded_rounds_in_use:
+            # Read the inbox only once the leased work is settled, so it can
+            # neither delay nor fail that work. An agreed child is claimed on
+            # a later pass.
+            try:
+                self._poll_graded_rounds()
+            except Exception as exc:  # noqa: BLE001 - the next pass reads it again
+                _LOGGER.debug("Graded inbox after work failed: %s", type(exc).__name__)
+        return done
+
+    def _run_claimed(self, store, claimed) -> bool:
         lease, draft = claimed
         lease_task_id = require_task_id(lease.task_id)
         draft_task_id = require_task_id(draft.task_id)
@@ -1228,7 +1921,7 @@ class MinerSkeleton:
             raise ValueError("claim task identity mismatch")
         start = time.monotonic()
         try:
-            if _public_packet(draft) is not None:
+            if _graded_packet(draft) is not None or _public_packet(draft) is not None:
                 if store is None:
                     raise RecoveryRequired('public recovery requires gateway identity')
                 store.begin(lease, draft)
@@ -1241,9 +1934,13 @@ class MinerSkeleton:
                 if checkout.exists():
                     raise RecoveryRequired('public checkout has no matching recovery record')
             self._run_leased_task(lease, draft, start)
-        except RecoveryRequired:
+        except RecoveryRequired as exc:
+            if self._resolve_graded_artifact_refusal(lease, draft, exc, start):
+                return store.pending() is None
             raise
         except Exception as exc:  # noqa: BLE001 - contained + reported; KeyboardInterrupt propagates
+            if self._resolve_graded_artifact_refusal(lease, draft, exc, start):
+                return store.pending() is None
             if store is not None and (pending := store.pending()) is not None:
                 if pending['stage'] in {'artifact', 'completion'}:
                     # A publication or completion may already have reached the
@@ -1289,35 +1986,57 @@ class MinerSkeleton:
                 'legacy public recovery lacks frozen publication scope authorization'
             )
         if pending['stage'] == 'artifact':
+            graded = _graded_packet(draft) is not None
             try:
                 workdir = contained_workdir(
                     self.config.workdir_root, draft.task_id, field_name="task_id"
                 )
             except ValueError:
                 raise RecoveryRequired('public recovery checkout is missing or unsafe') from None
-            if workdir.is_symlink() or not workdir.is_dir():
+            if not graded and (workdir.is_symlink() or not workdir.is_dir()):
                 raise RecoveryRequired('public recovery checkout is missing or unsafe')
             try:
-                result_ref, result = self._publish_public(
+                publish = self._publish_graded if graded else self._publish_public
+                result_ref, result = publish(
                     lease, draft, workdir, SolveResult(**pending['result']),
                     capture=pending['capture'],
                 )
-            except OrmasGatewayError as exc:
-                if exc.status_code != 409 or exc.error_type != 'lease_lost':
+            except Exception as exc:
+                if self._resolve_graded_artifact_refusal(lease, draft, exc, start):
+                    return self._public_recovery.pending() is None
+                if (not isinstance(exc, OrmasGatewayError)
+                        or exc.status_code != 409 or exc.error_type != 'lease_lost'):
                     raise
                 self.cancelled.set()
                 last_run['lease_lost'] = True
                 self._acknowledge_public(None)
                 return True
             capture = pending['capture']
-            self._freeze_public_completion(lease, result_ref, result, capture)
+            self._freeze_public_completion(lease, result_ref, result, capture, graded=graded)
             pending = self._public_recovery.pending()
         kwargs = self._public_recovery.completion_for_wire(pending)
-        response = self._complete_with_retry(
-            draft.task_id, lease, start, receipt=TaskReceipt.from_wire(kwargs['receipt']),
-            terminal=TaskTerminal.from_wire(kwargs['terminal']), capture=kwargs['capture'],
-            last_run=last_run,
-        )
+        terminal_wire = kwargs['terminal']
+        try:
+            response = self._complete_with_retry(
+                draft.task_id, lease, start, receipt=TaskReceipt.from_wire(kwargs['receipt']),
+                terminal=TaskTerminal.from_wire(terminal_wire),
+                capture=_without_legacy_error(kwargs['capture']),
+                last_run=last_run,
+            )
+        except OrmasGatewayError as exc:
+            if not (_terminal_refusal(exc)
+                    and (terminal_wire.get('verification_state') in {'failed', 'aborted'}
+                         or (_graded_packet(draft) is not None
+                             and terminal_wire.get('verification_state') == 'publish_failed'))):
+                raise
+            # The gateway permanently refused this failure report: log it once
+            # and release the retained record instead of replaying it forever.
+            _LOGGER.warning(
+                "public failure report for task %s refused by gateway %s [%s]; releasing record",
+                draft.task_id, exc.status_code, exc.error_type,
+            )
+            self._public_recovery.acknowledge()
+            return True
         self._acknowledge_public(response)
         return self._public_recovery.pending() is None
 
@@ -1334,14 +2053,14 @@ class MinerSkeleton:
             raise ValueError("settle_fn must return a finite, non-negative number")
         return float(min(limit, price))
 
-    def _freeze_public_completion(self, lease, result_ref, result, capture):
-        if capture.get('scope_ok') is not True and (
+    def _freeze_public_completion(self, lease, result_ref, result, capture, *, graded=False):
+        if not graded and capture.get('scope_ok') is not True and (
             result_ref is not None or result.result_commit
         ):
             raise GitError('publication scope validation failed')
         terminal = TaskTerminal(lease_id=lease.lease_id,
-            verification_state=capture['status'], result_ref=result_ref,
-            settlement_state='unset', rating=None, result_commit=result.result_commit,
+            verification_state=capture['status'], result_ref=None if graded else result_ref,
+            settlement_state='unset', rating=None, result_commit='' if graded else result.result_commit,
             settled_price_usd=self._settled_price(lease, result, capture['status']))
         receipt = _build_receipt(lease.lease_id, result)
         if self._public_recovery is not None and self._public_recovery.pending() is not None:
@@ -1405,7 +2124,8 @@ class MinerSkeleton:
             "settlement": None,
         }
         try:
-            packet = _public_packet(draft)
+            graded = _graded_packet(draft) is not None
+            packet = None if graded else _public_packet(draft)
             if packet is not None:
                 base_exit = _run_verify_command(
                     draft.verify_command, cwd=workdir, trusted_public_python=True,
@@ -1480,7 +2200,11 @@ class MinerSkeleton:
             if result.failure_class is not None:
                 capture["failure_class"] = result.failure_class
 
-            if not scope_ok:
+            if graded:
+                result_ref = None
+                if verification_state == 'verified':
+                    self._publish_graded(lease, draft, workdir, result, capture=capture)
+            elif not scope_ok:
                 capture["failure_class"] = "scope_violation"
                 result_ref = None
                 result = replace(result, result_commit="")
@@ -1490,7 +2214,8 @@ class MinerSkeleton:
                 )
             else:
                 result_ref = self._publish(draft.task_id, workdir, result, draft=draft)
-            receipt, terminal = self._freeze_public_completion(lease, result_ref, result, capture)
+            receipt, terminal = self._freeze_public_completion(
+                lease, result_ref, result, capture, graded=graded)
 
             response = self._complete_with_retry(
                 draft.task_id,
@@ -1607,21 +2332,26 @@ class MinerSkeleton:
         when the public base check calls it before ``solve_fn``. The terminal
         says ``verification_state='failed'`` / ``settlement_state='unset'``
         with no result ref. A public crash leaves ``result_commit`` empty; a
-        private crash points it at the base commit. The capture carries a
-        typed ``failure_class``; local exception text never crosses the wire.
-        The default receipt reports unknown usage rather than fabricated zeros.
-        A caller that already knows no provider ran (a public base that exits 0) passes
+        private crash points it at the base commit. The capture carries only
+        gateway allow-listed keys plus a ``failure_class``; the exception
+        message (truncated) goes to the local log only. The default
+        receipt reports unknown usage rather than fabricated zeros. A caller
+        that already knows no provider ran (a public base that exits 0) passes
         ``failure_class``, ``verification_state='failed'``, and
         ``known_cost_usd=0.0`` so this same completion carries a known zero
         cost instead of the public abort class. Reporting itself is
         best-effort: if even the completion call cannot reach the gateway
         there is nothing more this process can do for the lease, so that
-        secondary failure only warns.
+        secondary failure only warns. A public report the gateway refuses
+        with a terminal 4xx (not 409) is logged and its retained record is
+        released; a 5xx or transport error keeps the record for recovery.
         """
         public = self._public_recovery is not None and self._public_recovery.pending() is not None
+        packet = getattr(draft, 'work_packet', None)
+        graded = isinstance(packet, Mapping) and packet.get('acceptance_level') == 'graded'
         if failure_class is None:
             local_failure_class = "git_error" if isinstance(exc, GitError) else "solve_error"
-            failure_class = 'public_execution_interrupted' if public else 'failed'
+            failure_class = 'public_execution_interrupted' if public else local_failure_class
         else:
             local_failure_class = failure_class
         if verification_state is None:
@@ -1632,7 +2362,7 @@ class MinerSkeleton:
             result_ref=None,
             settlement_state="unset",
             rating=None,
-            result_commit="" if public else draft.base_commit,
+            result_commit="" if public or graded else draft.base_commit,
         )
         solved = SolveResult(result_commit=draft.base_commit, failure_class=failure_class)
         if known_cost_usd is not None:
@@ -1649,6 +2379,10 @@ class MinerSkeleton:
                 upstream_cost_usd=known_cost_usd,
             )
         receipt = _build_receipt(lease.lease_id, solved)
+        _LOGGER.warning(
+            "task %s failed (%s): %s",
+            draft.task_id, local_failure_class, str(exc)[:_FAILURE_MESSAGE_MAX],
+        )
         capture: dict[str, Any] = {
             "status": "failed",
             "scope_ok": False,
@@ -1679,6 +2413,19 @@ class MinerSkeleton:
             )
             if public:
                 self._acknowledge_public(response)
+        except OrmasGatewayError as report_exc:
+            if public and _terminal_refusal(report_exc):
+                _LOGGER.warning(
+                    "public failure report for task %s refused by gateway %s [%s]; releasing record",
+                    draft.task_id, report_exc.status_code, report_exc.error_type,
+                )
+                self._public_recovery.acknowledge()
+                return
+            warnings.warn(
+                f"could not report crashed task {draft.task_id!r} to the gateway "
+                f"({report_exc}); the lease will expire server-side",
+                stacklevel=2,
+            )
         except Exception as report_exc:  # noqa: BLE001 - nothing more to do for this lease
             warnings.warn(
                 f"could not report crashed task {draft.task_id!r} to the gateway "
@@ -1748,7 +2495,7 @@ class MinerSkeleton:
             iterations += 1
             try:
                 did_work = self.run_once()
-            except (OrmasGatewayError, HTTPError, OSError) as exc:
+            except (OrmasGatewayError, HTTPError, OSError, RecoveryRequired) as exc:
                 if self._claim_error is not exc or (
                     isinstance(exc, OrmasGatewayError) and exc.status_code in (401, 403)
                 ):

@@ -20,6 +20,12 @@ def assignment(tmp_path):
         'packages': {'': {'name': package['name'], 'version': '1.0.0'}},
     }))
     (tmp_path / 'value.test.cjs').write_text("require('node:test')('value',()=>{});\n")
+    # Environment preparation inspects committed paths for repository features.
+    for args in (['init'], ['add', '.'], ['commit', '-m', 'acceptance fixture']):
+        support.public_git(
+            ['-c', 'user.name=Ormas tests', '-c', 'user.email=tests@ormas.invalid', *args],
+            cwd=tmp_path,
+        )
     original = 'node --test value.test.cjs'
     environment, config, _ = support.prepare_environment(
         {'profile_id': 'linux-node-test-v1', 'lock_paths': ['package-lock.json', 'package.json'],
@@ -46,11 +52,7 @@ def assignment(tmp_path):
         verify_command=command, allowed_paths=['cli.cjs'],
         immutable_paths=['package.json', 'package-lock.json', 'value.test.cjs'],
         execution_contract=contract)
-    return {'assignment_id': 'asgn_public', 'validator_id': 'val_test',
-            'decision_protocol_version': module.VALIDATOR_DECISION_PROTOCOL_V2,
-            'decision_nonce': '3' * 64,
-            'validator_key_generation': 1, 'validator_pubkey_hex': 'ab' * 32,
-            'decision_expires_at': '2099-01-01T00:00:00Z', **fields,
+    return {'assignment_id': 'asgn_public', **fields,
             'evidence_digest_sha256': module.evidence_digest_hex(fields)}
 
 
@@ -61,7 +63,7 @@ def daemon(tmp_path):
 @pytest.mark.parametrize('base_exit,result_exit,expected', [
     (86, 0, 'accept'), (86, 86, 'reject'),
     (98, 0, 'error'), (124, 0, 'error'), (127, 0, 'error'), (1, 0, 'error'),
-    (0, 0, 'error'), (86, 98, 'error'), (86, 124, 'error'), (86, 127, 'error'),
+    (0, 0, 'error'), (86, 98, 'reject'), (86, 124, 'reject'), (86, 127, 'reject'),
 ])
 def test_public_decision_distinguishes_assertion_from_environment_failure(
         tmp_path, monkeypatch, assignment, base_exit, result_exit, expected):
@@ -79,6 +81,75 @@ def test_public_decision_distinguishes_assertion_from_environment_failure(
     assert len(calls) == (2 if base_exit == 86 else 1)
 
 
+@pytest.mark.parametrize('result_exit,expected', [(0, 'accept'), (86, 'reject'), (98, 'reject')])
+def test_packet_turn_metadata_does_not_change_validator_grade(
+        tmp_path, monkeypatch, assignment, result_exit, expected):
+    # The gateway owns packet -> assignment projection. Like protocol parity,
+    # this cross-repo check runs in the monorepo, not the standalone public package.
+    gateway = pytest.importorskip('tensorbox_spec.customer_api.outcomes_validators')
+    preparer = pytest.importorskip('tensorbox_spec.outcomes_prep')
+    instance = daemon(tmp_path)
+    checked_out = None
+    calls = []
+
+    def git(argv, **kwargs):
+        nonlocal checked_out
+        assert kwargs['cwd'] == tmp_path
+        if argv[0] == 'diff':
+            assert argv[-3:-1] == [assignment['base_commit'], assignment['result_commit']]
+            return 'cli.cjs\0'
+        assert argv[0] == 'checkout'
+        checked_out = argv[1]
+        return ''
+
+    def verify(command, **kwargs):
+        assert command == assignment['verify_command']
+        assert kwargs['trusted_public_python'] is True
+        assert checked_out in (assignment['base_commit'], assignment['result_commit'])
+        calls.append(checked_out)
+        return 86 if checked_out == assignment['base_commit'] else result_exit
+
+    monkeypatch.setattr(module, '_run_git', git)
+    monkeypatch.setattr(module, '_run_verify_command', verify)
+    contracts = []
+    for turns in (12, 60):  # Two existing packet metadata values, not new limits.
+        packet = {name: copy.deepcopy(assignment['execution_contract'][name]) for name in (
+            'execution_environment', 'execution_requirements', 'verifier_profile', 'verify_base',
+        )}
+        packet.update(
+            verification_command=assignment['verify_command'],
+            task_features={'languages': packet['execution_requirements']['languages']},
+            execution_policy=preparer.build_execution_policy_v1(
+                allowed_paths=assignment['allowed_paths'],
+                immutable_paths=assignment['immutable_paths'], allowed_tools=['terminal'],
+                max_attempts=1, max_turns=turns, continuation_cost_authorization_ticks=0,
+                repo_base_sha=assignment['base_commit'],
+            ),
+        )
+        support.validate_public_execution_packet(packet)
+        contract = gateway.packet_validation_contract(packet)
+        assert contract['work_packet_sha256'] == preparer.canonical_inner_packet_sha256(packet)
+        contracts.append(contract)
+        fields = {name: copy.deepcopy(value) for name, value in assignment.items()
+                  if name not in ('assignment_id', 'evidence_digest_sha256')}
+        fields['execution_contract'] = contract
+        value = {'assignment_id': assignment['assignment_id'], **fields,
+                 'evidence_digest_sha256': module.evidence_digest_hex(fields)}
+        assert instance._preface(value) == ('review', value['evidence_digest_sha256'])
+        assert instance._decide(value, tmp_path) == expected
+
+        # Advisory metadata remains hash-bound, not permission to tamper with evidence.
+        tampered = copy.deepcopy(value)
+        tampered['execution_contract']['work_packet_sha256'] = '0' * 64
+        assert instance._preface(tampered) == ('error', value['evidence_digest_sha256'])
+
+    assert calls == [assignment['base_commit'], assignment['result_commit']] * 2
+    assert contracts[0]['work_packet_sha256'] != contracts[1]['work_packet_sha256']
+    assert {key: value for key, value in contracts[0].items() if key != 'work_packet_sha256'} == {
+        key: value for key, value in contracts[1].items() if key != 'work_packet_sha256'
+    }
+
+
 def test_public_contract_never_provisions_an_ambient_host_toolchain(tmp_path, monkeypatch, assignment):
     def forbidden(*args, **kwargs):
         pytest.fail('public OCI assignment attempted legacy host provisioning')
@@ -94,10 +165,6 @@ def test_public_contract_never_provisions_an_ambient_host_toolchain(tmp_path, mo
      '2026-10-04.1'),
     ('sha256:aebcdc4a64d54b94c27a1eae933144290abe82f0062626f0187ad33d7a8195e7',
      '2026-10-14.1'),
-    ('sha256:9251253a5dc1c1a4fd5947f0b1190a27393bf499f30c325d6345a0db98b946a9',
-     '2026-10-14.2'),
-    ('sha256:4f945739b4de965b264192cd9cf96368eb12a02246336d58489365ac317cbafe',
-     '2026-10-14.3'),
 ])
 def test_historical_catalog_loads_but_revoked_compiler_cannot_execute(
         assignment, previous_digest, revision):

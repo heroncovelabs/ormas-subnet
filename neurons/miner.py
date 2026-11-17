@@ -6,8 +6,8 @@ end before plugging in real mining logic. Replace ``make_shell_solver`` with
 your own ``solve(draft, workdir) -> SolveResult`` — that function is the miner.
 
     python neurons/miner.py --gateway https://api.ormas.ai --token-env ORMAS_MINER_TOKEN \
-        --runner-id runr_0123456789ab --repo-id <repo_id> --repo-url <https-or-ssh-url> \
-        --cell task:code --solve-command 'make fix' [--ask-usd 1.20]
+        --runner-id runr_0123456789ab \
+        --cell task:code --solve-command 'make fix' --ask-usd <your-price>
 
 ``--runner-id``: omit on first run — the gateway assigns it (`runr_<12hex>`)
 and it is printed (stderr ``runner_id=<assigned>``); pass it on later runs.
@@ -48,7 +48,7 @@ _TOKEN_HELP_FILE = "File holding the runner token"
 
 # Args the run path requires; enforced in _parse so the register-hotkey
 # subcommand can omit them (argparse required= applies even under a subcommand).
-_RUN_REQUIRED = ("gateway", "repo_id", "repo_url", "cell", "solve_command")
+_RUN_REQUIRED = ("gateway", "cell", "solve_command")
 
 
 def _add_token_group(
@@ -77,8 +77,15 @@ def build_parser(*, credential_defaults: bool = False) -> argparse.ArgumentParse
         help="Public miner identity (lowercase [a-z0-9-], 3-40 chars); must match your "
         "approved miner slot for the self-serve qualification job",
     )
-    ap.add_argument("--repo-id", help="Repo id the gateway bound for this project")
-    ap.add_argument("--repo-url", help="Credential-free clone URL (https or ssh)")
+    ap.add_argument(
+        "--repo-id", default="",
+        help="Repo id for binding; required only with --bind-project",
+    )
+    ap.add_argument(
+        "--repo-url", default="",
+        help="Credential-free clone URL (https or ssh) for legacy fallback; "
+        "required with --bind-project, otherwise jobs supply their own repository",
+    )
     ap.add_argument(
         "--cell", action="append",
         help="Task-type cell this miner serves, e.g. task:code (repeatable)",
@@ -87,11 +94,12 @@ def build_parser(*, credential_defaults: bool = False) -> argparse.ArgumentParse
     ap.add_argument("--solve-command", help="Shell command the reference solver runs in the workdir")
     ap.add_argument(
         "--ask-usd", type=float, default=None,
-        help="Firm ask sent with every claim; omit to let the gateway derive one",
+        help="Firm price in USD sent with every claim; third-party miners must name a "
+        "positive price (the gateway does not derive one)",
     )
     ap.add_argument(
         "--offer-window", action="store_true",
-        help="Opt in to gateway offer windows; requires a positive --ask-usd",
+        help="Opt in to gateway offer windows using your firm price; requires a positive --ask-usd",
     )
     ap.add_argument(
         "--no-push", action="store_true",
@@ -159,6 +167,13 @@ def _parse(
         missing = [f"--{name.replace('_', '-')}" for name in _RUN_REQUIRED if not getattr(ns, name)]
         if missing:
             ap.error("the following arguments are required: " + ", ".join(missing))
+        if ns.bind_project:
+            missing_repo = [flag for name, flag in (("repo_id", "--repo-id"),
+                                                     ("repo_url", "--repo-url"))
+                            if not getattr(ns, name)]
+            if missing_repo:
+                ap.error("the following arguments are required with --bind-project: "
+                         + ", ".join(missing_repo))
         if not credential_defaults and not (ns.token_env or ns.token_file):
             ap.error("one of the arguments --token-env --token-file is required")
     if ns.gateway is not None:

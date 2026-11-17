@@ -572,7 +572,7 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--provider", action="append", default=[], help="Declared provider DNS host; repeatable")
             sub.add_argument("--pricing-template", action="store_true", help="Write pricing.json placeholders beside env")
             sub.add_argument("--relay", choices=sorted(RELAY_PRESETS),
-                             help="Seal an inference relay policy for the shell (relay slot)")
+                             help="Seal a shell relay policy: frontier or explicit Engy ZDR (not inference TEE)")
             sub.add_argument("--relay-model", action="append", default=[],
                              help="Permitted provider model id; repeatable; required with --relay unless --relay-policy-file")
             sub.add_argument("--relay-policy-file", help="Reuse a saved relay-policy.json (same digest)")

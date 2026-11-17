@@ -10,12 +10,13 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RECIPE = ROOT / "protected" / "miner"
+# main: vectors follow main's split pin (shell d4931dec, 2026-11-13 transition).
 VECTORS = [
-    ([], "f36515ef902b61c6f1a682895e6d9489fec1e5ba79a250b8686d08c5f09d03e3"),
+    ([], "41669305b1a8532b3499e2fd6da9d8277767aeb63a498922913a7cc49c62d2b5"),
     (["--dstack", "0.6.1"],
-     "dd7c936b1031167de28950904cd55be2564ba43093c93ee19f76c9f01c3e3418"),
+     "da6e7edd0b329ae53aa1b065ec9bf247f1f7761371084e696b2cedb5fbb8aabe"),
     (["--dstack", "0.6.1", "--kms-pinned"],
-     "618ba303cf7c582137c5b85c920a8411774d6ddf594bbc4867f78e3881b271af"),
+     "fb6e6c4c1ef9666d3f337a1bc158fbf582a44f6f4adc8a3043bf062ce2b00942"),
 ]
 MONOLITH = "ac40e43d91fc2b47944b3e5f7e94d538fae23977914e80a888a86f9e3aca0805"
 

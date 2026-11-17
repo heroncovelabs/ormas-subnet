@@ -420,6 +420,19 @@ def test_qualification_line_shapes(qualification, expected):
     assert expected in miner.qualification_line(response)
 
 
+def test_run_without_repository_flags_uses_empty_config(cli, gateway, monkeypatch):
+    from neurons import miner
+
+    credentials()
+    configs = []
+    monkeypatch.setattr(miner.MinerSkeleton, "run_once",
+                        lambda self: configs.append(self.config) or True)
+    assert cli.main(["run", "--cell", "task:code", "--solve-command", "true", "--once"]) == 0
+    assert configs[0].repo_id == ""
+    assert configs[0].repo_url == ""
+    assert gateway[0][0].url.path == "/api/runner/v1/registrations"
+
+
 def test_run_passes_miner_id_and_prints_qualification(cli, gateway, monkeypatch, capsys):
     from neurons import miner
 
@@ -789,7 +802,7 @@ def test_documented_registration_passes_doctor(cli, gateway, capsys, document):
 def test_install_run_example_uses_assigned_id():
     text = (ROOT / "docs" / "INSTALL.md").read_text()
     paragraph = text.split("The same loop is available as ", 1)[1].split("\n\n", 1)[0]
-    example = "ormas-miner run --runner-id <assigned-id> --repo-id <id>"
+    example = "ormas-miner run --runner-id <assigned-id>"
     assert example in paragraph
 
 

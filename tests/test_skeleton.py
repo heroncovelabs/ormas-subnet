@@ -267,6 +267,36 @@ def test_skeleton_scope_preserves_leading_whitespace_in_paths(tmp_path: Path) ->
     assert gateway.completed["terminal"]["verification_state"] == "failed"
 
 
+@requires_git
+def test_skeleton_diff_never_executes_repository_diff_driver(tmp_path: Path) -> None:
+    repo, base_commit = _init_repo(tmp_path)
+    marker = tmp_path / "external-diff-ran"
+    driver = tmp_path / "external-diff"
+    driver.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    driver.chmod(0o700)
+
+    def solve(draft, workdir: Path) -> SolveResult:
+        (workdir / "out.txt").write_text("base\nmined\n")
+        subprocess.run(["git", "add", "-A"], cwd=workdir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "result"], cwd=workdir,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "--local", "diff.external", str(driver)],
+                       cwd=workdir, check=True, capture_output=True)
+        result_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return SolveResult(result_commit=result_commit, changed_paths=("out.txt",))
+
+    gateway, _ = _run_one_task(
+        tmp_path, repo=repo, base_commit=base_commit, verify_command="true", solve_fn=solve,
+    )
+
+    assert gateway.completed["capture"]["scope_ok"] is True
+    assert gateway.completed["capture"]["material_diff_sha256"]
+    assert not marker.exists()
+
+
 def test_scope_parser_rejects_invalid_utf8_git_path() -> None:
     with pytest.raises(GitError, match="not valid UTF-8"):
         _nul_git_paths("\udcff\0")
@@ -332,17 +362,7 @@ def _validator_assignment(*, repo: Path, base_commit: str, result_commit: str,
         allowed_paths=allowed_paths or ["out.txt"],
         immutable_paths=immutable_paths or [],
     )
-    return {
-        "assignment_id": "asgn_1",
-        "validator_id": "val_test",
-        "decision_protocol_version": "ormas-validator-decision-v2",
-        "decision_nonce": "1" * 64,
-        "validator_key_generation": 1,
-        "validator_pubkey_hex": "ab" * 32,
-        "decision_expires_at": "2099-01-01T00:00:00Z",
-        **fields,
-        "evidence_digest_sha256": evidence_digest_hex(fields),
-    }
+    return {"assignment_id": "asgn_1", **fields, "evidence_digest_sha256": evidence_digest_hex(fields)}
 
 
 def _run_validator_once(tmp_path: Path, *, assignment: dict[str, Any]) -> _FakeValidatorGateway:
@@ -621,7 +641,9 @@ def test_old_gateway_queue_404_is_remembered_and_not_probed_again(tmp_path: Path
     )
     assert skeleton.run_once() is True
     assert skeleton.run_once() is False
-    assert gateway.gets == ["/api/runner/v1/queue?runner_id=miner-1"]
+    # The idle pass also reads the optional Graded inbox; only the queue probe is pinned.
+    queue_gets = [path for path in gateway.gets if path.startswith("/api/runner/v1/queue?")]
+    assert queue_gets == ["/api/runner/v1/queue?runner_id=miner-1"]
     legacy = {"schema_version": "ormas-runner-v1", "runner_id": "miner-1", "ask_usd": 0.75}
     assert gateway.claims == [legacy, legacy]
 

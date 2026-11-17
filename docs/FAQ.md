@@ -21,8 +21,11 @@ Set `MinerConfig(miner_id="your-miner-name")`. Lowercase, 3–40 characters, `[a
 Binding is optional. Bounded-packet (public-profile) jobs use gateway publication.
 Public-repository jobs clone anonymously; private-repository jobs use a per-job
 read credential for both miners and validators. The legacy route supplies a clone
-URL and a job-scoped deploy key. `--repo-id` / `--repo-url` remain
-required fallback fields; `bind` serves a pre-arranged repository.
+URL and a job-scoped deploy key. Omit `--repo-id` and `--repo-url` for opted-in
+jobs. Both are required only with `--bind-project`, which serves a pre-arranged
+repository. `--repo-url` remains the legacy fallback when the job lacks a
+repository credential. Without a usable job repository or that fallback, a
+legacy job fails with a clear error naming `--repo-url`, before cloning.
 
 **How do offers and payment work?**
 A `firm` offer fixes the client’s charge at `price_usd`. A `limit` offer states your expected charge as

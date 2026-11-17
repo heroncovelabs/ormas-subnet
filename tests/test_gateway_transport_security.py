@@ -81,9 +81,13 @@ def test_owned_http_client_never_follows_redirects_or_environment_proxies(client
         def close(self):
             pass
 
-    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=FakeClient))
+    # main also retains idle channels with httpx.Limits (823e4252e); record and set it aside.
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(
+        Client=FakeClient, Limits=lambda **kwargs: ("limits", kwargs)))
     instance = client("https://gateway.example/", "secret")
     assert instance.base_url == "https://gateway.example"
+    for call in calls:
+        call.pop("limits", None)
     assert calls == [{
         "base_url": "https://gateway.example",
         "headers": {"Authorization": "Bearer secret"},

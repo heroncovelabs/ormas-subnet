@@ -18,7 +18,7 @@ services:
   # every container before starting any, so the miner's bind creates the directory (root,
   # 0755) and the miner starts only after this service has fixed its owner and mode.
   scratch-init:
-    image: ghcr.io/heroncovelabs/ormas-protected-shell@sha256:5bbb71864135ec7487c8a16fb0ebf570221ff01f02c2c65239da5e77dcf14723
+    image: ghcr.io/heroncovelabs/ormas-protected-shell@sha256:d4931dec4f5d5dbb737c163b02c7da322e22b730a003087d003c46698f711b15
     restart: "no"
     user: "0:0"
     network_mode: none
@@ -26,7 +26,7 @@ services:
     volumes:
       - /var/lib/ormas-verifier-scratch:/var/lib/ormas-verifier-scratch
   ormas-shell:
-    image: ghcr.io/heroncovelabs/ormas-protected-shell@sha256:5bbb71864135ec7487c8a16fb0ebf570221ff01f02c2c65239da5e77dcf14723
+    image: ghcr.io/heroncovelabs/ormas-protected-shell@sha256:d4931dec4f5d5dbb737c163b02c7da322e22b730a003087d003c46698f711b15
     restart: unless-stopped
     depends_on:
       scratch-init:
